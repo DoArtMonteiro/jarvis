@@ -28,13 +28,14 @@ use std::os::windows::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::watch;
 use windows_sys::Win32::Foundation::{
-    ERROR_ENVVAR_NOT_FOUND, GENERIC_READ, GENERIC_WRITE, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0,
+    ERROR_ENVVAR_NOT_FOUND, GENERIC_READ, GENERIC_WRITE, HANDLE, STILL_ACTIVE, WAIT_ABANDONED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -45,12 +46,12 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     SetErrorMode,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateMutexW, CreateProcessW, DETACHED_PROCESS,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ReleaseMutex, ResumeThread,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
@@ -83,6 +84,41 @@ const MITIGATIONS: u64 = (1 << 12) // HEAP_TERMINATE
 pub(crate) const MITIGATION_NAMES: &str = "heap terminate, ASLR, no extension points, no \
      non-system fonts, no remote or low-label images";
 
+/// The longest a launch waits for another Core's launch to finish.
+const LAUNCH_LOCK_TIMEOUT_MS: u32 = 60_000;
+
+/// A named mutex held for the duration of one launch. Its name lives in the
+/// user's session namespace, which the worker's AppContainer cannot open.
+/// Held by the calling thread; [`spawn`] is synchronous, so it is released
+/// on the thread that took it.
+struct LaunchLock(Handle);
+
+impl LaunchLock {
+    fn acquire() -> io::Result<Self> {
+        let name = super::wide_str(r"Local\JARVIS.Worker.Launch");
+        // SAFETY: default security, not initially owned, a NUL-terminated name.
+        let raw = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
+        let mutex = Handle::new(raw).ok_or_else(|| last_error("CreateMutexW"))?;
+        // SAFETY: a valid mutex handle owned by `mutex`.
+        match unsafe { WaitForSingleObject(mutex.0, LAUNCH_LOCK_TIMEOUT_MS) } {
+            // An abandoned mutex is owned now; the clean-up below re-runs.
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(mutex)),
+            WAIT_TIMEOUT => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "another worker launch did not finish within 60 s",
+            )),
+            _ => Err(last_error("WaitForSingleObject")),
+        }
+    }
+}
+
+impl Drop for LaunchLock {
+    fn drop(&mut self) {
+        // SAFETY: the mutex is owned by this thread (taken in `acquire`).
+        unsafe { ReleaseMutex(self.0.0) };
+    }
+}
+
 pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::Result<Spawned> {
     if !confinement.deny_network {
         return Err(io::Error::new(
@@ -90,11 +126,11 @@ pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::R
             "a Windows worker always runs without network access",
         ));
     }
-    // One launch at a time in this process: the access-control check and
-    // update, and the AppContainer set-up inside CreateProcessW, then never
-    // interleave with another launch from the same Core (or test binary).
-    static LAUNCH: Mutex<()> = Mutex::new(());
-    let _launching = LAUNCH.lock().unwrap_or_else(PoisonError::into_inner);
+    // One launch at a time for this user, across processes: every Core
+    // shares the one AppContainer profile, and its creation, the folder
+    // clean-up, the access-control update and the AppContainer set-up inside
+    // CreateProcessW fail or undo each other when two Cores interleave them.
+    let _launching = LaunchLock::acquire()?;
 
     let sid = PackageSid::ensure()?;
     appcontainer::clear_container_folder(&sid)?;
