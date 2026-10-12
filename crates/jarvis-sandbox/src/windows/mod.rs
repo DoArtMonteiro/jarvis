@@ -95,6 +95,8 @@ pub(crate) fn report(_confinement: &Confinement) -> io::Result<Report> {
 /// Remove the package SID's entries from every granted path, then delete
 /// the AppContainer profile.
 pub(crate) fn remove(confinement: &Confinement) -> io::Result<Vec<String>> {
+    // Not while another Core launches a worker in the same profile.
+    let _removing = launch::LaunchLock::acquire()?;
     let sid = appcontainer::PackageSid::derive()?;
     let mut done: Vec<String> = appcontainer::revoke_paths(&sid, &confinement.filesystem)?
         .into_iter()

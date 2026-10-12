@@ -87,21 +87,23 @@ pub(crate) const MITIGATION_NAMES: &str = "heap terminate, ASLR, no extension po
 /// The longest a launch waits for another Core's launch to finish.
 const LAUNCH_LOCK_TIMEOUT_MS: u32 = 60_000;
 
-/// A named mutex held for the duration of one launch. Its name lives in the
-/// user's session namespace, which the worker's AppContainer cannot open.
-/// Held by the calling thread; [`spawn`] is synchronous, so it is released
-/// on the thread that took it.
-struct LaunchLock(Handle);
+/// A named mutex held for the duration of one launch or one removal of the
+/// profile. Its name lives in the user's session namespace, which the
+/// worker's AppContainer cannot open. Held by the calling thread; [`spawn`]
+/// and [`super::remove`] are synchronous, so it is released on the thread
+/// that took it.
+pub(super) struct LaunchLock(Handle);
 
 impl LaunchLock {
-    fn acquire() -> io::Result<Self> {
+    pub(super) fn acquire() -> io::Result<Self> {
         let name = super::wide_str(r"Local\JARVIS.Worker.Launch");
         // SAFETY: default security, not initially owned, a NUL-terminated name.
         let raw = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
         let mutex = Handle::new(raw).ok_or_else(|| last_error("CreateMutexW"))?;
         // SAFETY: a valid mutex handle owned by `mutex`.
         match unsafe { WaitForSingleObject(mutex.0, LAUNCH_LOCK_TIMEOUT_MS) } {
-            // An abandoned mutex is owned now; the clean-up below re-runs.
+            // Abandoned: a Core died while holding it. It is ours now, and
+            // every step a launch takes is safe to repeat.
             WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(mutex)),
             WAIT_TIMEOUT => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
