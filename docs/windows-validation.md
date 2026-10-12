@@ -75,7 +75,7 @@ Expected: the class A job completes. The write waits; the approval shows path, s
 - It is a child of `jarvis-core.exe` with no `conhost.exe` child.
 - Security tab: **AppContainer** flag set, integrity **AppContainer** (low), package SID `S-1-15-2-...` matching section 2, no privileges except `SeChangeNotifyPrivilege`, no capabilities listed.
 - Job tab: one job with active process limit 1, process memory limit 512 MiB, kill on job close, and (if `health` says so) UI restrictions.
-- Handles view: the three stdio pipe handles (`\Device\NamedPipe\jarvis-worker-...`) and no handle to `jarvis.db`, `jarvis.db.lock`, the WAL file, the `\Device\NamedPipe\jarvis` RPC pipe, or any file in your profile.
+- Handles view: the handle list passes exactly three stdio pipe ends to the worker. Process Explorer may show only two of them by name (`\Device\NamedPipe\jarvis-worker-...`); the third can appear as an unnamed `File` handle (enable View > Show Unnamed Handles and Mappings to see it). The cause was not established, so record the third pipe as inferred, not observed by name. Check that no handle to `jarvis.db`, `jarvis.db.lock`, the WAL file, the `\Device\NamedPipe\jarvis` RPC pipe, or any file in your profile appears among the named handles.
 - Environment tab: `PATH`, `SYSTEMROOT`, the profile variables (`APPDATA`, `HOMEDRIVE`, `HOMEPATH`, `USERPROFILE`), and `LOCALAPPDATA`, `TEMP` and `TMP`, which Windows points into `%LOCALAPPDATA%\Packages\jarvis.worker\AC` (CI observed this), and nothing else. Set `$env:JARVIS_SECRET_PROBE = "x"` before starting the Core and confirm it is absent.
 - Security of `%LOCALAPPDATA%\Packages\jarvis.worker\AC` (Properties, Security, Advanced): Windows gives the package SID full control there (`icacls` shows it as `(CR)`, a critical entry). This is the one folder the worker can write. Write a file into `AC\Temp` as yourself, restart the Core, and check the file is gone: the Core empties the folder before every start.
 
@@ -96,8 +96,11 @@ Every test must pass. They are read-only towards your files: the canaries they c
 - reading `%APPDATA%\Microsoft\Credentials` and a browser profile directory fails;
 - `socket.getaddrinfo("example.com", 443)` and `socket.create_connection(("1.1.1.1", 443), timeout=5)` fail;
 - connecting to a local service you run (for example `python -m http.server 8000` in another window) fails, and that server logs no request;
+- a connection to the IPv6 loopback address and to your machine's LAN IPv4 address fails (CI does not cover these two);
 - `subprocess.run(["cmd", "/c", "exit"])` fails;
 - `ctypes.windll.kernel32.OpenProcess(0x1F0FFF, False, <pid of jarvis-core>)` returns 0.
+
+**LOCAL WINDOWS VERIFICATION REQUIRED**, known open items to record, not expected to pass: from the same throwaway script, opening `HKEY_CURRENT_USER\Software` and Explorer's `RecentDocs` key for reading succeeded on one desktop run; also record whether a value can be read from each (this was not recorded); `GetDC(NULL)` returns a screen device context; screen capture (reading pixels from that context) and keyboard-state reading (`GetAsyncKeyState`) are not proven blocked. Record what each does, whatever the outcome. Until these are resolved, no model, voice or personal-data integration may run in the worker (threat model, known gaps).
 
 ## 7. Lifecycle
 
@@ -141,7 +144,7 @@ It lists what it will do and asks first: add Windows Firewall rules in the group
 
 To undo everything: elevated, `scripts\windows\isolation.ps1 -Action Remove [-GrantPath <python directory>]` removes the firewall rules and grants; then, as your normal user, `jarvis isolation remove` removes the Core's access entries and the AppContainer profile. Expected afterwards: no rules in the group, `icacls <python dir>` no longer lists the package SID, and `%LOCALAPPDATA%\Packages\jarvis.worker` no longer exists. A later `jarvis isolation check` recreates the profile and grants.
 
-**LOCAL WINDOWS VERIFICATION REQUIRED:** with the Windows Defender Firewall service stopped (only on a test machine), `jarvis isolation check` must either still pass (the Filtering Platform still enforces AppContainer isolation) or fail and make the Core refuse to start. It must never report `ok` while the probe actually reached the network. Record which.
+**LOCAL WINDOWS VERIFICATION REQUIRED:** with the Windows Defender Firewall service stopped (only on a test machine), `jarvis isolation check` must either still pass (the Filtering Platform still enforces AppContainer isolation) or fail and make the Core refuse to start. It must never report `ok` while the probe actually reached the network. This scenario has not been run. The start-up probe detects loopback reachability only, so also repeat the internet and DNS probes of section 6 while the service is stopped. Record which.
 
 ## Results
 
@@ -155,10 +158,11 @@ To undo everything: elevated, `scripts\windows\isolation.ps1 -Action Remove [-Gr
 | Class A job, approved write, denied write (times) | | |
 | Process Explorer: AppContainer, low integrity, privileges, no capabilities | | |
 | Process Explorer: job limits, no console host child | | |
-| Process Explorer: only stdio handles, environment | | |
+| Process Explorer: stdio handles (two named, one unnamed), no database, lock, WAL, RPC pipe or profile handle; environment | | |
 | Worker dies when the Core is ended | | |
 | Probe suite on a real profile | | |
-| Manual probes: Documents, OneDrive, credentials, DNS, internet, local service, child process, Core process | | |
+| Manual probes: Documents, OneDrive, credentials, DNS, internet, local service, IPv6 loopback, LAN address, child process, Core process | | |
+| Open items: registry read (`HKCU\Software`, `RecentDocs`), screen device context and capture, keyboard state | | |
 | Ctrl+C once and twice, `shutdown`, console close | | |
 | Crash, restart, budget, pending approval expiry, restart recovery | | |
 | Overhead: interpreter start, idle memory, probe, RPC, idle CPU | | |

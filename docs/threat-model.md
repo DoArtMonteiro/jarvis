@@ -23,14 +23,15 @@ Each threat lists its current mitigation and the test that proves it, or states 
         |  (the worker's only channel to the Core)
         v
 +==================================================+
-| OS isolation boundary, proved at Core start-up    |
+| OS isolation boundary, checked at Core start-up   |
 |  Windows: AppContainer (no capabilities), job,    |
 |    child-process policy, handle list, mitigations |
 |  Linux: Landlock + seccomp + no capabilities      |
 | +----------------------------------------------+ |
 | | Python worker (untrusted)                    | |
-| |  reads its runtime and source, nothing else  | |
-| |  no network, no processes, no other files    | |
+| |  reads its runtime and source (+ known gaps) | |
+| |  no user files, no processes                 | |
+| |  no network (by design)                      | |
 | |  deterministic planner today; models later   | |
 | +----------------------------------------------+ |
 +==================================================+
@@ -42,10 +43,10 @@ Each threat lists its current mitigation and the test that proves it, or states 
 | --- | --- | --- |
 | Filesystem | Personal files, project files, system files | Tools read inside one fixture directory and write inside one workspace directory, writes only after a person approves |
 | Credentials | API keys, tokens, SSH keys, password stores | None through tools; the worker starts with a cleared environment |
-| Private documents | Notes, mail, documents on the PC | None through tools. The worker's OS isolation denies it every file outside its runtime and source |
+| Private documents | Notes, mail, documents on the PC | None through tools. The worker's OS isolation denies it every user file outside its runtime and source. On Windows it can still read system directories and registry keys open to every AppContainer, such as Explorer's list of recent documents (opened for read on a desktop run; see known gaps) |
 | Browser and session data | Cookies, profiles, saved sessions | As above |
 | Processes | Ability to start, stop or control programs | No tool starts processes. The worker can start, signal or read no other process |
-| Network access | Exfiltration, remote actions | No tool performs network I/O. The worker has no network at all, loopback included |
+| Network access | Exfiltration, remote actions | No tool performs network I/O. By design the worker has no network at all, loopback included (no capabilities on Windows, no sockets on Linux). The start-up probe checks loopback TCP and UDP at every Core start (not on worker restarts); see the isolation table for what else is tested |
 | The approval channel | Whoever can approve can trigger class B actions | Local RPC, same user only, worker refused |
 | User identity | Hostname, username, account names | `system.info` deliberately omits them |
 | The Core's own state | Policy, config, audit log, task and approval history | Not reachable through the worker protocol or the RPC interface |
@@ -57,7 +58,7 @@ Each threat lists its current mitigation and the test that proves it, or states 
 | Person at the machine | Trusted | Owns the machine, writes the config and policy, decides on approvals |
 | Local client (CLI) | Trusted as the person | Any process of the same user that can open the RPC endpoint, except the worker |
 | Model (future) | Untrusted | Its output is data. It may be steered by content it reads (prompt injection) |
-| Python worker | Untrusted | Its requests are validated as if hostile, and the OS isolates it from everything but its runtime, its source and its stdio |
+| Python worker | Untrusted | Its requests are validated as if hostile, and the OS isolates it from the user's files, the Core's data, the network and other processes. It keeps its runtime, its source and its stdio; on Windows it can also read what Windows opens to every AppContainer (see known gaps) |
 | Rust Core | Trusted | The only component that decides and executes |
 | Tool Gateway and tools | Trusted code, bounded | Receive typed arguments only after policy (and, for class B, a person) allows them |
 | Other local users | Untrusted | Cannot reach the RPC endpoint |
@@ -69,7 +70,7 @@ Each threat lists its current mitigation and the test that proves it, or states 
 2. **Worker → Core (stdio protocol).** Every frame is size-bounded, decoded strictly, version-checked, tied to the current job and validated before it can create a task.
 3. **Client → Core (local RPC).** The OS identifies every peer before a request is read. Requests are size-bounded and decoded strictly; there are nine typed operations and none runs a tool directly.
 4. **Core → tools.** The Gateway calls a tool only with a typed, validated call that policy has allowed and, for class B, whose approval was consumed in the same transaction that started execution.
-5. **Worker → OS.** The worker runs inside an OS isolation boundary (ADRs 0013, 0014): it can read its interpreter and its own source, and nothing else; it has no network, cannot start or signal processes, and cannot reach the Core's RPC endpoint. The Core proves the boundary on each start before any worker runs, and refuses to run a worker if it does not hold.
+5. **Worker → OS.** The worker runs inside an OS isolation boundary (ADRs 0013, 0014): it can read its interpreter and its own source and, on Windows, what Windows opens to every AppContainer (system directories, registry keys that grant "ALL APPLICATION PACKAGES", including parts of `HKEY_CURRENT_USER`; its access to the screen and keyboard state is not proven blocked). It reads no user file and no Core data. By design it has no network, cannot start or signal processes, and cannot reach the Core's RPC endpoint. At every Core start, before the first worker runs, the Core checks that the boundary holds for a loopback listener (TCP and UDP), a file next to the database, the user's home and starting a process, and refuses to run a worker if any check fails.
 
 ## Security invariants
 
@@ -84,7 +85,7 @@ These rules hold in the current code. Changes that break one of them need an ADR
 7. **Everything is bounded.** Frames, results, fixture and workspace sizes, tool time, job time, approval time, requests and protocol errors per session, frames buffered while waiting for a person, RPC request size, RPC connections, long-poll time, worker memory and worker restarts.
 8. **The worker does not inherit secrets or authority.** Cleared environment (on Windows plus the profile variables an AppContainer launch requires), no inherited descriptors or handles besides stdio, no shell, no privileges or capabilities, OS isolation applied before it runs any code.
 9. **Strict decoding on every interface.** Unknown fields, unknown message types and other versions are rejected on the worker protocol and the RPC interface.
-10. **The worker's isolation is proved, not assumed.** Before the first worker starts, the Core runs a probe under the identical isolation and checks from its own side that it cannot reach the network (loopback included), read the Core's files or start a process. If any check fails, the Core does not start.
+10. **The worker's isolation is checked, not assumed.** Before the first worker starts, the Core runs a probe under the identical isolation and checks from its own side that it cannot reach a loopback listener (TCP and UDP), read a file next to the Core's database or the user's home, or start a process. If any check fails, the Core does not start. The probe does not exercise other network paths; those rest on the isolation design (no capabilities, no sockets) and on the tests listed in the isolation table.
 
 ## Action classes
 
@@ -148,7 +149,7 @@ Status: **Implemented** means the mitigation exists in code and a test covers it
 
 ### Worker isolation (Phase 3)
 
-What a compromised worker can do when it ignores the protocol and calls the operating system directly. **Prevented**: the OS refuses it and a test proves the refusal on CI. **Mitigated**: reduced, not removed. **Residual**: possible today, accepted and stated. **Out of scope**: not defended against.
+What a compromised worker can do when it ignores the protocol and calls the operating system directly. **Prevented**: the OS refuses it and a test proves the refusal on CI. **Mitigated**: reduced, not removed. **Residual**: possible today, accepted and stated. **Untested**: not exercised by any test or desktop run. **Out of scope**: not defended against.
 
 | Attempt | Windows (AppContainer, ADR 0013) | Linux (Landlock + seccomp, ADR 0014) | Classification | Evidence |
 | --- | --- | --- | --- | --- |
@@ -158,8 +159,8 @@ What a compromised worker can do when it ignores the protocol and calls the oper
 | A grant broader than intended (an interpreter in `~/bin`, a drive root) | No grant may be a root or contain the profile, the database or the workspace | Same | Prevented | `a_grant_that_contains_protected_data_is_refused`; `filesystem_roots_are_never_granted` |
 | Learn that a path exists, its size and times | Needs read-attributes access, which the package SID lacks | Landlock does not mediate `stat` | Residual on Linux (metadata only, no contents) | ADR 0014 |
 | Read system files outside the runtime | Readable where Windows grants "ALL APPLICATION PACKAGES" (system directories) | `/etc`, `/proc`, `/run` and others denied | Prevented on Linux; Residual on Windows (system files only, no user data) | `system_files_outside_the_grants_are_denied` (Linux) |
-| Read the user's registry, screen or clipboard | Registry keys that grant "ALL APPLICATION PACKAGES" are readable, including parts of `HKEY_CURRENT_USER` (such as Explorer's list of recent documents); a screen device context can be obtained; the clipboard is refused | Not applicable | Residual on Windows (names and metadata, not file contents) | Desktop run recorded in the known gaps; not covered by CI |
-| Any network: internet, LAN, loopback, DNS, model APIs | No capabilities: the Filtering Platform drops all traffic | No socket can be created | Prevented, and checked at every start | `connecting_to_a_loopback_listener_is_denied`; `reaching_the_internet_is_denied`; `every_kind_of_socket_is_denied` (Linux); start-up probe |
+| Read the user's registry, screen or clipboard | Registry keys that grant "ALL APPLICATION PACKAGES" are readable, including parts of `HKEY_CURRENT_USER` (such as Explorer's list of recent documents); a screen device context can be obtained; the clipboard is refused. Values in those keys, not only names, are presumed readable (opening a key for read grants the right to query its values; no value read was recorded); the full set of readable keys has not been enumerated. Whether the screen contents can be captured is not proven either way, and reading keyboard state was inconclusive | Not applicable | Residual on Windows (registry keys open to every AppContainer; screen and keyboard access not proven blocked; no direct read of user files, but whether file contents shown on screen can be captured is not proven) | Desktop run recorded in the known gaps; not covered by CI |
+| Any network: internet, LAN, loopback, DNS, model APIs | No capabilities: the Filtering Platform is expected to drop all traffic | No socket can be created | Prevented for what is tested. Checked at every start: loopback TCP and UDP only. CI also covers a public address on port 443 and a DNS lookup, and on Linux every socket kind. IPv6 loopback and the host's LAN address were denied on one manual desktop run only | `connecting_to_a_loopback_listener_is_denied`; `reaching_the_internet_is_denied`; `every_kind_of_socket_is_denied` (Linux); start-up probe (loopback only) |
 | Reach the Core's RPC endpoint | Pipe DACL omits the package SID; RPC refuses restricted tokens | No sockets | Prevented | `a_rogue_worker_cannot_bypass_policy_or_approve_its_own_request`; `the_worker_cannot_open_an_owner_only_pipe` |
 | Start another program, or escape the job | Child-process policy plus a one-process job without breakaway | `fork`, `vfork` and process `clone` denied | Prevented, and checked at every start | `starting_a_child_process_is_denied` |
 | Re-execute itself as another binary | Not possible without creating a process | `execve` of a binary under a runtime root, which keeps the same Landlock domain and seccomp filter | Mitigated on Linux | ADR 0014 |
@@ -171,9 +172,9 @@ What a compromised worker can do when it ignores the protocol and calls the oper
 | Use privileges or capabilities | Token checked for exactly our package SID and no capabilities; every privilege but `SeChangeNotifyPrivilege` removed before it runs | All capabilities dropped; `no_new_privs` | Prevented | `the_worker_runs_in_an_app_container_at_low_integrity` (Windows); `the_worker_has_no_capabilities` (Linux) |
 | Exhaust memory | Job commit limit | `RLIMIT_AS` | Mitigated (CPU time is not limited) | `the_memory_limit_applies` |
 | Outlive the Core | Job kill-on-close | `PR_SET_PDEATHSIG` | Prevented | `the_worker_dies_with_the_core` |
-| Run with a boundary that silently failed to apply | Every control is applied before the first instruction; any failure aborts the start; the start-up probe proves network, file and process denial | Same | Prevented | `a_missing_boundary_is_detected`; `a_probe_that_cannot_run_fails_closed`; `a_missing_worker_program_stops_the_core_before_any_worker` |
-| Network block disabled because the Base Filtering Engine is stopped | The start-up probe would see traffic and the Core would refuse to start | Not applicable | Mitigated | Start-up probe |
-| The optional provisioning script giving administrator rights to code a user process could replace | It derives the package SID itself and never runs `jarvis-core.exe` elevated; it grants only validated interpreter directories | Not applicable | Prevented | CI runs the script end to end |
+| Run with a boundary that silently failed to apply | Every control is applied before the first instruction; any failure aborts the start; the start-up probe checks loopback, file and process denial | Same | Prevented | `a_missing_boundary_is_detected`; `a_probe_that_cannot_run_fails_closed`; `a_missing_worker_program_stops_the_core_before_any_worker` |
+| Network block disabled because the Base Filtering Engine is stopped | If the Base Filtering Engine were stopped the block might not apply. The start-up probe is expected to notice loopback traffic and the Core to refuse to start; this has not been run. Other traffic would not be noticed | Not applicable | Untested; at most mitigated, and only for loopback | Start-up probe; the last step of section 9 in [`windows-validation.md`](windows-validation.md) is not yet run |
+| The optional provisioning script giving administrator rights to code a user process could replace | It derives the package SID itself and never runs `jarvis-core.exe` elevated; it grants only validated interpreter directories | Not applicable | Prevented | CI runs the script end to end on an administrator runner; not yet run on a desktop |
 | Exploit a kernel or OS-component vulnerability to leave the boundary | — | — | Out of scope | — |
 | A same-user process outside JARVIS tampering with the Core | — | — | Out of scope (see known gaps) | — |
 
@@ -211,8 +212,9 @@ The Core guarantees that **authority is used at most once**: an approval is cons
 - **The isolation is as strong as the OS mechanisms behind it.** A kernel, AppContainer or Landlock escape is out of scope. The seccomp filter is a denylist of dangerous syscall groups, not an allowlist; an independent review found and closed gaps in an earlier version (signals through file ownership, other processes' limits, System V IPC, newer metadata calls), and a syscall added by a future kernel is allowed until it is listed.
 - **On Linux the worker can `stat` paths outside its grants**, learning whether they exist and their size, mode and times (Landlock does not mediate metadata). It cannot read contents.
 - **On Windows the worker can read system directories** that grant "ALL APPLICATION PACKAGES" (for example `C:\Windows`, `Program Files`), and learns the user's profile path from the variables an AppContainer launch requires. It can open neither the profile nor anything else of the user's.
-- **On Windows the worker can read registry keys that grant "ALL APPLICATION PACKAGES"**, which include parts of the user's `HKEY_CURRENT_USER` such as the Explorer list of recently opened documents. It has no channel out except the typed requests the Core checks, but the names it learns can appear in a request a person reviews. A less privileged AppContainer, which drops that group, is not yet validated with CPython.
-- **On Windows the worker's access to the screen and keyboard state is not proven blocked.** It cannot open the clipboard, but it can obtain a screen device context; the job's UI restrictions and the AppContainer are the only controls, and win32k system calls are not disabled (ADR 0013).
+- **On Windows the worker can read registry keys that grant "ALL APPLICATION PACKAGES"**, which include parts of the user's `HKEY_CURRENT_USER` such as the Explorer list of recently opened documents. It has no channel out except the typed requests the Core checks, but the names it learns can appear in a request a person reviews. On a desktop run it opened `HKEY_CURRENT_USER\Software` and Explorer's `RecentDocs` for reading. Reading the values in readable keys, not only listing their names, follows from the read access but was not separately recorded, and the full set of readable keys has not been enumerated. A less privileged AppContainer (LPAC), which drops that group, is not implemented and not yet validated with CPython; it is a possible future mitigation only.
+- **On Windows the worker's access to the screen and keyboard state is not proven blocked.** It cannot open the clipboard, but it can obtain a screen device context; whether it can capture screen pixels is not proven either way, and reading keyboard state (`GetAsyncKeyState`) was inconclusive. The job's UI restrictions and the AppContainer are the only controls; win32k system calls are not disabled, and that lockdown is not implemented or tested (ADR 0013).
+- **Until the registry and screen and keyboard gaps are resolved, no language model, voice or personal-data integration may run in the worker.** Such an integration would give the worker data worth reading, and these are channels through which it could read more than the typed requests show.
 - **On Windows the worker can write in its own AppContainer folder** (where `TEMP` points), because Windows grants an AppContainer that folder through an entry no deny entry overrides. The Core empties it before every start, so nothing survives into the next worker, but within one session disk use is bounded only by free space.
 - **CPU time is not limited.** A worker that spins wastes CPU until the job or handshake timeout ends its session.
 - **A local attacker running as the same user** can edit the config, the policy and the database, and can approve requests. JARVIS does not defend against that account.
