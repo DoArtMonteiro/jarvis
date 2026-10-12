@@ -101,6 +101,76 @@ async fn a_worker_with_network_access_is_refused() {
     ));
 }
 
+#[test]
+fn concurrent_cores_each_start_their_worker_in_isolation() {
+    // Separate Core processes share one AppContainer profile on Windows; a
+    // launch in one must not fail or undo a launch in another.
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let core = |config: &Path, args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_jarvis-core"));
+        command.args(args).arg("--config").arg(config);
+        command.stdin(Stdio::null());
+        command
+    };
+    let cores: Vec<_> = (0..8)
+        .map(|n| {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("jarvis.toml");
+            let text = format!(
+                "database = {database:?}\n\n[worker]\nprogram = {python:?}\n\
+                 args = [\"-m\", \"jarvis_worker\"]\ncwd = {cwd:?}\n\n\
+                 [fixtures]\nroot = {fixtures:?}\n\n[workspace]\nroot = {workspace:?}\n\n\
+                 [rpc]\nsocket = {socket:?}\npipe = \"jarvis-concurrent-{id}-{n}\"\n\
+                 allow_shutdown = true\n\n[policy]\n\"system.info\" = \"allow\"\n",
+                database = dir.path().join("jarvis.db"),
+                python = python(),
+                cwd = repo().join("services/intelligence-python/src"),
+                fixtures = repo().join("tests/fixtures/files"),
+                workspace = dir.path().join("workspace"),
+                socket = dir.path().join("rpc").join("jarvis.sock"),
+                id = std::process::id(),
+            );
+            std::fs::write(&config, text).unwrap();
+            let log = std::fs::File::create(dir.path().join("core.log")).unwrap();
+            let child = core(&config, &["serve"])
+                .stdout(Stdio::piped())
+                .stderr(log)
+                .spawn()
+                .unwrap();
+            (dir, config, child)
+        })
+        .collect();
+    let mut failures = Vec::new();
+    for (dir, config, mut child) in cores {
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let worker = loop {
+            let output = core(&config, &["health", "--json"]).output().unwrap();
+            let health: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_default();
+            let worker = health["worker"].clone();
+            if worker["state"] == "idle" || worker["state"] == "failed" || Instant::now() > deadline
+            {
+                break worker;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if !ready.starts_with("ready ") || worker["state"] != "idle" || worker["restarts"] != 0 {
+            let log = std::fs::read_to_string(dir.path().join("core.log")).unwrap_or_default();
+            failures.push(format!("{worker}\n{log}"));
+        }
+        let _ = core(&config, &["shutdown"]).output();
+        let _ = child.wait();
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n---\n"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_probe_that_cannot_run_fails_closed() {
     // A program that is not an interpreter produces no report.
