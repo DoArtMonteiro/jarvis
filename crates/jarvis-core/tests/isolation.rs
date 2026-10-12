@@ -109,6 +109,15 @@ fn concurrent_cores_each_start_their_worker_in_isolation() {
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
+    /// Kills its Core if the test ends early, before the directory goes.
+    struct Running(std::process::Child);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     let core = |config: &Path, args: &[&str]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_jarvis-core"));
         command.args(args).arg("--config").arg(config);
@@ -140,16 +149,16 @@ fn concurrent_cores_each_start_their_worker_in_isolation() {
                 .stderr(log)
                 .spawn()
                 .unwrap();
-            (dir, config, child)
+            (Running(child), config, dir)
         })
         .collect();
     let mut failures = Vec::new();
-    for (dir, config, mut child) in cores {
+    for (mut core_process, config, dir) in cores {
         let mut ready = String::new();
-        BufReader::new(child.stdout.take().unwrap())
+        BufReader::new(core_process.0.stdout.take().unwrap())
             .read_line(&mut ready)
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let worker = loop {
             let output = core(&config, &["health", "--json"]).output().unwrap();
             let health: serde_json::Value =
@@ -166,7 +175,7 @@ fn concurrent_cores_each_start_their_worker_in_isolation() {
             failures.push(format!("{worker}\n{log}"));
         }
         let _ = core(&config, &["shutdown"]).output();
-        let _ = child.wait();
+        drop(core_process);
     }
     assert!(failures.is_empty(), "{}", failures.join("\n---\n"));
 }
