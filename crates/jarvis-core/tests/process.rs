@@ -541,7 +541,8 @@ fn a_write_runs_only_after_a_person_approves_it_through_another_client() {
 }
 
 /// Pending approvals do not survive a restart, and a consumed approval stays
-/// consumed: neither can be used after the Core comes back.
+/// consumed: neither can be used after the Core comes back. The job that was
+/// waiting is queued again and asks again with a new approval.
 #[test]
 fn no_approval_can_be_used_after_the_core_restarts() {
     let setup = Setup::new("real", POLICY, "");
@@ -563,7 +564,9 @@ fn no_approval_can_be_used_after_the_core_restarts() {
     daemon.crash();
 
     let daemon = setup.serve();
-    assert!(setup.json(&["approvals", "list"]).is_empty());
+    let renewed = setup.pending_approval();
+    assert_ne!(renewed["approval_id"], second_id.as_str());
+    assert_ne!(renewed["fingerprint"], second["fingerprint"]);
     let shown = setup.json(&["approvals", "show", &second_id]).remove(0);
     assert_eq!(shown["status"], "expired");
     let shown = setup.json(&["approvals", "show", &first_id]).remove(0);
@@ -573,7 +576,7 @@ fn no_approval_can_be_used_after_the_core_restarts() {
         assert_eq!(output.status.code(), Some(1), "{id} was approved again");
     }
     let job = setup.json(&["job", &job]).remove(0);
-    assert_eq!(job["status"], "interrupted");
+    assert_eq!(job["status"], "running", "waiting for the new approval");
     assert_eq!(setup.workspace_file("a.txt").as_deref(), Some("first"));
     assert_eq!(setup.workspace_file("b.txt"), None);
     assert!(setup.shutdown(daemon).success());
@@ -674,22 +677,28 @@ fn a_worker_that_dies_while_waiting_for_approval_leaves_nothing_usable() {
     let setup = Setup::new("crash-waiting", POLICY, "");
     let daemon = setup.serve();
     let job = setup.submit("anything");
-    setup.wait_for_kind("approval_requested", 1);
-    setup.wait_for_kind("worker_restart_scheduled", 1);
-    let approval = setup
+    // Nothing the worker did completed or started, so the job is tried again
+    // until its attempts are spent. Every attempt asks anew.
+    setup.wait_for_kind("job_finished", 1);
+    let approvals: Vec<_> = setup
         .events()
         .into_iter()
-        .find_map(|event| match event.event {
+        .filter_map(|event| match event.event {
             AuditEventKind::ApprovalRequested { approval_id, .. } => Some(approval_id),
             _ => None,
         })
-        .unwrap();
-    let record = setup.store().approval(approval).unwrap().unwrap();
-    assert_eq!(record.status, ApprovalStatus::Expired);
-    let output = setup.run(&["approvals", "approve", &approval.to_string(), "--yes"]);
-    assert_eq!(output.status.code(), Some(1));
+        .collect();
+    assert_eq!(approvals.len(), 3);
+    for approval in approvals {
+        let record = setup.store().approval(approval).unwrap().unwrap();
+        assert_eq!(record.status, ApprovalStatus::Expired);
+        let output = setup.run(&["approvals", "approve", &approval.to_string(), "--yes"]);
+        assert_eq!(output.status.code(), Some(1));
+    }
+    assert_eq!(setup.count("job_requeued"), 2);
     let job = setup.json(&["job", &job]).remove(0);
     assert_eq!(job["status"], "interrupted");
+    assert!(job["summary"].as_str().unwrap().contains("attempt limit"));
     assert_eq!(setup.workspace_file("never.txt"), None);
     drop(daemon);
 }
@@ -821,7 +830,11 @@ fn start_up_recovers_what_a_previous_run_left_open() {
         store.task(task_id).unwrap().unwrap().status,
         TaskStatus::Interrupted
     );
-    assert_eq!(store.jobs(1).unwrap()[0].status, JobStatus::Cancelled);
+    // A queued job is carried over, not cancelled.
+    assert!(matches!(
+        store.jobs(1).unwrap()[0].status,
+        JobStatus::Queued | JobStatus::Completed | JobStatus::Failed
+    ));
     assert!(
         store
             .audit_events(Some(task_id), 100)
