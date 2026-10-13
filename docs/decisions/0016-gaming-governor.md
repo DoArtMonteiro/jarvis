@@ -88,7 +88,7 @@ On the Core's side the real source runs `find_running` on a blocking thread. Tes
 
 ### Cost
 
-Measured on a Windows machine with 1019 processes, a release build, over 60 s of real time: with the governor off the Core used no measurable CPU; on, with `poll_ms = 2000`, it used 687.5 ms of CPU, about 1.15% of one core. One Toolhelp snapshot costs about 17 ms of CPU there. That cost is inherent to listing the process table and grows with the number of processes. The cheaper Windows ways to ask whether a named process runs need `OpenProcess` on the target, which this design excludes. The default `poll_ms` is therefore 5000, and the cost at that setting has not been measured. A longer poll also means a game can run for that long before the gate closes.
+Measured on a Windows machine with 1019 processes, a release build, over 60 s of real time: with the governor off the Core used no measurable CPU; on, with `poll_ms = 2000`, it used 687.5 ms of CPU, about 1.15% of one core. One Toolhelp snapshot costs about 17 ms of CPU there. That cost is inherent to listing the process table and grows with the number of processes. The cheaper Windows ways to ask whether a named process runs need `OpenProcess` on the target, which this design excludes. The default `poll_ms` is therefore 5000. At that setting two 60 s runs on the same machine used 234.4 ms and 265.6 ms of CPU, about 0.4% of one core. A longer poll also means a game can run for that long before the gate closes.
 
 ### Privacy
 
