@@ -63,6 +63,25 @@ pipe = "jarvis"
 # Lets `jarvis-core shutdown` stop the Core. Off by default.
 allow_shutdown = true
 
+[governor]
+# Off by default. When on, the Core does not start queued jobs while one of
+# the listed processes is running. Jobs that already run are left alone, and
+# nothing about the game is touched: only the system's process list is read.
+# Right after start-up jobs wait for the first check.
+enabled = false
+# Executable names, compared ignoring ASCII case; 1 to 16 names of up to 64
+# printable ASCII characters, no `/` or `\`. On Linux the kernel keeps only
+# the first 15 bytes of a process name, so list the name as `ps` shows it.
+processes = ["cs2.exe"]
+# How often the process list is read (250 to 60000).
+poll_ms = 2000
+# How long the list must stay clear before queued jobs start again (0 to
+# 600000).
+resume_delay_ms = 30000
+# A hold longer than this is reported as overdue in `health` and the audit
+# log (60000 to 86400000). Jobs keep waiting: time alone never ends a hold.
+alert_after_ms = 14400000
+
 # Capabilities not listed here are denied.
 # Decisions: "allow", "require_confirmation", "deny".
 # Class B capabilities (workspace.write) cannot be set to "allow".
