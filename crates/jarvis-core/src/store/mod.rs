@@ -383,7 +383,9 @@ impl Store {
     /// - queued jobs stay queued; a running job goes back to the queue, or
     ///   ends `interrupted` when it ran out of attempts or a task of it has an
     ///   unknown outcome (see [`Store::requeue_or_close`]). This runs before
-    ///   open tasks are rewritten, so it still sees what they were doing.
+    ///   open tasks are rewritten. The decision does not depend on that order
+    ///   (it reads the `execution_started` event and the final status), but
+    ///   settling first records the quarantine before the task rewrite.
     pub fn recover(&self, max_job_attempts: u32) -> Result<Recovery, StoreError> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;

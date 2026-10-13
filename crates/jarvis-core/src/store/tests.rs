@@ -1533,9 +1533,9 @@ fn a_database_written_at_migration_two_upgrades_to_the_ledger() {
     assert_eq!(claimed.attempts, 1);
 }
 
-/// Recovery must look at the tasks before it rewrites them. The rewrite turns
-/// an `executing` task into `interrupted`, which would hide what it was doing
-/// if the job were settled afterwards, so the audit order is the evidence.
+/// Recovery settles a job before it rewrites its open tasks, so the audit
+/// trail shows the quarantine before the task recovery. The decision itself
+/// does not depend on the order.
 #[test]
 fn recovery_settles_a_job_before_it_rewrites_its_tasks() {
     let dir = tempfile::tempdir().unwrap();

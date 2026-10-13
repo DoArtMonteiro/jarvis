@@ -17,7 +17,7 @@ Resuming a job is only safe if it never repeats a side effect whose result is al
 - A running job ends **`failed`** when it exceeded `job_timeout`, broke the protocol (`terminated`), or failed a replay check (below). These are never requeued.
 - Every Core shutdown while a job runs spends one of its attempts, because the next start claims it again. A job found running with no attempt counted, left from before attempts were recorded, has no ledger of steps and ends `interrupted`.
 - The Core counts attempts per job. A job that has already been claimed `max_job_attempts` times ends `interrupted` instead of being requeued. So the total time spent on a job is at most `max_job_attempts × job_timeout`.
-- One store function makes this decision for both start-up recovery and session close. At start-up it runs in the recovery transaction, before tasks left open are rewritten, so it still sees what they were doing.
+- One store function makes this decision for both start-up recovery and session close. At start-up it runs in the recovery transaction, before tasks left open are rewritten. The decision does not depend on that order, because it reads whether `execution_started` was recorded and the task's final status; settling first keeps the audit trail in causal order, with the quarantine recorded before the task rewrite.
 
 ### Steps and replay
 
@@ -44,8 +44,9 @@ Approvals are still expired when their session ends and at start-up (ADR 0009). 
 ## Consequences
 
 - The guarantee is *at most once for a recorded completion*: resuming never runs a step whose completion is recorded, and never runs a step whose outcome is unknown. It is **not** exactly-once. A tool can act and the Core can stop before `execution_started` is followed by a result. That job is then quarantined rather than resumed, so the action may have happened once and is never repeated automatically.
-- Replay depends on the worker sending the same requests in the same order on every attempt. The current planner is a pure function of the goal, so it does. A planner that is not, such as a language model, will fail the replay check at the first difference. Its resumed jobs then end `failed`, and no completed step runs twice. Resuming such planners needs the protocol to tell the worker which steps are done. That would be a later decision.
+- Replay depends on the worker sending the same requests in the same order on every attempt. The current planner is a pure function of the goal, so it does. The Core checks only positions whose step completed: a different request there ends the job `failed`. A request at any other position is a new request with a new task and, for class B, a new approval. So a planner that is not deterministic, such as a language model, can ask for an action again, and a person decides on any class B one. Resuming such planners safely needs the protocol to tell the worker which steps are done. That would be a later decision.
 - There is no request to cancel a job. Carrying the queue over a restart adds no authority: every class B step still needs a fresh approval. Terminal jobs never change (migration 0002).
 - `cancelled` is no longer produced for jobs by recovery. Existing rows keep their status.
 - Replayed steps count toward `max_requests_per_session`. A job with more completed steps than that limit cannot finish on a later attempt: its session ends with a limit error (`limit_exceeded`) and the job ends `failed`.
 - A job that crashes the worker every time uses up its attempts and ends `interrupted`. The worker restart budget still applies on top.
+- A job whose worker keeps dying while a class B step waits asks a person once per attempt, at most `max_job_attempts` times, each with a new approval.
