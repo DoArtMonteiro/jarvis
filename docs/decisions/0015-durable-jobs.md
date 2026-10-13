@@ -17,7 +17,7 @@ Resuming a job is only safe if it never repeats a side effect whose result is al
 - A running job ends **`failed`** when it exceeded `job_timeout`, broke the protocol (`terminated`), or failed a replay check (below). These are never requeued.
 - Every Core shutdown while a job runs spends one of its attempts, because the next start claims it again. A job found running with no attempt counted, left from before attempts were recorded, has no ledger of steps and ends `interrupted`.
 - The Core counts attempts per job. A job that has already been claimed `max_job_attempts` times ends `interrupted` instead of being requeued. So the total time spent on a job is at most `max_job_attempts × job_timeout`.
-- One store function makes this decision for both start-up recovery and session close. At start-up it runs in the recovery transaction, before tasks left open are rewritten. The decision does not depend on that order, because it reads whether `execution_started` was recorded and the task's final status; settling first keeps the audit trail in causal order, with the quarantine recorded before the task rewrite.
+- One store function makes this decision for both start-up recovery and session close. At start-up it runs in the recovery transaction, before tasks left open are rewritten. The decision does not depend on that order, because it reads whether `execution_started` was recorded and the task's final status; settling first records the quarantine before the task rewrite.
 
 ### Steps and replay
 
