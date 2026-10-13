@@ -1456,6 +1456,83 @@ fn a_job_from_before_the_ledger_is_never_requeued() {
     assert!(!job_kinds(&store).contains(&"job_requeued"));
 }
 
+/// No other test opens a database that a Core at migration 0002 wrote, so the
+/// upgrade over real rows is only proved here.
+#[test]
+fn a_database_written_at_migration_two_upgrades_to_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jarvis.db");
+    let running = JobId::new();
+    let queued = JobId::new();
+    let task = TaskId::new();
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                 version    INTEGER PRIMARY KEY NOT NULL,
+                 name       TEXT NOT NULL,
+                 applied_at TEXT NOT NULL
+             ) STRICT;",
+        )
+        .unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 2) {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+                params![migration.version, migration.name, "2026-01-01T00:00:00Z"],
+            )
+            .unwrap();
+        }
+        for (id, status, goal) in [(running, "running", "old"), (queued, "queued", "waiting")] {
+            conn.execute(
+                "INSERT INTO jobs (job_id, goal, submitted_by, status, created_at, updated_at)
+                 VALUES (?1, ?2, 'client', ?3, ?4, ?4)",
+                params![id.to_string(), goal, status, "2026-01-01T00:00:00Z"],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tasks (task_id, session_id, request_id, tool, args, status, job_id,
+                                created_at, updated_at)
+             VALUES (?1, ?2, 'r1', 'system.info', '{}', 'completed', ?3, ?4, ?4)",
+            params![
+                task.to_string(),
+                SessionId::new().to_string(),
+                running.to_string(),
+                "2026-01-01T00:00:00Z"
+            ],
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), latest_version());
+    assert_eq!(latest_version(), 3);
+
+    let before = store.job(running).unwrap().unwrap();
+    assert_eq!(before.status, JobStatus::Running);
+    assert_eq!(before.attempts, 0);
+    assert_eq!(before.goal.as_str(), "old");
+    assert_eq!(
+        store.job(queued).unwrap().unwrap().status,
+        JobStatus::Queued
+    );
+    let kept = store.task(task).unwrap().unwrap();
+    assert_eq!(kept.status, TaskStatus::Completed);
+    assert_eq!(kept.job_id, Some(running));
+
+    // Without a ledger the running job cannot be resumed, so it is ended.
+    assert_eq!(store.recover(MAX_ATTEMPTS).unwrap().jobs, 1);
+    let done = store.job(running).unwrap().unwrap();
+    assert_eq!(done.status, JobStatus::Interrupted);
+    assert!(!job_kinds(&store).contains(&"job_requeued"));
+
+    let claimed = store.claim_next_job(SessionId::new()).unwrap().unwrap();
+    assert_eq!(claimed.job_id, queued);
+    assert_eq!(claimed.status, JobStatus::Running);
+    assert_eq!(claimed.attempts, 1);
+}
+
 /// Recovery must look at the tasks before it rewrites them. The rewrite turns
 /// an `executing` task into `interrupted`, which would hide what it was doing
 /// if the job were settled afterwards, so the audit order is the evidence.
