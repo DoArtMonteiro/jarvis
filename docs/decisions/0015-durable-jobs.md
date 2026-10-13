@@ -22,7 +22,7 @@ Resuming a job is only safe if it never repeats a side effect whose result is al
 ### Steps and replay
 
 - Every tool request in a job has a position, `seq`, counted from 1 in each attempt. A request that creates a task or is answered from the ledger takes a position. A frame rejected before a task exists does not. Each task created for a job is recorded in an insert-only ledger: `(job_id, attempt, seq, task_id)`.
-- A step is **completed** when the task recorded for that `(job_id, seq)` in an earlier attempt has status `completed`. The Core never creates a second task for a completed position, so there is at most one.
+- A step is **completed** when the task recorded for that `(job_id, seq)` in an earlier attempt has status `completed`. There is at most one, because the Core never creates a task at a completed position; no schema constraint enforces it.
 - When the worker sends the request at position `seq` and a completed task exists there, the Core checks three things:
   - the request, parsed as a typed call, equals the stored task's call;
   - current policy does not deny it;
@@ -33,7 +33,7 @@ Resuming a job is only safe if it never repeats a side effect whose result is al
 
 ### Uncertain outcomes are quarantined
 
-A task's outcome is **known** only when `execution_started` was recorded and the task then ended `completed`, or ended `failed` with an error the tool itself reported (`tool_failed`). The workspace writer, for example, renames a complete temporary file into place or writes nothing, so a write that reports an error did not happen. Every other task that started is **unknown**: one still `executing` when the Core stopped, `interrupted` after starting, `timed_out`, `cancelled` by shutdown, `failed` because the tool panicked (`internal`), or `failed` because the Core rejected a result after the tool had run (`result_rejected`). In each case the tool may have acted without the Core recording what it did.
+A task's outcome is **known** only when `execution_started` was recorded and the task then ended `completed`, or ended `failed` with an error the tool itself reported (`tool_failed`). The workspace writer, for example, renames a complete temporary file into place or writes nothing, so a write that reports an error did not happen. Treating `tool_failed` as known relies on every tool guaranteeing that an error it reports means it changed nothing, because the gateway maps every error a tool returns to `tool_failed`. A tool that cannot promise this must not report `tool_failed` for a partial effect. Every other task that started is **unknown**: one still `executing` when the Core stopped, `interrupted` after starting, `timed_out`, `cancelled` by shutdown, `failed` because the tool panicked (`internal`), or `failed` because the Core rejected a result after the tool had run (`result_rejected`). In each case the tool may have acted without the Core recording what it did.
 
 A job with any task of unknown outcome is never resumed, whatever the task's class. It ends `interrupted`, its summary names the task, and `job_quarantined` is recorded. A person decides what to do next. A job that ends without a retry (a timeout, a protocol violation, a replay mismatch, or a failure the worker reports) records `job_quarantined` as well when such a task exists, so the audit log says where a person should look.
 
@@ -47,4 +47,5 @@ Approvals are still expired when their session ends and at start-up (ADR 0009). 
 - Replay depends on the worker sending the same requests in the same order on every attempt. The current planner is a pure function of the goal, so it does. A planner that is not, such as a language model, will fail the replay check at the first difference. Its resumed jobs then end `failed`, and no completed step runs twice. Resuming such planners needs the protocol to tell the worker which steps are done. That would be a later decision.
 - There is no request to cancel a job. Carrying the queue over a restart adds no authority: every class B step still needs a fresh approval. Terminal jobs never change (migration 0002).
 - `cancelled` is no longer produced for jobs by recovery. Existing rows keep their status.
+- Replayed steps count toward `max_requests_per_session`. A job with more completed steps than that limit cannot finish on a later attempt: its session ends with a limit error (`limit_exceeded`) and the job ends `failed`.
 - A job that crashes the worker every time uses up its attempts and ends `interrupted`. The worker restart budget still applies on top.
