@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn governor_rejects_unknown_keys() {
-        assert!(governor("max_hold_ms = 1000").is_err());
+        assert!(governor("unknown_key_ms = 1000").is_err());
         assert!(governor("enabled = \"yes\"").is_err());
         assert!(governor("processes = \"cs2.exe\"").is_err());
     }

@@ -556,7 +556,7 @@ fn governor_line(governor: &GovernorView) -> String {
     let line = match governor.state {
         GovernorPhase::Off => return "off".to_owned(),
         GovernorPhase::Open => return "open".to_owned(),
-        GovernorPhase::Releasing => format!("releasing after {}", held_for()),
+        GovernorPhase::Releasing => format!("releasing, held for {}", held_for()),
         GovernorPhase::Held => {
             let why = match (governor.reason, governor.process.as_deref()) {
                 (Some(GovernorReason::Game), Some(name)) => format!("{name} is running"),
@@ -970,7 +970,7 @@ mod tests {
             "held, cannot read the process list, for 5s"
         );
         let releasing = view(GovernorPhase::Releasing, None, Some(90_000));
-        assert_eq!(governor_line(&releasing), "releasing after 1m 30s");
+        assert_eq!(governor_line(&releasing), "releasing, held for 1m 30s");
         let overdue = GovernorView {
             overdue: true,
             ..game

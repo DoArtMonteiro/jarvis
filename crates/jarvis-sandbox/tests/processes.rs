@@ -29,9 +29,9 @@ fn exe_name(stem: &str) -> String {
     }
 }
 
-/// Copy a small system binary to `dir/<unique>` and start it for 30 s.
-fn start_copy(dir: &Path, stem: &str) -> (Child, PathBuf) {
-    let target = dir.join(exe_name(stem));
+/// Copy a small system binary to `dir/<file_name>` and start it for 30 s.
+fn start_copy(dir: &Path, file_name: &str) -> (Child, PathBuf) {
+    let target = dir.join(file_name);
     let (source, args): (&str, &[&str]) = if cfg!(windows) {
         (r"C:\Windows\System32\PING.EXE", &["-n", "30", "127.0.0.1"])
     } else {
@@ -96,7 +96,7 @@ fn a_process_is_found_while_it_runs_and_not_after_it_exits() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(find_running(&[&name]).unwrap(), None, "not started yet");
 
-    let (mut child, _target) = start_copy(dir.path(), &stem);
+    let (mut child, _target) = start_copy(dir.path(), &name);
     let seen = wait_until(|| find_running(&[&name]).unwrap().is_some());
     let found = find_running(&[&name]).unwrap();
 
@@ -111,15 +111,26 @@ fn a_process_is_found_while_it_runs_and_not_after_it_exits() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn a_linux_name_longer_than_comm_matches_its_truncation() {
+fn a_linux_name_is_compared_as_the_kernel_keeps_it() {
     // `comm` keeps 15 bytes, so the configured name is cut the same way.
     // The price is that two names with the same first 15 bytes are equal.
-    let stem = unique_stem();
+    let long = format!("{}-and-a-long-tail", unique_stem());
+    assert!(long.len() > 15);
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, _target) = start_copy(dir.path(), &stem);
-    let long = format!("{stem}-and-a-long-tail");
+    let (mut child, _target) = start_copy(dir.path(), &long);
+
+    let same_start = format!("{}-a-different-tail", &long[..15]);
     let seen = wait_until(|| find_running(&[&long]).unwrap().is_some());
+    let lookalike = find_running(&[&same_start]).unwrap();
+    let shorter = find_running(&[&long[..14]]).unwrap();
+
     child.kill().unwrap();
     child.wait().unwrap();
-    assert!(seen);
+    assert!(seen, "the long name was not found");
+    assert_eq!(
+        lookalike.as_deref(),
+        Some(same_start.as_str()),
+        "documented false positive"
+    );
+    assert_eq!(shorter, None, "14 bytes is not the 15 the kernel kept");
 }

@@ -509,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn the_start_up_hold_also_alerts_if_the_first_reading_never_comes() {
+    fn the_start_up_hold_counts_toward_the_alert_when_the_first_reading_comes_late() {
         let (state, events) = step(State::starting(0), Observation::Failed, ALERT, TIMING);
         assert!(matches!(state, State::Held { overdue: true, .. }));
         assert_eq!(
