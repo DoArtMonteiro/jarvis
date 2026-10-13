@@ -146,6 +146,17 @@ To undo everything: elevated, `scripts\windows\isolation.ps1 -Action Remove [-Gr
 
 **LOCAL WINDOWS VERIFICATION REQUIRED:** with the Windows Defender Firewall service stopped (only on a test machine), `jarvis isolation check` must either still pass (the Filtering Platform still enforces AppContainer isolation) or fail and make the Core refuse to start. It must never report `ok` while the probe actually reached the network. This scenario has not been run. The start-up probe detects loopback reachability only, so also repeat the internet and DNS probes of section 6 while the service is stopped. Record which.
 
+## 10. Gaming governor
+
+**LOCAL WINDOWS VERIFICATION REQUIRED** if you turn it on. CI proves the detection against a stand-in copied to a unique name; it cannot prove how a real game, its launcher or its anti-cheat software treat a process that only reads the process list.
+
+Set `[governor] enabled = true` and `processes = ["<your game>.exe"]` in the config you started the Core with, and start the Core as a standard user.
+
+- `jarvis health` shows `governor open` once the first check has run, and `held, <game>.exe is running` while the game runs. Start the game while the Core is already running, and then start the Core while the game is already running.
+- With the game running, `jarvis submit "describe the runtime"` queues the job and `jarvis job <id>` stays `queued`; no `job_started` appears in `jarvis audit`. After the game exits and `resume_delay_ms` has passed, the job runs, and `governor_released` precedes `job_started` in the audit log.
+- `jarvis audit` shows `governor_hold` with the configured name and nothing else about the process list.
+- Record whether the game, its launcher or its anti-cheat software reported or did anything because the Core was running. The Core opens no handle to the game; this is the check that matters.
+
 ## Results
 
 | Item | Result | Notes |
@@ -168,3 +179,4 @@ To undo everything: elevated, `scripts\windows\isolation.ps1 -Action Remove [-Gr
 | Overhead: interpreter start, idle memory, probe, RPC, idle CPU | | |
 | Provisioning install twice, check, remove | | |
 | Firewall service stopped (test machine only) | | |
+| Gaming governor: held and released around a real game; game, launcher and anti-cheat unaffected | | |

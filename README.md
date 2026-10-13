@@ -69,6 +69,7 @@ The limits are stated plainly in the [threat model](docs/threat-model.md). The w
 - Three tools: `system.info` (no hostname, username, environment or paths), `filesystem.read_fixture` (one configured directory) and `workspace.write_file` (one configured directory, handle-based resolution, atomic replace, no links followed out).
 - Worker isolation on Windows (AppContainer) and Linux (Landlock and seccomp), checked at every start by a probe (loopback TCP and UDP, a file next to the database, the user's home, starting a process) and by hostile probes from a real child process on CI; `isolation check` and `isolation remove` commands, and an optional Windows script that adds firewall rules for the worker as defence in depth.
 - SQLite store with migrations, jobs, tasks, approvals, an append-only audit log, replay protection and crash recovery. A job whose worker or Core stopped is resumed without repeating a recorded step, or quarantined when a step's outcome is unknown (ADR 0015).
+- Optional gaming governor (off by default): while a configured process runs, the Core does not start queued jobs; running jobs are not touched. It reads only the process list, holds when it cannot tell, never releases because of time, and shows its state in `health` and the audit log (ADR 0016).
 - Python worker with a job loop and a deterministic planner.
 
 ## Planned

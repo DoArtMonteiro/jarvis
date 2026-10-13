@@ -45,7 +45,7 @@ Each threat lists its current mitigation and the test that proves it, or states 
 | Credentials | API keys, tokens, SSH keys, password stores | None through tools; the worker starts with a cleared environment |
 | Private documents | Notes, mail, documents on the PC | None through tools. The worker's OS isolation denies it every user file outside its runtime and source. On Windows it can still read system directories and registry keys open to every AppContainer, such as Explorer's list of recent documents (opened for read on a desktop run; see known gaps) |
 | Browser and session data | Cookies, profiles, saved sessions | As above |
-| Processes | Ability to start, stop or control programs | No tool starts processes. The worker can start, signal or read no other process |
+| Processes | Ability to start, stop or control programs | No tool starts processes. The worker can start, signal or read no other process. When the governor is on, the Core reads the system process list to look for the configured game names; it opens no process (ADR 0016) |
 | Network access | Exfiltration, remote actions | No tool performs network I/O. By design the worker has no network at all, loopback included (no capabilities on Windows, no sockets on Linux). The start-up probe checks loopback TCP and UDP at every Core start (not on worker restarts); see the isolation table for what else is tested |
 | The approval channel | Whoever can approve can trigger class B actions | Local RPC, same user only, worker refused |
 | User identity | Hostname, username, account names | `system.info` deliberately omits them |
@@ -205,6 +205,23 @@ What a compromised worker can do when it ignores the protocol and calls the oper
 | Log or terminal injection | Worker and client text is escaped before it reaches the wire, the audit log, the logs or the CLI | Implemented | `worker_text_in_errors_is_escaped`; `error_messages_are_sanitised` |
 | Credential leakage to the worker | Cleared environment with no config option to add variables; no inherited descriptors or handles; no readable credential files | Implemented | `the_worker_environment_is_cleared`; `only_the_given_environment_reaches_the_worker`; the descriptor and handle probes |
 
+### The gaming governor
+
+Only present when `[governor]` is enabled (ADR 0016). It adds no tool, capability or RPC operation, and the worker does not know it exists.
+
+| Threat | Mitigation | Status | Evidence |
+| --- | --- | --- | --- |
+| A job starts while a game runs | The session reads the governor's gate before its single claim and does not claim while it is closed. No attempt is counted and no job timer starts | Implemented | `while_held_a_queued_job_is_not_claimed`; `a_hold_longer_than_the_job_timeout_does_not_use_up_the_job`; `a_requeued_job_is_held_too`; `queued_jobs_wait_while_a_game_runs_and_start_after_it_exits` |
+| A job queued before a restart starts before the first check | The Core starts held and the gate is closed before the first session can run; the first reading opens it | Implemented | `no_job_starts_before_the_first_detection`; `a_game_that_is_running_at_start_up_holds_a_job_queued_before_the_restart` |
+| The process list cannot be read, so "no game" would be a guess | Any failure to read the whole list is an error that holds the jobs; the real detection never reports a partial list as empty | Implemented | `a_failed_detection_holds_and_a_streak_is_recorded_once`; the pure `step` tests. That the detection itself returns an error, not a short list, is by construction: no test can make the OS list fail |
+| A release that is not on the record | The release is written before the gate opens; if the write fails the gate stays shut and tries again | Implemented | `if_the_release_cannot_be_recorded_the_gate_stays_closed_until_it_can`; `the_gate_opens_after_exactly_the_resume_delay_and_the_release_is_recorded_first` |
+| Time silently releasing work while the game runs | Time never ends a hold. After `alert_after_ms` one event is recorded and `health` shows `overdue` | Implemented | `a_long_hold_raises_one_alert_and_is_never_released_by_time` |
+| The governor touching the game | The process list is a snapshot of names. No process is opened, suspended, inspected or reprioritised, and a running job is never paused. Not tested against any game or anti-cheat product | Implemented | `a_process_is_found_while_it_runs_and_not_after_it_exits`; `a_hold_that_starts_while_a_job_runs_leaves_it_running` |
+| The audit log or `health` becoming a process inventory | Only the configured name that matched is recorded or shown | Implemented | `audit_events_carry_only_the_configured_name` |
+| A same-user process named like a configured game | Not prevented. It holds jobs for as long as it runs. The alert and the audit log make it visible | Accepted | `a_long_hold_raises_one_alert_and_is_never_released_by_time` |
+| A game that starts between the gate check and the claim | Not prevented; that job runs. A running job is never paused | Accepted | ADR 0016 |
+| Long names matching another program on Linux | `comm` keeps 15 bytes, so names are compared cut to 15. Two programs that share them cannot be told apart | Accepted | `a_linux_name_is_compared_as_the_kernel_keeps_it` (Linux CI) |
+
 ## Durability semantics
 
 The Core guarantees that **authority is used at most once**: an approval is consumed in the same transaction that starts execution, and can never be consumed again. It does **not** guarantee that a side effect happens exactly once. If the Core dies after that transaction and before the result is recorded, the write may or may not have happened; the task is marked `interrupted` and the approval stays consumed. A person decides whether to ask again.
@@ -222,6 +239,7 @@ Resuming a job keeps to the same rule. It never repeats a step whose completion 
 - **On Windows the worker can write in its own AppContainer folder** (where `TEMP` points), because Windows grants an AppContainer that folder through an entry no deny entry overrides. The Core empties it before every start, so nothing survives into the next worker, but within one session disk use is bounded only by free space.
 - **CPU time is not limited.** A worker that spins wastes CPU until the job or handshake timeout ends its session.
 - **A local attacker running as the same user** can edit the config, the policy and the database, and can approve requests. JARVIS does not defend against that account.
+- **The governor trusts the process names on the machine.** A process of the same user, named like a configured game, holds queued jobs until it exits; the alert only makes that visible. The same user can already edit the configuration, approve requests and change the database, so this adds no authority, and nothing here bounds it. A process hidden from the process list (a `/proc` mounted to hide other users' processes, say) is not seen, and an unreadable list is treated as a failed detection.
 - **Some Windows behaviour is verified only on a real desktop:** UI restrictions (CI runs inside a job), a standard (non-administrator) account, and Windows editions other than the CI image. See [`windows-validation.md`](windows-validation.md).
 - **Fixture reads have a time-of-check to time-of-use window** between canonicalisation and open; the fixture root is the user's to populate. Writes do not have this problem.
 - **Dependencies are pinned by lockfiles** but not yet audited in CI.

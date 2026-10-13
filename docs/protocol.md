@@ -208,6 +208,8 @@ A job can be handed out again after its worker or the Core stopped. Requests are
 
 Version 2 added `governor`. A Core and a client of different versions refuse each other's frames (above), so the CLI and the Core must come from the same build.
 
+The governor also writes three audit events, which are not part of either wire protocol: `governor_hold` (`reason`, and `process` when a game caused it), `governor_released` (`held_ms`) and `governor_hold_overdue` (`held_ms`). They carry the configured process name that matched and nothing else about the process list (ADR 0016).
+
 ### Approvals
 
 An `approval` reply carries what a person needs to decide: the tool, the derived capabilities, a display-safe description of the arguments (for a write: path, size, SHA-256 and a short escaped preview), the task, request and job IDs, the request time, the expiry and the time left. It also carries the `fingerprint`, a SHA-256 over the task ID, request ID, tool, normalised arguments and capabilities.
