@@ -137,7 +137,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         if !status.is_terminal() {
             return Err(StoreError::Corrupt(format!(
-                "job {job_id} is not running or `{status}` is not terminal"
+                "job {job_id} cannot finish as `{status}`, which is not terminal"
             )));
         }
         let mut conn = self.conn()?;
