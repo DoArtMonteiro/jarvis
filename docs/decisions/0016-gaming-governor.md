@@ -44,7 +44,7 @@ Notes on the table:
 - A zero `resume_delay_ms` releases on the first clear reading.
 - `held_ms` counts from the beginning of the hold, resume delay included, and a game that returns during the delay does not start a new hold.
 - Detection errors are logged and audited once per streak. A streak that starts while the gate is open produces one `governor_hold`, and the readings that fail after it change nothing. A failure while already held changes the reason shown in `health` and nothing else.
-- The release is recorded before the gate opens. If that write fails, the gate stays shut and the next reading tries again; the failure is logged once per streak. A hold is the other way round: the gate closes first and the record is written after, so a slow, locked or failing database cannot keep jobs starting while a game runs. A hold that cannot be recorded still applies, and an error is logged.
+- The release is recorded before the gate opens. If that write fails, the gate stays shut, `health` shows `releasing` (also when `resume_delay_ms` is 0, where the step would otherwise have gone straight from held to open) and the next reading tries again; the failure is logged once per streak. A hold is the other way round: the gate closes first and the record is written after, so a slow, locked or failing database cannot keep jobs starting while a game runs. A hold that cannot be recorded still applies, and an error is logged.
 
 ### Start-up
 
@@ -54,7 +54,7 @@ The first reading ends it. A clear list opens the gate at once, without a resume
 
 ### Reads that hang, and a governor that stops
 
-The real source reads the list on a blocking thread, which Tokio cannot cancel. At most one read is in flight. A read that has not finished within `poll_ms` counts as a failed reading, so the jobs are held with reason `detection_failed`, and the next tick goes on waiting for that same read instead of starting another. If it finishes late, its answer is used. A hung operating-system call therefore costs one blocked thread, not one per tick. The Core stops waiting for blocking threads five seconds after shutdown, so a hung call delays the exit of the process by at most that long.
+The real source reads the list on a blocking thread, which Tokio cannot cancel. At most one read is in flight. A read that has not finished within `poll_ms` counts as a failed reading, so the jobs are held with reason `detection_failed`, and the next tick goes on waiting for that same read instead of starting another. If it finishes late, its answer is used. A hung operating-system call therefore costs one blocked thread, not one per tick. A read that is merely slower than `poll_ms`, on a machine saturated with other work for example, also causes a `detection_failed` hold until it returns; that is the safe direction. The Core stops waiting for blocking threads five seconds after shutdown, so a hung call delays the exit of the process by at most that long.
 
 If the governor task ends for any reason but a stop request (a panic in a source, the task being dropped), a guard sets the gate to held with reason `detection_failed` and logs an error, and `health` shows it. Nothing would update the gate afterwards, so it must not stay open.
 
