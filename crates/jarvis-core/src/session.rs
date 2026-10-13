@@ -134,7 +134,7 @@ where
         requests: 0,
         errors: 0,
         job: None,
-        replayed: HashSet::new(),
+        used: HashSet::new(),
         backlog: VecDeque::new(),
     };
     let result = async {
@@ -185,9 +185,9 @@ struct Session<'a, R, W> {
     requests: u32,
     errors: u32,
     job: Option<RunningJob>,
-    /// Request IDs answered from the job's earlier work. They have no task,
-    /// so the store cannot tell that they were used.
-    replayed: HashSet<RequestId>,
+    /// Request IDs this session has used for a task or a replay. A replay
+    /// has no task, so the store alone cannot tell that its ID was used.
+    used: HashSet<RequestId>,
     /// Frames read while a request waited for a person, handled afterwards.
     backlog: VecDeque<Frame>,
 }
@@ -458,6 +458,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             return self.terminate(Some(request.request_id), error).await;
         }
 
+        if self.used.contains(&request.request_id) {
+            return self.duplicate_request(request.request_id).await;
+        }
+
         // A position an earlier attempt completed is answered from the
         // ledger. Attempt 1 has no earlier attempt to ask.
         if step.attempt > 1 {
@@ -486,6 +490,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             Ok(()) => {
                 self.requests += 1;
                 self.advance_to(step.seq);
+                self.used.insert(request.request_id.clone());
             }
             Err(StoreError::DuplicateRequest(request_id)) => {
                 return self.duplicate_request(request_id).await;
@@ -547,9 +552,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
         seq: u32,
         prior: TaskRecord,
     ) -> Result<Step, SessionError> {
-        if self.replayed.contains(&request.request_id) {
-            return self.duplicate_request(request.request_id).await;
-        }
         let result = match self.check_replay(&request, &prior) {
             Ok(result) => result,
             Err(reason) => return self.replay_mismatch(&request, seq, reason).await,
@@ -570,7 +572,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
         }
         self.requests += 1;
         self.advance_to(seq);
-        self.replayed.insert(request.request_id.clone());
+        self.used.insert(request.request_id.clone());
         tracing::info!(session = %self.id, task = %task_id, seq, "step replayed");
         let response = CoreMessage::ToolResponse(ToolResponse {
             request_id: request.request_id,
@@ -1017,13 +1019,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
                 SessionEnd::WorkerClosed | SessionEnd::WorkerGone | SessionEnd::Shutdown => {
                     self.requeue_or_close(job.id, end).await?;
                 }
+                // The worker broke the protocol: retrying would repeat it.
                 _ => {
                     let summary = Some(Summary::lossy(&format!(
                         "the worker stopped: {}",
                         end.describe()
                     )));
-                    self.finish_job(job.id, JobStatus::Interrupted, summary)
-                        .await?;
+                    self.finish_job(job.id, JobStatus::Failed, summary).await?;
                 }
             }
         }

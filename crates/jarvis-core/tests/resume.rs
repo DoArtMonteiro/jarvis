@@ -413,6 +413,89 @@ async fn a_replayed_request_id_cannot_be_reused_and_a_refusal_takes_no_position(
     h.worker_exits().await;
 }
 
+/// A replayed request has no task, so the store alone cannot tell that its
+/// request_id was used; the id must not name a second position either.
+#[tokio::test]
+async fn a_replayed_request_id_cannot_name_a_new_task() {
+    let env = Env::new();
+    let (job, first, _) = first_attempt_completes_system_info(&env).await;
+    let mut h = env.session(Options::default()).await;
+    h.takes(job).await;
+    assert_eq!(h.request("r1", "system.info", json!({})).await.0, first);
+    // Position 2 is open, and `r1` is taken.
+    h.send_request(
+        "r1",
+        "filesystem.read_fixture",
+        json!({"path": "welcome.txt"}),
+    )
+    .await;
+    h.expect_error(ErrorCode::DuplicateRequest).await;
+    assert_eq!(
+        env.store.tasks(10).unwrap().len(),
+        1,
+        "no task for the reused id"
+    );
+    assert_eq!(env.executions(), 1);
+    // The refusal took no position: the next request is position 2.
+    let (task, outcome) = h
+        .request(
+            "r2",
+            "filesystem.read_fixture",
+            json!({"path": "welcome.txt"}),
+        )
+        .await;
+    assert!(matches!(completed(outcome), ToolResult::Fixture(_)));
+    assert_ne!(task, first);
+    assert_eq!(env.store.tasks(10).unwrap().len(), 2);
+    h.worker_exits().await;
+}
+
+/// A request_id already used for a task of this session is refused even where
+/// the position it arrives at has a completed step to compare with.
+#[tokio::test]
+async fn a_reused_request_id_is_refused_before_the_replay_check() {
+    let env = Env::new();
+    let job = env.submit("read a file, then system info");
+    let mut h = env.session(Options::default()).await;
+    h.takes(job).await;
+    // Step 1 fails (no such fixture), step 2 completes.
+    let (_, outcome) = h
+        .request(
+            "r1",
+            "filesystem.read_fixture",
+            json!({"path": "missing.txt"}),
+        )
+        .await;
+    assert!(matches!(outcome, ToolOutcome::Failed { .. }));
+    h.request("r2", "system.info", json!({})).await;
+    h.worker_exits().await;
+
+    let mut h = env.session(Options::default()).await;
+    h.takes(job).await;
+    // Position 1 has no completed step: a new task is created for `r1`.
+    let (_, outcome) = h
+        .request(
+            "r1",
+            "filesystem.read_fixture",
+            json!({"path": "welcome.txt"}),
+        )
+        .await;
+    assert!(matches!(completed(outcome), ToolResult::Fixture(_)));
+    // Position 2 completed before. `r1` again is a protocol error, not a
+    // reason to fail the job.
+    h.send_request(
+        "r1",
+        "filesystem.read_fixture",
+        json!({"path": "other.txt"}),
+    )
+    .await;
+    h.expect_error(ErrorCode::DuplicateRequest).await;
+    let (_, outcome) = h.request("r2", "system.info", json!({})).await;
+    assert!(matches!(completed(outcome), ToolResult::SystemInfo(_)));
+    assert_eq!(env.count("step_replayed"), 1);
+    h.worker_exits().await;
+}
+
 #[tokio::test]
 async fn a_request_that_differs_from_the_completed_step_fails_the_job() {
     let cases = [
@@ -665,7 +748,7 @@ async fn a_worker_whose_stream_fails_leaves_its_job_in_the_queue() {
 }
 
 #[tokio::test]
-async fn a_protocol_violation_ends_the_job_instead_of_retrying_it() {
+async fn a_protocol_violation_fails_the_job_instead_of_retrying_it() {
     let env = Env::new();
     let job = env.submit("system info");
     let mut h = env.session(Options::default()).await;
@@ -675,7 +758,7 @@ async fn a_protocol_violation_ends_the_job_instead_of_retrying_it() {
     h.expect_fatal(ErrorCode::UnsupportedProtocolVersion).await;
     let report = h.ended().await;
     assert!(matches!(report.end, SessionEnd::Terminated(_)));
-    assert_eq!(env.job(job).0, JobStatus::Interrupted);
+    assert_eq!(env.job(job).0, JobStatus::Failed);
     assert_eq!(env.count("job_requeued"), 0);
 }
 

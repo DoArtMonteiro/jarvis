@@ -814,7 +814,8 @@ async fn version_change_mid_session_closes_session() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         store.job(job).unwrap().unwrap().status,
-        JobStatus::Interrupted
+        JobStatus::Failed,
+        "a job whose worker broke the protocol is not retried (ADR 0015)"
     );
 }
 

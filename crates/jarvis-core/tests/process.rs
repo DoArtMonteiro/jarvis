@@ -824,17 +824,22 @@ fn start_up_recovers_what_a_previous_run_left_open() {
         store.submit_job(&goal, "test").unwrap();
     }
     let daemon = setup.serve();
+    // The queued job is carried over and run by the new worker.
+    setup.wait_for_kind("job_finished", 1);
     assert!(setup.shutdown(daemon).success());
     let store = setup.store();
     assert_eq!(
         store.task(task_id).unwrap().unwrap().status,
         TaskStatus::Interrupted
     );
-    // A queued job is carried over, not cancelled.
-    assert!(matches!(
-        store.jobs(1).unwrap()[0].status,
-        JobStatus::Queued | JobStatus::Completed | JobStatus::Failed
-    ));
+    let job = &store.jobs(1).unwrap()[0];
+    // The worker ran it: the goal names nothing it knows how to do.
+    assert_eq!(job.status, JobStatus::Failed);
+    let summary = job.summary.as_ref().unwrap();
+    assert!(summary.as_str().contains("known action"), "{summary:?}");
+    assert_eq!(job.attempts, 1);
+    assert_eq!(setup.count("job_started"), 1);
+    assert_eq!(setup.count("job_requeued"), 0);
     assert!(
         store
             .audit_events(Some(task_id), 100)
