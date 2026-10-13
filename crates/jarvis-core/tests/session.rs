@@ -413,8 +413,8 @@ async fn jobs_are_handed_out_one_at_a_time() {
     assert_eq!(store.job(first).unwrap().unwrap().status, JobStatus::Failed);
     assert_eq!(
         store.job(second.job_id).unwrap().unwrap().status,
-        JobStatus::Interrupted,
-        "the worker left in the middle of the second job"
+        JobStatus::Queued,
+        "the worker left in the middle of the second job, which waits for the next worker"
     );
 }
 
@@ -1291,7 +1291,8 @@ async fn the_worker_leaving_while_waiting_expires_the_approval() {
     assert_eq!(store.tasks(1).unwrap()[0].status, TaskStatus::Expired);
     assert_eq!(
         store.job(job).unwrap().unwrap().status,
-        JobStatus::Interrupted
+        JobStatus::Queued,
+        "nothing ran, so the job waits for the next worker"
     );
     // A person who approves after the worker left changes nothing.
     assert!(matches!(

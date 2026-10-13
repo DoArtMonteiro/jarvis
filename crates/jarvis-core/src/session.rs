@@ -18,7 +18,7 @@
 //! The session works on any `AsyncRead`/`AsyncWrite` pair, so tests drive it
 //! over in-memory pipes and the Core drives it over a child's stdio.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,8 +26,8 @@ use jarvis_protocol::{
     ApprovalId, ApprovalStatus, AuditEventKind, CallError, CoreMessage, DecodeError, ErrorCode,
     ErrorMessage, Fingerprint, JobAssignment, JobId, JobOutcome, JobResult, JobStatus,
     PolicyDecision, RequestId, SessionId, SessionLimits, Summary, TaskId, TaskStatus, ToolCall,
-    ToolName, ToolOutcome, ToolRequest, ToolResponse, Welcome, WireError, WorkerMessage,
-    WorkerState, decode_worker_message, encode_core_message,
+    ToolName, ToolOutcome, ToolRequest, ToolResponse, ToolResult, Welcome, WireError,
+    WorkerMessage, WorkerState, decode_worker_message, encode_core_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -40,7 +40,9 @@ use crate::framing::{Frame, FrameReader};
 use crate::gateway::{Execution, Gateway};
 use crate::hub::Hub;
 use crate::policy::{Policy, required_capabilities};
-use crate::store::{ApprovalError, NewApproval, NewTask, Store, StoreError, TaskChange, now_ms};
+use crate::store::{
+    ApprovalError, JobStep, NewApproval, NewTask, Store, StoreError, TaskChange, TaskRecord, now_ms,
+};
 
 /// Frames a worker may send while one of its requests waits for a person.
 const MAX_BACKLOG: usize = 16;
@@ -128,6 +130,7 @@ where
         requests: 0,
         errors: 0,
         job: None,
+        replayed: HashSet::new(),
         backlog: VecDeque::new(),
     };
     let result = async {
@@ -163,6 +166,10 @@ where
 struct RunningJob {
     id: JobId,
     deadline: Instant,
+    /// How many times the job has been claimed, this claim included.
+    attempt: u32,
+    /// Position of the last request that created a task or was replayed.
+    seq: u32,
 }
 
 struct Session<'a, R, W> {
@@ -174,6 +181,9 @@ struct Session<'a, R, W> {
     requests: u32,
     errors: u32,
     job: Option<RunningJob>,
+    /// Request IDs answered from the job's earlier work. They have no task,
+    /// so the store cannot tell that they were used.
+    replayed: HashSet<RequestId>,
     /// Frames read while a request waited for a person, handled afterwards.
     backlog: VecDeque<Frame>,
 }
@@ -307,6 +317,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
         self.job = Some(RunningJob {
             id: job.job_id,
             deadline: Instant::now() + self.ctx.job_timeout,
+            attempt: job.attempts,
+            seq: 0,
         });
         self.ctx.hub.set_worker_state(WorkerState::Busy);
         self.ctx.hub.changed();
@@ -346,6 +358,24 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
         Ok(())
     }
 
+    async fn requeue_or_close(
+        &mut self,
+        job_id: JobId,
+        end: &SessionEnd,
+    ) -> Result<(), SessionError> {
+        let (session_id, max_attempts, reason) =
+            (self.id, self.ctx.limits.max_job_attempts, end.describe());
+        let status = self
+            .ctx
+            .store
+            .call(move |s| s.requeue_or_close(job_id, max_attempts, Some(session_id), &reason))
+            .await?;
+        tracing::info!(session = %self.id, job = %job_id, %status, "job settled after the session ended");
+        self.ctx.hub.set_worker_state(WorkerState::Idle);
+        self.ctx.hub.changed();
+        Ok(())
+    }
+
     async fn handle_frame(
         &mut self,
         frame: Frame,
@@ -371,14 +401,18 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             }
             Ok(WorkerMessage::JobResult(result)) => self.handle_job_result(result).await,
             Ok(WorkerMessage::ToolRequest(request)) => {
-                if self.job.as_ref().map(|job| job.id) != Some(request.job_id) {
+                let Some(job) = self.job.as_ref().filter(|job| job.id == request.job_id) else {
                     let error = WireError::new(
                         ErrorCode::UnexpectedMessage,
                         "the request does not belong to the current job",
                     );
                     return self.reject_frame(Some(request.request_id), error).await;
-                }
-                self.handle_request(request, shutdown).await
+                };
+                let step = JobStep {
+                    attempt: job.attempt,
+                    seq: job.seq + 1,
+                };
+                self.handle_request(request, step, shutdown).await
             }
         }
     }
@@ -402,9 +436,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
         Ok(None)
     }
 
+    /// `step` is the position this request would take in the job.
     async fn handle_request(
         &mut self,
         request: ToolRequest,
+        step: JobStep,
         shutdown: &CancellationToken,
     ) -> Result<Step, SessionError> {
         if self.requests >= self.ctx.limits.max_requests_per_session {
@@ -418,24 +454,37 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             return self.terminate(Some(request.request_id), error).await;
         }
 
+        // A position an earlier attempt completed is answered from the
+        // ledger. Attempt 1 has no earlier attempt to ask.
+        if step.attempt > 1 {
+            let (job_id, seq, attempt) = (request.job_id, step.seq, step.attempt);
+            let prior = self
+                .ctx
+                .store
+                .call(move |s| s.completed_step(job_id, seq, attempt))
+                .await?;
+            if let Some(prior) = prior {
+                return self.replay(request, step.seq, prior).await;
+            }
+        }
+
         let task_id = TaskId::new();
         let new_task = NewTask {
             task_id,
             session_id: self.id,
             job_id: Some(request.job_id),
-            step: None,
+            step: Some(step),
             request_id: request.request_id.clone(),
             tool: request.tool.clone(),
             args: request.args.clone(),
         };
         match self.ctx.store.call(move |s| s.create_task(&new_task)).await {
-            Ok(()) => self.requests += 1,
+            Ok(()) => {
+                self.requests += 1;
+                self.advance_to(step.seq);
+            }
             Err(StoreError::DuplicateRequest(request_id)) => {
-                let error = WireError::new(
-                    ErrorCode::DuplicateRequest,
-                    format!("request_id `{request_id}` was already used in this session"),
-                );
-                return self.reject_frame(Some(request_id), error).await;
+                return self.duplicate_request(request_id).await;
             }
             Err(error) => return Err(error.into()),
         }
@@ -468,6 +517,126 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             Some(SessionEnd::JobTimedOut(_)) => self.job_timed_out().await.map(Some),
             end => Ok(end),
         }
+    }
+
+    fn advance_to(&mut self, seq: u32) {
+        if let Some(job) = self.job.as_mut() {
+            job.seq = seq;
+        }
+    }
+
+    async fn duplicate_request(&mut self, request_id: RequestId) -> Result<Step, SessionError> {
+        let error = WireError::new(
+            ErrorCode::DuplicateRequest,
+            format!("request_id `{request_id}` was already used in this session"),
+        );
+        self.reject_frame(Some(request_id), error).await
+    }
+
+    /// Answer a request with the stored result of the step an earlier attempt
+    /// completed at this position. Nothing runs and no task is created. If
+    /// the worker no longer asks for the same thing, the job cannot be
+    /// resumed safely: it fails and the session ends.
+    async fn replay(
+        &mut self,
+        request: ToolRequest,
+        seq: u32,
+        prior: TaskRecord,
+    ) -> Result<Step, SessionError> {
+        if self.replayed.contains(&request.request_id) {
+            return self.duplicate_request(request.request_id).await;
+        }
+        let result = match self.check_replay(&request, &prior) {
+            Ok(result) => result,
+            Err(reason) => return self.replay_mismatch(&request, seq, reason).await,
+        };
+        let (session_id, job_id, task_id) = (self.id, request.job_id, prior.task_id);
+        let request_id = request.request_id.clone();
+        let recorded = self
+            .ctx
+            .store
+            .call(move |s| s.replay_step(session_id, job_id, seq, task_id, &request_id))
+            .await;
+        match recorded {
+            Ok(()) => {}
+            Err(StoreError::DuplicateRequest(request_id)) => {
+                return self.duplicate_request(request_id).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        self.requests += 1;
+        self.advance_to(seq);
+        self.replayed.insert(request.request_id.clone());
+        tracing::info!(session = %self.id, task = %task_id, seq, "step replayed");
+        let response = CoreMessage::ToolResponse(ToolResponse {
+            request_id: request.request_id,
+            task_id,
+            outcome: ToolOutcome::Completed { result },
+        });
+        self.send(&response).await
+    }
+
+    /// The stored result of `prior` if `request` asks for exactly what
+    /// `prior` completed, current policy still allows it and the stored
+    /// result is valid. Otherwise why not, in words that do not repeat
+    /// anything the worker sent.
+    fn check_replay(
+        &self,
+        request: &ToolRequest,
+        prior: &TaskRecord,
+    ) -> Result<ToolResult, &'static str> {
+        let asked = ToolCall::from_request(&request.tool, &request.args)
+            .map_err(|_| "the request is not a valid call")?;
+        let stored_tool =
+            ToolName::try_from(prior.tool.clone()).map_err(|_| "the stored step is unreadable")?;
+        let stored_args =
+            serde_json::from_str(&prior.args).map_err(|_| "the stored step is unreadable")?;
+        let stored = ToolCall::from_request(&stored_tool, &stored_args)
+            .map_err(|_| "the stored step is unreadable")?;
+        if asked != stored {
+            return Err("the request differs from the step that completed");
+        }
+        let decision = self
+            .ctx
+            .policy
+            .evaluate(&required_capabilities(&asked))
+            .decision;
+        if decision == PolicyDecision::Deny {
+            return Err("policy no longer allows the step");
+        }
+        let json = prior
+            .result
+            .as_deref()
+            .filter(|json| json.len() <= self.ctx.limits.max_result_bytes())
+            .ok_or("the stored result is missing or too large")?;
+        let result: ToolResult =
+            serde_json::from_str(json).map_err(|_| "the stored result is invalid")?;
+        if !result.answers(&asked) {
+            return Err("the stored result does not answer the request");
+        }
+        Ok(result)
+    }
+
+    async fn replay_mismatch(
+        &mut self,
+        request: &ToolRequest,
+        seq: u32,
+        reason: &str,
+    ) -> Result<Step, SessionError> {
+        tracing::warn!(session = %self.id, seq, "cannot replay a completed step: {reason}");
+        if let Some(job) = self.job.take() {
+            let summary = Summary::lossy(&format!("step {seq} could not be replayed: {reason}"));
+            self.finish_job(job.id, JobStatus::Failed, Some(summary))
+                .await?;
+        }
+        let error = WireError::new(
+            ErrorCode::UnexpectedMessage,
+            format!(
+                "step {seq} of this job already completed and this request does not match it: {reason}"
+            ),
+        );
+        self.terminate(Some(request.request_id.clone()), error)
+            .await
     }
 
     /// Validate, authorise and execute one request whose task exists in
@@ -839,12 +1008,20 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             }
         }
         if let Some(job) = self.job.take() {
-            let summary = Some(Summary::lossy(&format!(
-                "the worker stopped: {}",
-                end.describe()
-            )));
-            self.finish_job(job.id, JobStatus::Interrupted, summary)
-                .await?;
+            match end {
+                // The worker or the Core stopped: the job may be resumed.
+                SessionEnd::WorkerClosed | SessionEnd::WorkerGone | SessionEnd::Shutdown => {
+                    self.requeue_or_close(job.id, end).await?;
+                }
+                _ => {
+                    let summary = Some(Summary::lossy(&format!(
+                        "the worker stopped: {}",
+                        end.describe()
+                    )));
+                    self.finish_job(job.id, JobStatus::Interrupted, summary)
+                        .await?;
+                }
+            }
         }
         self.audit(
             None,
