@@ -636,15 +636,20 @@ async fn an_approval_from_an_earlier_attempt_cannot_be_used_in_the_next() {
     h.send_request("w1", "workspace.write_file", write_args("a.txt", "x"))
         .await;
     let old = h.pending_approval().await;
-    // Granted, but the worker goes away before the Core consumes it.
-    h.store
-        .grant_approval(old.approval_id, &old.fingerprint, "test client", now_ms())
-        .unwrap();
+    // The worker goes away while the write waits for a person. A grant sent
+    // while the session still waits could be used by that session, which is
+    // allowed, so the grant is only attempted once the session has ended.
     h.worker_exits().await;
     assert_eq!(env.job(job).0, JobStatus::Queued);
     assert_eq!(env.workspace_file("a.txt"), None);
     let status = env.store.approval(old.approval_id).unwrap().unwrap().status;
     assert_eq!(status, ApprovalStatus::Expired);
+    assert!(
+        env.store
+            .grant_approval(old.approval_id, &old.fingerprint, "test client", now_ms())
+            .is_err(),
+        "an approval from an ended session cannot be granted"
+    );
 
     let mut h = env.session(Options::default()).await;
     h.takes(job).await;
