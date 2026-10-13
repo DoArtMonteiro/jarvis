@@ -37,6 +37,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "jobs_and_approvals",
         sql: include_str!("migrations/0002_jobs_and_approvals.sql"),
     },
+    Migration {
+        version: 3,
+        name: "durable_jobs",
+        sql: include_str!("migrations/0003_durable_jobs.sql"),
+    },
 ];
 
 mod approvals;
@@ -84,12 +89,22 @@ pub enum StoreError {
     Poisoned,
 }
 
+/// Where a task sits in its job: the attempt that created it and its
+/// position (counted from 1) within that attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobStep {
+    pub attempt: u32,
+    pub seq: u32,
+}
+
 /// A task to insert in the `received` state.
 #[derive(Debug, Clone)]
 pub struct NewTask {
     pub task_id: TaskId,
     pub session_id: SessionId,
     pub job_id: Option<JobId>,
+    /// Recorded with the task, in the same transaction. Needs `job_id`.
+    pub step: Option<JobStep>,
     pub request_id: RequestId,
     pub tool: ToolName,
     pub args: serde_json::Value,
@@ -261,7 +276,8 @@ impl Store {
     }
 
     /// Insert a task in `received` together with its `request_received`
-    /// event. A repeated `(session_id, request_id)` is refused.
+    /// event and, for a task that is a step of a job, its place in the job's
+    /// ledger. A repeated `(session_id, request_id)` is refused.
     pub fn create_task(&self, task: &NewTask) -> Result<(), StoreError> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
@@ -288,6 +304,12 @@ impl Store {
                 return Err(StoreError::DuplicateRequest(task.request_id.clone()));
             }
             Err(error) => return Err(error.into()),
+        }
+        if let Some(step) = task.step {
+            let job_id = task
+                .job_id
+                .ok_or_else(|| StoreError::Corrupt("a step needs a job".into()))?;
+            jobs::record_step(&tx, task.task_id, job_id, step)?;
         }
         insert_event(
             &tx,
@@ -358,12 +380,15 @@ impl Store {
     /// - pending and granted approvals become `expired`;
     /// - tasks that were received or executing become `interrupted`, tasks
     ///   waiting for confirmation become `expired`;
-    /// - running jobs become `interrupted`, queued jobs `cancelled`.
-    pub fn recover(&self) -> Result<Recovery, StoreError> {
+    /// - queued jobs stay queued; a running job goes back to the queue, or
+    ///   ends `interrupted` when it ran out of attempts or a task of it has an
+    ///   unknown outcome (see [`Store::requeue_or_close`]). This runs before
+    ///   open tasks are rewritten, so it still sees what they were doing.
+    pub fn recover(&self, max_job_attempts: u32) -> Result<Recovery, StoreError> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let approvals = approvals::expire_all_open(&tx, "the Core restarted")?;
-        let jobs = jobs::close_all_open(&tx)?;
+        let jobs = jobs::settle_running(&tx, max_job_attempts)?;
         let open: Vec<(TaskId, SessionId, TaskStatus)> = {
             let mut statement = tx.prepare(
                 "SELECT task_id, session_id, status FROM tasks

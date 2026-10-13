@@ -797,6 +797,7 @@ fn start_up_recovers_what_a_previous_run_left_open() {
                 task_id,
                 session_id: SessionId::new(),
                 job_id: None,
+                step: None,
                 request_id: RequestId::try_from("r1".to_owned()).unwrap(),
                 tool: ToolName::try_from("system.info".to_owned()).unwrap(),
                 args: serde_json::json!({}),

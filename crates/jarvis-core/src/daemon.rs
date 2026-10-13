@@ -159,7 +159,10 @@ pub async fn serve_with_executor(
     ready: impl FnOnce(&Endpoint),
 ) -> Result<ServeReport, CoreError> {
     let store = Store::open(&config.database)?;
-    let recovered = store.call(Store::recover).await?;
+    let max_job_attempts = config.limits.max_job_attempts;
+    let recovered = store
+        .call(move |store| store.recover(max_job_attempts))
+        .await?;
     if !recovered.is_empty() {
         tracing::warn!(
             tasks = recovered.tasks,

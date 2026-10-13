@@ -69,6 +69,9 @@ pub struct Limits {
     pub write_timeout: Duration,
     pub max_requests_per_session: u32,
     pub max_protocol_errors: u32,
+    /// How many times a job may be claimed before it is no longer put back in
+    /// the queue after its worker or the Core stops.
+    pub max_job_attempts: u32,
     pub shutdown_grace: Duration,
 }
 
@@ -90,6 +93,7 @@ impl Default for Limits {
             write_timeout: Duration::from_secs(5),
             max_requests_per_session: 1000,
             max_protocol_errors: 16,
+            max_job_attempts: 3,
             shutdown_grace: Duration::from_secs(2),
         }
     }
@@ -188,6 +192,7 @@ struct RawLimits {
     write_timeout_ms: Option<u64>,
     max_requests_per_session: Option<u32>,
     max_protocol_errors: Option<u32>,
+    max_job_attempts: Option<u32>,
     shutdown_grace_ms: Option<u64>,
 }
 
@@ -277,6 +282,14 @@ impl Config {
                     .unwrap_or(defaults.max_protocol_errors),
                 1,
                 1_000,
+            )?,
+            max_job_attempts: within(
+                "limits.max_job_attempts",
+                raw.limits
+                    .max_job_attempts
+                    .unwrap_or(defaults.max_job_attempts),
+                1,
+                10,
             )?,
             shutdown_grace: ms(
                 "limits.shutdown_grace_ms",
@@ -579,6 +592,20 @@ mod tests {
         assert!(Config::from_toml(&text, Path::new(".")).is_err());
         let text = format!("{MINIMAL}\n[approvals]\nttl_ms = 10\n");
         assert!(Config::from_toml(&text, Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn a_job_gets_a_few_attempts_by_default_and_the_number_is_bounded() {
+        let config = Config::from_toml(MINIMAL, Path::new(".")).unwrap();
+        assert_eq!(config.limits.max_job_attempts, 3);
+        let text = format!("{MINIMAL}\n[limits]\nmax_job_attempts = 10\n");
+        let config = Config::from_toml(&text, Path::new(".")).unwrap();
+        assert_eq!(config.limits.max_job_attempts, 10);
+        for bad in ["0", "11"] {
+            let text = format!("{MINIMAL}\n[limits]\nmax_job_attempts = {bad}\n");
+            let error = Config::from_toml(&text, Path::new(".")).unwrap_err();
+            assert!(error.to_string().contains("max_job_attempts"), "{error}");
+        }
     }
 
     #[test]

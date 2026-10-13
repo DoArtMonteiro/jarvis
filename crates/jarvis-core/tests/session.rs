@@ -1410,7 +1410,7 @@ async fn a_store_failure_before_consumption_never_runs_the_tool() {
         TaskStatus::AwaitingConfirmation
     );
     // What the next start-up does.
-    let recovered = store.recover().unwrap();
+    let recovered = store.recover(Limits::default().max_job_attempts).unwrap();
     assert_eq!(recovered.approvals, 1);
     assert_eq!(
         store
@@ -1450,7 +1450,7 @@ async fn a_store_failure_after_the_tool_ran_leaves_a_consumed_approval() {
         ApprovalStatus::Consumed
     );
     assert_eq!(store.tasks(1).unwrap()[0].status, TaskStatus::Executing);
-    store.recover().unwrap();
+    store.recover(Limits::default().max_job_attempts).unwrap();
     assert_eq!(store.tasks(1).unwrap()[0].status, TaskStatus::Interrupted);
     assert!(
         store

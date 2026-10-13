@@ -423,6 +423,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             task_id,
             session_id: self.id,
             job_id: Some(request.job_id),
+            step: None,
             request_id: request.request_id.clone(),
             tool: request.tool.clone(),
             args: request.args.clone(),
