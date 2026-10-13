@@ -951,6 +951,7 @@ fn the_rpc_interface_is_strict_and_bounded() {
                 br#"{"rpc":2,"type":"health","extra":1}"#,
                 br#"{"rpc":2,"type":"run_command","command":"id"}"#,
                 br#"{"rpc":3,"type":"health"}"#,
+                br#"{"rpc":1,"type":"health"}"#,
                 br#"{"protocol":2,"type":"hello","worker":"w","worker_version":"1"}"#,
                 br#"{"rpc":2,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aa","approved":true}"#,
                 br#"{"rpc":2,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
@@ -969,13 +970,18 @@ fn the_rpc_interface_is_strict_and_bounded() {
                 "malformed_request",
                 "malformed_request",
                 "unsupported_version",
+                "unsupported_version",
                 "malformed_request",
                 "malformed_request",
                 "not_found",
                 "-",
             ]
         );
-        assert_eq!(replies[7]["type"], "health", "the connection survives bad requests");
+        // A client of the previous version is refused, and the answer is
+        // encoded at this version: an older client cannot decode it either.
+        assert_eq!(replies[4]["rpc"], 2);
+        assert!(replies[4]["message"].as_str().unwrap().contains("version 1"));
+        assert_eq!(replies[8]["type"], "health", "the connection survives bad requests");
 
         // An oversized request is answered once, then the connection closes.
         let huge = format!(
