@@ -167,9 +167,11 @@ pub struct Governor {
     /// Whether the previous reading failed, so that a streak of failures is
     /// logged once.
     failing: bool,
-    /// Whether the last attempt to record a release failed, so that a
+    /// Whether the last reading had a write fail, so that a
     /// streak of failures is logged once.
-    release_failing: bool,
+    record_failing: bool,
+    /// Events that could not be written, oldest first (see `apply`).
+    pending: Vec<Event>,
 }
 
 impl Governor {
@@ -194,7 +196,8 @@ impl Governor {
             origin,
             state,
             failing: false,
-            release_failing: false,
+            record_failing: false,
+            pending: Vec::new(),
         }
     }
 
@@ -261,44 +264,96 @@ impl Governor {
 
         let now = millis(self.origin.elapsed());
         let (next, events) = step(self.state.clone(), observation, now, self.timing);
+        let releasing = events.iter().any(|e| matches!(e, Event::Released { .. }));
+        let alerted = events.iter().any(|e| matches!(e, Event::Overdue { .. }));
 
-        if !events.iter().any(|e| matches!(e, Event::Released { .. })) {
-            // Holding is the safe direction, so the gate closes first and the
-            // record follows. A slow or failing database must not keep jobs
-            // starting while a game runs.
-            self.publish(next);
-            for event in &events {
-                if let Err(error) = self.record(event).await {
-                    tracing::error!(%error, ?event, "could not record a governor event");
-                }
-            }
-            return;
-        }
-
-        // Opening the gate is the other direction: it waits for the record.
-        // If the release cannot be written the gate stays shut and the next
-        // reading tries again.
-        let mut released = true;
-        for event in &events {
-            if let Err(error) = self.record(event).await {
-                if matches!(event, Event::Released { .. }) {
-                    released = false;
-                    if !self.release_failing {
-                        tracing::error!(
-                            %error,
-                            "could not record the release; queued jobs stay held until it can be"
-                        );
-                    }
-                } else {
-                    tracing::error!(%error, ?event, "could not record a governor event");
-                }
-            }
-        }
-        self.release_failing = !released;
-        if released {
-            self.publish(next);
+        // Holding is the safe direction, so the gate closes first and the
+        // record follows. A slow or failing database must not keep jobs
+        // starting while a game runs.
+        let next = if releasing {
+            Some(next)
         } else {
-            self.publish(staying(self.state.clone(), &events, now));
+            self.publish(next);
+            None
+        };
+
+        // Events are recorded in the order they happened. One that cannot be
+        // written waits in `pending` and is tried again, before anything
+        // newer, at every later reading.
+        let mut streak = false;
+        let mut in_order = self.flush_pending(&mut streak).await;
+        let mut release_recorded = false;
+        for event in events {
+            if matches!(event, Event::Released { .. }) {
+                // Never queued: the state machine emits it again at the next
+                // reading for as long as the gate has not opened.
+                if in_order && self.try_record(&event, &mut streak).await {
+                    release_recorded = true;
+                }
+                continue;
+            }
+            if in_order && self.try_record(&event, &mut streak).await {
+                continue;
+            }
+            in_order = false;
+            self.queue(event);
+        }
+        self.record_failing = streak;
+
+        // Opening the gate is the other direction: it waits for the record
+        // of the release and of everything before it. Otherwise the gate
+        // stays shut and the next reading tries again.
+        if let Some(next) = next {
+            if release_recorded {
+                self.publish(next);
+            } else {
+                self.publish(staying(self.state.clone(), alerted, now));
+            }
+        }
+    }
+
+    /// Retry the events that earlier readings could not record, oldest
+    /// first. Returns whether none is left.
+    async fn flush_pending(&mut self, streak: &mut bool) -> bool {
+        while let Some(event) = self.pending.first().cloned() {
+            if !self.try_record(&event, streak).await {
+                return false;
+            }
+            self.pending.remove(0);
+        }
+        true
+    }
+
+    /// Write one event. A failure is logged once per streak of failures.
+    async fn try_record(&self, event: &Event, streak: &mut bool) -> bool {
+        match self.record(event).await {
+            Ok(()) => true,
+            Err(error) => {
+                if !self.record_failing {
+                    tracing::error!(
+                        %error,
+                        ?event,
+                        "could not record a governor event; it is kept and tried again, \
+                         and the gate stays shut until a release can be recorded"
+                    );
+                }
+                *streak = true;
+                false
+            }
+        }
+    }
+
+    /// Keep an event that could not be written. While anything waits the gate
+    /// cannot open, so the state machine produces at most one hold and one
+    /// alert in that time; the cap only guards against a mistake.
+    fn queue(&mut self, event: Event) {
+        if self.pending.len() >= MAX_PENDING {
+            tracing::error!(
+                ?event,
+                "too many governor events wait to be recorded; dropped"
+            );
+        } else {
+            self.pending.push(event);
         }
     }
 
@@ -347,9 +402,8 @@ impl Drop for FailClosed {
 /// The state to keep when a release could not be recorded: the game is gone
 /// but the jobs stay held, so it is releasing and the next reading tries
 /// again. (Without a resume delay the step went straight from held to open.)
-/// An alert recorded in the same step is not raised again.
-fn staying(state: State, events: &[Event], now: u64) -> State {
-    let alerted = events.iter().any(|e| matches!(e, Event::Overdue { .. }));
+/// An alert raised in the same step is not raised again.
+fn staying(state: State, alerted: bool, now: u64) -> State {
     match state {
         State::Held { since, overdue, .. } => State::Releasing {
             since,
@@ -368,6 +422,9 @@ fn staying(state: State, events: &[Event], now: u64) -> State {
         State::Open => State::Open,
     }
 }
+
+/// More events than this waiting to be written means a mistake.
+const MAX_PENDING: usize = 8;
 
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
