@@ -1139,3 +1139,127 @@ fn a_job_whose_worker_keeps_dying_replays_its_first_step_until_the_attempts_are_
     assert_eq!(setup.store().tasks(10).unwrap().len(), 1);
     drop(daemon);
 }
+
+// --- gaming governor (ADR 0016) -----------------------------------------------------------------
+
+/// A name no other process uses, short enough for a Linux `comm`.
+fn unique_game_name() -> String {
+    let id = TaskId::new().to_string().replace('-', "");
+    let stem = format!("jv{}", &id[id.len() - 12..]);
+    if cfg!(windows) {
+        format!("{stem}.exe")
+    } else {
+        stem
+    }
+}
+
+/// Copy a harmless system binary to `dir/name` and run it for two minutes.
+/// It is a stand-in for a game, found by its file name like one.
+fn start_stand_in(dir: &Path, name: &str) -> Child {
+    let target = dir.join(name);
+    let (source, args): (&str, &[&str]) = if cfg!(windows) {
+        (r"C:\Windows\System32\PING.EXE", &["-n", "120", "127.0.0.1"])
+    } else {
+        ("/bin/sleep", &["120"])
+    };
+    std::fs::copy(source, &target).unwrap();
+    Command::new(&target)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+impl Setup {
+    fn wait_for_governor(&self, state: &str) -> Value {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let governor = self.health()["governor"].clone();
+            if governor["state"] == state {
+                return governor;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the governor never became {state}, last {governor}: {}",
+                self.log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[test]
+fn the_governor_is_off_unless_the_config_turns_it_on() {
+    let setup = Setup::new("real", POLICY, "");
+    let daemon = setup.serve();
+    setup.wait_for_worker("idle");
+    let governor = setup.health()["governor"].clone();
+    assert_eq!(
+        governor,
+        serde_json::json!({"state": "off", "reason": null, "process": null,
+                           "held_ms": null, "overdue": false})
+    );
+    let job = setup.json(&["submit", "describe the runtime", "--wait"]);
+    assert_eq!(job[0]["status"], "completed");
+    assert!(setup.shutdown(daemon).success());
+    assert_eq!(setup.count("governor_hold"), 0);
+}
+
+#[test]
+fn queued_jobs_wait_while_a_game_runs_and_start_after_it_exits() {
+    let game = unique_game_name();
+    let setup = Setup::new(
+        "real",
+        POLICY,
+        &format!(
+            "[governor]\nenabled = true\nprocesses = [{game:?}]\npoll_ms = 250\n\
+             resume_delay_ms = 500\nalert_after_ms = 600000\n"
+        ),
+    );
+    let daemon = setup.serve();
+    setup.wait_for_worker("idle");
+    setup.wait_for_governor("open");
+
+    let mut stand_in = start_stand_in(setup.dir.path(), &game);
+    let held = setup.wait_for_governor("held");
+    assert_eq!(held["reason"], "game");
+    assert_eq!(held["process"], game.as_str());
+    setup.wait_for_kind("governor_hold", 1);
+
+    let job = setup.submit("describe the runtime");
+    std::thread::sleep(Duration::from_millis(1500));
+    let status = setup.json(&["job", &job]).remove(0);
+    assert_eq!(status["status"], "queued", "held while the game runs");
+    assert_eq!(setup.count("job_started"), 0);
+    assert_eq!(setup.health()["queued_jobs"], 1);
+
+    stand_in.kill().unwrap();
+    stand_in.wait().unwrap();
+    let done = setup
+        .json(&["job", &job, "--wait", "--timeout", "30s"])
+        .remove(0);
+    assert_eq!(done["status"], "completed", "{}", setup.log());
+    assert_eq!(setup.health()["governor"]["state"], "open");
+
+    let events = setup.events();
+    let seq = |kind: &str| {
+        events
+            .iter()
+            .find(|event| event.event.name() == kind)
+            .map(|event| event.seq)
+            .unwrap_or_else(|| panic!("no {kind} in the audit log"))
+    };
+    assert!(seq("governor_hold") < seq("governor_released"));
+    assert!(
+        seq("governor_released") < seq("job_started"),
+        "the release is recorded before the job starts"
+    );
+    let process = events.iter().find_map(|event| match &event.event {
+        AuditEventKind::GovernorHold { process, .. } => process.clone(),
+        _ => None,
+    });
+    assert_eq!(process.as_deref(), Some(game.as_str()));
+    assert!(setup.shutdown(daemon).success(), "{}", setup.log());
+}

@@ -9,6 +9,7 @@ use jarvis_sandbox::Contained;
 use tokio::sync::{Notify, watch};
 
 use crate::approval::ApprovalBroker;
+use crate::governor::Status as GovernorStatus;
 
 #[derive(Debug)]
 pub struct Hub {
@@ -18,6 +19,9 @@ pub struct Hub {
     pub jobs: Notify,
     /// Bumped whenever a job or approval changes, for long-polling clients.
     changes: watch::Sender<u64>,
+    /// Whether queued jobs may start (ADR 0016). Open for good unless the
+    /// governor is enabled.
+    governor: watch::Sender<GovernorStatus>,
     worker: Mutex<WorkerView>,
     contained: Mutex<Option<Arc<Contained>>>,
     /// Who asked the Core to stop, when a client did.
@@ -30,6 +34,7 @@ impl Default for Hub {
             approvals: ApprovalBroker::default(),
             jobs: Notify::new(),
             changes: watch::Sender::new(0),
+            governor: watch::Sender::new(GovernorStatus::OFF),
             worker: Mutex::new(WorkerView {
                 state: WorkerState::Starting,
                 pid: None,
@@ -50,6 +55,20 @@ impl Hub {
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
+    }
+
+    /// A receiver for the governor's status. A session reads it before it
+    /// claims a job and waits on it while the gate is closed.
+    pub fn subscribe_governor(&self) -> watch::Receiver<GovernorStatus> {
+        self.governor.subscribe()
+    }
+
+    pub fn governor_status(&self) -> GovernorStatus {
+        self.governor.borrow().clone()
+    }
+
+    pub fn set_governor(&self, status: GovernorStatus) {
+        self.governor.send_replace(status);
     }
 
     pub fn worker(&self) -> WorkerView {

@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, SupervisorConfig};
 use crate::gateway::Gateway;
+use crate::governor::{Governor, ProcessActivity};
 use crate::hub::Hub;
 use crate::isolation::{self, IsolationError, WorkerLaunch};
 use crate::rpc::{self, Endpoint, Listener, RpcState};
@@ -203,6 +204,19 @@ pub async fn serve_with_executor(
             });
         }
     };
+    // The listener is bound first so that a failure to bind leaves no task
+    // behind. From here on the gate is closed until the governor has looked
+    // once, and `health` already reports it.
+    let governor_stop = shutdown.child_token();
+    let governor = config.governor.enabled.then(|| {
+        tracing::info!(
+            processes = %config.governor.processes.join(", "),
+            "gaming governor enabled: queued jobs wait while one of these runs"
+        );
+        let source = Arc::new(ProcessActivity::new(config.governor.processes.clone()));
+        let governor = Governor::new(&config.governor, store.clone(), Arc::clone(&hub), source);
+        tokio::spawn(governor.run(governor_stop.clone()))
+    });
     let rpc_state = Arc::new(RpcState {
         store: store.clone(),
         hub: Arc::clone(&hub),
@@ -232,6 +246,11 @@ pub async fn serve_with_executor(
         hub: Arc::clone(&hub),
     };
     let supervised = supervise(config, &launch, &ctx, &shutdown).await;
+
+    governor_stop.cancel();
+    if let Some(task) = governor {
+        let _ = task.await;
+    }
 
     rpc_stop.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), rpc_task).await;

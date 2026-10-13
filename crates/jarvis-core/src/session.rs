@@ -34,7 +34,7 @@ use jarvis_protocol::{
     encode_core_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -42,6 +42,7 @@ use crate::approval;
 use crate::config::Limits;
 use crate::framing::{Frame, FrameReader};
 use crate::gateway::{Execution, Gateway};
+use crate::governor::Status as GovernorStatus;
 use crate::hub::Hub;
 use crate::policy::{Policy, required_capabilities};
 use crate::store::{
@@ -139,6 +140,7 @@ where
         job: None,
         used: HashSet::new(),
         backlog: VecDeque::new(),
+        gate: ctx.hub.subscribe_governor(),
     };
     let result = async {
         match session.handshake(shutdown).await? {
@@ -193,6 +195,8 @@ struct Session<'a, R, W> {
     used: HashSet<RequestId>,
     /// Frames read while a request waited for a person, handled afterwards.
     backlog: VecDeque<Frame>,
+    /// Whether the gaming governor lets a job start (ADR 0016).
+    gate: watch::Receiver<GovernorStatus>,
 }
 
 /// `None` means carry on; `Some` means the session is over.
@@ -271,7 +275,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
 
     async fn serve(&mut self, shutdown: &CancellationToken) -> Result<SessionEnd, SessionError> {
         loop {
+            // The only place a job is claimed. While the gaming governor holds
+            // jobs nothing is claimed, so no attempt is counted and no job
+            // timer starts. Reading the gate marks its current value as seen,
+            // so the wait below wakes for any later change and only for one.
+            let held = self.job.is_none() && !self.gate.borrow_and_update().is_open();
             if self.job.is_none()
+                && !held
                 && let Some(end) = self.dispatch_next_job().await?
             {
                 return Ok(end);
@@ -295,6 +305,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
                         () = shutdown.cancelled() => return Ok(SessionEnd::Shutdown),
                         () = sleep_until(deadline) => return self.job_timed_out().await,
                         () = self.ctx.hub.jobs.notified(), if idle => continue,
+                        changed = self.gate.changed(), if held => match changed {
+                            Ok(()) => continue,
+                            // The hub owns the sender and outlives the session.
+                            Err(_) => return Ok(SessionEnd::Shutdown),
+                        },
                         read = self.reader.next_frame() => read,
                     };
                     match read {

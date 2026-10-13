@@ -15,9 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jarvis_protocol::{
-    AuditEventKind, DecodeError, GovernorView, HealthReport, JobView, ProtocolVersion, RpcError,
-    RpcErrorCode, RpcRequest, RpcResponse, RpcVersion, WorkerState, decode_rpc_request,
-    encode_rpc_response,
+    AuditEventKind, DecodeError, HealthReport, JobView, ProtocolVersion, RpcError, RpcErrorCode,
+    RpcRequest, RpcResponse, RpcVersion, WorkerState, decode_rpc_request, encode_rpc_response,
 };
 use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::sync::Semaphore;
@@ -369,7 +368,10 @@ async fn health(state: &RpcState) -> Result<RpcResponse, RpcError> {
         rpc_protocol: RpcVersion::CURRENT,
         uptime_ms: u64::try_from(state.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         worker,
-        governor: GovernorView::OFF,
+        governor: state
+            .hub
+            .governor_status()
+            .view(tokio::time::Instant::now()),
         queued_jobs,
         pending_approvals,
     }))

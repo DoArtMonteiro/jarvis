@@ -11,8 +11,9 @@ use jarvis_core::rpc::client::Client;
 use jarvis_core::store::Store;
 use jarvis_core::{daemon, isolation};
 use jarvis_protocol::{
-    ApprovalId, ApprovalStatus, ApprovalView, Fingerprint, Goal, HealthReport, JobId, JobStatus,
-    JobView, RpcError, RpcRequest, RpcResponse, Summary, TaskId,
+    ApprovalId, ApprovalStatus, ApprovalView, Fingerprint, Goal, GovernorPhase, GovernorReason,
+    GovernorView, HealthReport, JobId, JobStatus, JobView, RpcError, RpcRequest, RpcResponse,
+    Summary, TaskId,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -539,8 +540,40 @@ fn print_health(report: &HealthReport) {
             &worker.containment
         }
     );
+    println!("governor           {}", governor_line(&report.governor));
     println!("queued jobs        {}", report.queued_jobs);
     println!("pending approvals  {}", report.pending_approvals);
+}
+
+/// One line for `health`: whether queued jobs may start, and if not, why.
+fn governor_line(governor: &GovernorView) -> String {
+    let held_for = || {
+        governor
+            .held_ms
+            .map(|ms| humantime::format_duration(Duration::from_secs(ms / 1000)).to_string())
+            .unwrap_or_default()
+    };
+    let line = match governor.state {
+        GovernorPhase::Off => return "off".to_owned(),
+        GovernorPhase::Open => return "open".to_owned(),
+        GovernorPhase::Releasing => format!("releasing after {}", held_for()),
+        GovernorPhase::Held => {
+            let why = match (governor.reason, governor.process.as_deref()) {
+                (Some(GovernorReason::Game), Some(name)) => format!("{name} is running"),
+                (Some(GovernorReason::DetectionFailed), _) => {
+                    "cannot read the process list".to_owned()
+                }
+                (Some(GovernorReason::Starting), _) => "waiting for the first check".to_owned(),
+                _ => "queued jobs are held".to_owned(),
+            };
+            format!("held, {why}, for {}", held_for())
+        }
+    };
+    if governor.overdue {
+        format!("{line} (longer than the alert time)")
+    } else {
+        line
+    }
 }
 
 async fn submit(
@@ -894,4 +927,54 @@ fn print_audit(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view(
+        state: GovernorPhase,
+        reason: Option<GovernorReason>,
+        held_ms: Option<u64>,
+    ) -> GovernorView {
+        GovernorView {
+            state,
+            reason,
+            process: (reason == Some(GovernorReason::Game)).then(|| "cs2.exe".to_owned()),
+            held_ms,
+            overdue: false,
+        }
+    }
+
+    #[test]
+    fn health_says_why_jobs_are_held() {
+        assert_eq!(governor_line(&GovernorView::OFF), "off");
+        assert_eq!(
+            governor_line(&view(GovernorPhase::Open, None, None)),
+            "open"
+        );
+        let game = view(
+            GovernorPhase::Held,
+            Some(GovernorReason::Game),
+            Some(61_000),
+        );
+        assert_eq!(governor_line(&game), "held, cs2.exe is running, for 1m 1s");
+        let failed = view(
+            GovernorPhase::Held,
+            Some(GovernorReason::DetectionFailed),
+            Some(5_000),
+        );
+        assert_eq!(
+            governor_line(&failed),
+            "held, cannot read the process list, for 5s"
+        );
+        let releasing = view(GovernorPhase::Releasing, None, Some(90_000));
+        assert_eq!(governor_line(&releasing), "releasing after 1m 30s");
+        let overdue = GovernorView {
+            overdue: true,
+            ..game
+        };
+        assert!(governor_line(&overdue).ends_with("(longer than the alert time)"));
+    }
 }
