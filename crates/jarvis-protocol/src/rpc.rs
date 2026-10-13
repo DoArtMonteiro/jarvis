@@ -8,7 +8,7 @@
 //! request being approved.
 //!
 //! ```json
-//! {"rpc":1,"type":"approve","approval_id":"…","fingerprint":"…"}
+//! {"rpc":2,"type":"approve","approval_id":"…","fingerprint":"…"}
 //! ```
 
 use std::collections::BTreeMap;
@@ -29,7 +29,7 @@ use crate::{
 pub struct RpcVersion(pub u32);
 
 impl RpcVersion {
-    pub const CURRENT: Self = Self(1);
+    pub const CURRENT: Self = Self(2);
 }
 
 impl fmt::Display for RpcVersion {
@@ -338,37 +338,46 @@ mod tests {
             fingerprint: Fingerprint::from_digest(&[7; 32]),
         };
         let bytes = encode_rpc_request(&request).unwrap();
-        assert!(bytes.starts_with(br#"{"rpc":1,"type":"approve""#));
+        assert!(bytes.starts_with(br#"{"rpc":2,"type":"approve""#));
         assert_eq!(decode_rpc_request(&bytes).unwrap(), request);
         let health = encode_rpc_request(&RpcRequest::Health {}).unwrap();
-        assert_eq!(health, br#"{"rpc":1,"type":"health"}"#);
+        assert_eq!(health, br#"{"rpc":2,"type":"health"}"#);
     }
 
     #[test]
     fn requests_are_strict() {
         for value in [
-            json!({"rpc": 1, "type": "health", "extra": true}),
-            json!({"rpc": 1, "type": "run_command", "command": "id"}),
-            json!({"rpc": 1, "type": "submit_job"}),
-            json!({"rpc": 1, "type": "submit_job", "goal": ""}),
-            json!({"rpc": 1, "type": "submit_job", "goal": "a\nb"}),
-            json!({"rpc": 1, "type": "get_job", "job_id": JobId::new()}),
-            json!({"rpc": 1, "type": "approve", "approval_id": ApprovalId::new()}),
-            json!({"rpc": 1, "type": "approve", "approval_id": ApprovalId::new(),
+            json!({"rpc": 2, "type": "health", "extra": true}),
+            json!({"rpc": 2, "type": "run_command", "command": "id"}),
+            json!({"rpc": 2, "type": "submit_job"}),
+            json!({"rpc": 2, "type": "submit_job", "goal": ""}),
+            json!({"rpc": 2, "type": "submit_job", "goal": "a\nb"}),
+            json!({"rpc": 2, "type": "get_job", "job_id": JobId::new()}),
+            json!({"rpc": 2, "type": "approve", "approval_id": ApprovalId::new()}),
+            json!({"rpc": 2, "type": "approve", "approval_id": ApprovalId::new(),
                    "fingerprint": "abc"}),
-            json!({"rpc": 1, "type": "approve", "approval_id": ApprovalId::new(),
+            json!({"rpc": 2, "type": "approve", "approval_id": ApprovalId::new(),
                    "fingerprint": "a".repeat(64), "approved": true}),
             json!({"protocol": 2, "type": "health"}),
         ] {
             let error = decode_rpc_request(&frame(value.clone())).unwrap_err();
             assert_eq!(error.code(), crate::ErrorCode::MalformedFrame, "{value}");
         }
-        let error = decode_rpc_request(&frame(json!({"rpc": 2, "type": "health"}))).unwrap_err();
+        let error = decode_rpc_request(&frame(json!({"rpc": 3, "type": "health"}))).unwrap_err();
         assert!(matches!(
             error,
             DecodeError::UnsupportedVersion {
-                found: 2,
-                expected: 1,
+                found: 3,
+                expected: 2,
+                ..
+            }
+        ));
+        let error = decode_rpc_request(&frame(json!({"rpc": 1, "type": "health"}))).unwrap_err();
+        assert!(matches!(
+            error,
+            DecodeError::UnsupportedVersion {
+                found: 1,
+                expected: 2,
                 ..
             }
         ));

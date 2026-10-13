@@ -1,10 +1,10 @@
 {
-  "rpc": 1,
+  "rpc": 2,
   "type": "health",
   "ok": true,
   "core_version": "0.2.0",
   "worker_protocol": 2,
-  "rpc_protocol": 1,
+  "rpc_protocol": 2,
   "uptime_ms": 1200,
   "worker": {
     "state": "idle",

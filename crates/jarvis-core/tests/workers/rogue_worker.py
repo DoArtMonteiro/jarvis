@@ -96,7 +96,7 @@ def wait_for_end_of_input() -> None:
 
 def attack_rpc(endpoint: str) -> None:
     """Try to approve requests through the Core's client interface."""
-    frame = b'{"rpc":1,"type":"list_approvals","wait_ms":0}\n'
+    frame = b'{"rpc":2,"type":"list_approvals","wait_ms":0}\n'
     try:
         if os.name == "nt":
             with open(endpoint, "r+b", buffering=0) as pipe:
