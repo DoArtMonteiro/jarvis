@@ -74,6 +74,19 @@ impl Scripted {
     fn reads(&self) -> usize {
         self.reads.load(Ordering::SeqCst)
     }
+
+    /// Wait until the governor has started its `count`th read. A read starts
+    /// only after the previous one has been applied, recorded and published,
+    /// so this says how many readings were fully handled, whatever the speed
+    /// of the database. The paused clock cannot say it.
+    async fn handled(&self, count: usize) {
+        within_real(10, "the governor's readings", async {
+            while self.reads() < count {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+    }
 }
 
 impl ActivitySource for Scripted {
@@ -159,13 +172,49 @@ impl ActivitySource for Panicking {
     }
 }
 
-/// Collects what `tracing` prints on this thread.
+/// What `tracing` printed, per thread. One subscriber is installed for the
+/// whole test binary, because a per-test subscriber races with the other
+/// tests over `tracing`'s global cache of which callsites are enabled. Each
+/// test runs the governor on its own thread, so it reads only its own lines.
 #[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+struct Captured(Arc<Mutex<std::collections::HashMap<std::thread::ThreadId, String>>>);
+
+impl Captured {
+    /// The shared capture, installing the subscriber on first use.
+    fn install() -> Self {
+        static CAPTURE: std::sync::OnceLock<Captured> = std::sync::OnceLock::new();
+        CAPTURE
+            .get_or_init(|| {
+                let captured = Captured::default();
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::fmt()
+                        .with_writer(captured.clone())
+                        .with_ansi(false)
+                        .finish(),
+                )
+                .expect("no other subscriber in this test binary");
+                captured
+            })
+            .clone()
+    }
+
+    /// Lines this thread logged that contain `text`.
+    fn lines_with(&self, text: &str) -> usize {
+        let all = self.0.lock().unwrap();
+        all.get(&std::thread::current().id()).map_or(0, |logged| {
+            logged.lines().filter(|l| l.contains(text)).count()
+        })
+    }
+}
 
 impl std::io::Write for Captured {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
+        self.0
+            .lock()
+            .unwrap()
+            .entry(std::thread::current().id())
+            .or_default()
+            .push_str(&String::from_utf8_lossy(bytes));
         Ok(bytes.len())
     }
 
@@ -182,12 +231,22 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
     }
 }
 
-impl Captured {
-    fn lines_with(&self, text: &str) -> usize {
-        String::from_utf8_lossy(&self.0.lock().unwrap())
-            .lines()
-            .filter(|line| line.contains(text))
-            .count()
+/// Fails the test if `future` takes more than `seconds` of real time. The
+/// paused clock cannot do this: it can jump ahead while the Core waits for
+/// its blocking threads, which would make a slow machine look like a hang.
+async fn within_real<T>(
+    seconds: u64,
+    what: &str,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let (send, expired) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(seconds));
+        let _ = send.send(());
+    });
+    tokio::select! {
+        value = future => value,
+        _ = expired => panic!("timed out after {seconds} s of real time: {what}"),
     }
 }
 
@@ -235,18 +294,16 @@ impl Rig {
 
     async fn reaches(&mut self, phase: GovernorPhase) -> Status {
         let wait = self.status.wait_for(|status| status.phase == phase);
-        let reached = tokio::time::timeout(Duration::from_secs(36_000), wait).await;
-        reached
-            .unwrap_or_else(|_| panic!("the governor never reached {phase:?}"))
+        within_real(10, &format!("the governor reaching {phase:?}"), wait)
+            .await
             .unwrap()
             .clone()
     }
 
     async fn holds_for(&mut self, reason: GovernorReason) -> Status {
         let wait = self.status.wait_for(|status| status.reason == Some(reason));
-        let reached = tokio::time::timeout(Duration::from_secs(36_000), wait).await;
-        reached
-            .unwrap_or_else(|_| panic!("the governor never held for {reason:?}"))
+        within_real(10, &format!("a hold for {reason:?}"), wait)
+            .await
             .unwrap()
             .clone()
     }
@@ -392,11 +449,7 @@ async fn a_long_hold_raises_one_alert_and_is_never_released_by_time() {
     let mut rig = Rig::start(Arc::clone(&source), &config);
 
     let wait = rig.status.wait_for(|status| status.overdue);
-    let status = tokio::time::timeout(Duration::from_secs(36_000), wait)
-        .await
-        .expect("the alert never came")
-        .unwrap()
-        .clone();
+    let status = within_real(10, "the alert", wait).await.unwrap().clone();
     assert_eq!(status.phase, GovernorPhase::Held);
     assert_eq!(rig.elapsed_ms(), 5_000);
     rig.recorded(2).await;
@@ -448,7 +501,8 @@ async fn a_failed_detection_holds_and_a_streak_is_recorded_once() {
 #[tokio::test(start_paused = true)]
 async fn if_the_release_cannot_be_recorded_the_gate_stays_closed_until_it_can() {
     let config = settings(1_000, 2_000, 86_400_000);
-    let mut rig = Rig::start(Scripted::script(vec![game(), clear()]), &config);
+    let source = Scripted::script(vec![game(), clear()]);
+    let mut rig = Rig::start(Arc::clone(&source), &config);
     rig.sql(
         "CREATE TRIGGER no_release BEFORE INSERT ON audit_events
          WHEN NEW.kind = 'governor_released'
@@ -457,7 +511,7 @@ async fn if_the_release_cannot_be_recorded_the_gate_stays_closed_until_it_can() 
     rig.reaches(GovernorPhase::Releasing).await;
 
     // Many readings later the delay is long over, but the gate is shut.
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    source.handled(40).await;
     let status = rig.hub.governor_status();
     assert_eq!(status.phase, GovernorPhase::Releasing);
     assert!(!status.is_open());
@@ -496,9 +550,7 @@ async fn the_task_ends_when_the_core_shuts_down() {
     let config = settings(1_000, 2_000, 86_400_000);
     let mut rig = Rig::start(Scripted::script(vec![game()]), &config);
     rig.reaches(GovernorPhase::Held).await;
-    tokio::time::timeout(Duration::from_secs(60), rig.stop())
-        .await
-        .expect("the governor did not stop");
+    within_real(10, "the governor stopping", rig.stop()).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -546,14 +598,13 @@ async fn a_read_that_never_finishes_holds_the_jobs_and_is_not_started_again() {
     assert_eq!(rig.elapsed_ms(), 2_000, "one poll after the read began");
     assert!(!rig.hub.governor_status().is_open());
 
+    rig.recorded(1).await;
     tokio::time::sleep(Duration::from_secs(60)).await;
     assert_eq!(source.reads(), 2, "no second read while one is in flight");
     assert_eq!(rig.hub.governor_status().phase, GovernorPhase::Held);
     assert_eq!(rig.audit(), [hold_failed()], "one streak, one event");
     // The governor can still stop with the read outstanding.
-    tokio::time::timeout(Duration::from_secs(60), rig.stop())
-        .await
-        .expect("a hung read blocked the governor's shutdown");
+    within_real(10, "stopping with a read outstanding", rig.stop()).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -602,22 +653,19 @@ async fn a_task_that_is_stopped_leaves_the_gate_as_it_was() {
 
 #[tokio::test(start_paused = true)]
 async fn a_release_that_cannot_be_recorded_is_logged_once_per_streak() {
-    let captured = Captured::default();
-    let _logging = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .finish(),
-    );
+    let captured = Captured::install();
     let config = settings(1_000, 2_000, 86_400_000);
-    let mut rig = Rig::start(Scripted::script(vec![game(), clear()]), &config);
+    let source = Scripted::script(vec![game(), clear()]);
+    let mut rig = Rig::start(Arc::clone(&source), &config);
     rig.sql(
         "CREATE TRIGGER no_release BEFORE INSERT ON audit_events
          WHEN NEW.kind = 'governor_released'
          BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;",
     );
     rig.reaches(GovernorPhase::Releasing).await;
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    // The release is attempted at the readings from 3 s on; by the 12th
+    // reading it has failed several times.
+    source.handled(12).await;
     assert_eq!(
         captured.lines_with("could not record the release"),
         1,
@@ -629,6 +677,35 @@ async fn a_release_that_cannot_be_recorded_is_logged_once_per_streak() {
 
     rig.sql("DROP TRIGGER no_release");
     rig.reaches(GovernorPhase::Open).await;
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn with_no_resume_delay_a_release_that_cannot_be_recorded_shows_as_releasing() {
+    let config = settings(1_000, 0, 86_400_000);
+    let source = Scripted::script(vec![game(), clear()]);
+    let mut rig = Rig::start(Arc::clone(&source), &config);
+    rig.sql(
+        "CREATE TRIGGER no_release BEFORE INSERT ON audit_events
+         WHEN NEW.kind = 'governor_released'
+         BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;",
+    );
+
+    // The game is gone, so health must not say it still runs; the gate stays
+    // shut because the release is not on the record.
+    let status = rig.reaches(GovernorPhase::Releasing).await;
+    assert_eq!((status.reason, status.process), (None, None));
+    source.handled(6).await;
+    let status = rig.hub.governor_status();
+    assert_eq!(status.phase, GovernorPhase::Releasing);
+    assert!(!status.is_open());
+    assert_eq!(rig.audit(), [hold_game()]);
+
+    rig.sql("DROP TRIGGER no_release");
+    rig.reaches(GovernorPhase::Open).await;
+    let audit = rig.audit();
+    assert_eq!(audit.len(), 2);
+    assert!(matches!(audit[1], AuditEventKind::GovernorReleased { .. }));
     rig.stop().await;
 }
 
@@ -766,9 +843,7 @@ impl Harness {
     }
 
     async fn takes(&mut self, job: JobId) {
-        let message = tokio::time::timeout(Duration::from_secs(10), self.recv())
-            .await
-            .expect("the job was never handed out");
+        let message = within_real(10, "the job being handed out", self.recv()).await;
         match message {
             CoreMessage::Job(assigned) => assert_eq!(assigned.job_id, job),
             other => panic!("expected a job, got {other:?}"),
@@ -787,9 +862,8 @@ impl Harness {
     }
 
     async fn ended(self) -> SessionReport {
-        tokio::time::timeout(Duration::from_secs(10), self.session)
+        within_real(10, "the session ending", self.session)
             .await
-            .expect("the session did not end")
             .unwrap()
             .unwrap()
     }

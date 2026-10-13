@@ -298,7 +298,7 @@ impl Governor {
         if released {
             self.publish(next);
         } else {
-            self.publish(staying(self.state.clone(), &events));
+            self.publish(staying(self.state.clone(), &events, now));
         }
     }
 
@@ -344,15 +344,29 @@ impl Drop for FailClosed {
     }
 }
 
-/// The state to keep when a release could not be recorded: unchanged, except
-/// that an alert recorded in the same step is not raised again.
-fn staying(mut state: State, events: &[Event]) -> State {
-    if events.iter().any(|e| matches!(e, Event::Overdue { .. }))
-        && let State::Held { overdue, .. } | State::Releasing { overdue, .. } = &mut state
-    {
-        *overdue = true;
+/// The state to keep when a release could not be recorded: the game is gone
+/// but the jobs stay held, so it is releasing and the next reading tries
+/// again. (Without a resume delay the step went straight from held to open.)
+/// An alert recorded in the same step is not raised again.
+fn staying(state: State, events: &[Event], now: u64) -> State {
+    let alerted = events.iter().any(|e| matches!(e, Event::Overdue { .. }));
+    match state {
+        State::Held { since, overdue, .. } => State::Releasing {
+            since,
+            until: now,
+            overdue: overdue || alerted,
+        },
+        State::Releasing {
+            since,
+            until,
+            overdue,
+        } => State::Releasing {
+            since,
+            until,
+            overdue: overdue || alerted,
+        },
+        State::Open => State::Open,
     }
-    state
 }
 
 fn millis(duration: Duration) -> u64 {
