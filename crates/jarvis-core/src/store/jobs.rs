@@ -193,8 +193,9 @@ impl Store {
     }
 
     /// The task that completed position `seq` of the job in an attempt before
-    /// `attempt`, if there is one. The Core never creates a second task for a
-    /// completed position, so there is at most one.
+    /// `attempt`, if there is one. The session never creates a task at a
+    /// completed position and no schema constraint enforces it, so the query
+    /// takes the oldest (ADR 0015).
     pub fn completed_step(
         &self,
         job_id: JobId,
