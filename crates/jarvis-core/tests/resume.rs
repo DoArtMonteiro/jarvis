@@ -645,9 +645,11 @@ async fn an_approval_from_an_earlier_attempt_cannot_be_used_in_the_next() {
     let status = env.store.approval(old.approval_id).unwrap().unwrap().status;
     assert_eq!(status, ApprovalStatus::Expired);
     assert!(
-        env.store
-            .grant_approval(old.approval_id, &old.fingerprint, "test client", now_ms())
-            .is_err(),
+        matches!(
+            env.store
+                .grant_approval(old.approval_id, &old.fingerprint, "test client", now_ms()),
+            Err(ApprovalError::NotPending(ApprovalStatus::Expired))
+        ),
         "an approval from an ended session cannot be granted"
     );
 
