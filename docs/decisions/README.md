@@ -18,3 +18,4 @@ Short records of decisions that shape the codebase. Each one states the context,
 | [0012](0012-worker-containment.md) | OS containment of the worker, without claiming a sandbox (superseded in part by 0013 and 0014) |
 | [0013](0013-windows-appcontainer.md) | Isolate the Windows worker in an AppContainer, and prove it at start-up |
 | [0014](0014-linux-landlock-seccomp.md) | Isolate the Linux worker with Landlock and seccomp |
+| [0015](0015-durable-jobs.md) | Durable jobs: resume what is safe, quarantine what is not (amends 0009) |

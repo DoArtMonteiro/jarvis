@@ -413,8 +413,8 @@ async fn jobs_are_handed_out_one_at_a_time() {
     assert_eq!(store.job(first).unwrap().unwrap().status, JobStatus::Failed);
     assert_eq!(
         store.job(second.job_id).unwrap().unwrap().status,
-        JobStatus::Interrupted,
-        "the worker left in the middle of the second job"
+        JobStatus::Queued,
+        "the worker left in the middle of the second job, which waits for the next worker"
     );
 }
 
@@ -814,7 +814,8 @@ async fn version_change_mid_session_closes_session() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         store.job(job).unwrap().unwrap().status,
-        JobStatus::Interrupted
+        JobStatus::Failed,
+        "a job whose worker broke the protocol is not retried (ADR 0015)"
     );
 }
 
@@ -1291,7 +1292,8 @@ async fn the_worker_leaving_while_waiting_expires_the_approval() {
     assert_eq!(store.tasks(1).unwrap()[0].status, TaskStatus::Expired);
     assert_eq!(
         store.job(job).unwrap().unwrap().status,
-        JobStatus::Interrupted
+        JobStatus::Queued,
+        "nothing ran, so the job waits for the next worker"
     );
     // A person who approves after the worker left changes nothing.
     assert!(matches!(
@@ -1410,7 +1412,7 @@ async fn a_store_failure_before_consumption_never_runs_the_tool() {
         TaskStatus::AwaitingConfirmation
     );
     // What the next start-up does.
-    let recovered = store.recover().unwrap();
+    let recovered = store.recover(Limits::default().max_job_attempts).unwrap();
     assert_eq!(recovered.approvals, 1);
     assert_eq!(
         store
@@ -1450,7 +1452,7 @@ async fn a_store_failure_after_the_tool_ran_leaves_a_consumed_approval() {
         ApprovalStatus::Consumed
     );
     assert_eq!(store.tasks(1).unwrap()[0].status, TaskStatus::Executing);
-    store.recover().unwrap();
+    store.recover(Limits::default().max_job_attempts).unwrap();
     assert_eq!(store.tasks(1).unwrap()[0].status, TaskStatus::Interrupted);
     assert!(
         store

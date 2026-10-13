@@ -6,6 +6,8 @@ use serde_json::json;
 
 use super::*;
 
+mod jobs;
+
 fn new_task(session_id: SessionId, request_id: &str) -> NewTask {
     NewTask {
         task_id: TaskId::new(),
@@ -14,8 +16,11 @@ fn new_task(session_id: SessionId, request_id: &str) -> NewTask {
         request_id: RequestId::try_from(request_id.to_owned()).unwrap(),
         tool: ToolName::try_from("system.info".to_owned()).unwrap(),
         args: json!({}),
+        step: None,
     }
 }
+
+const MAX_ATTEMPTS: u32 = 3;
 
 fn open(dir: &tempfile::TempDir) -> Store {
     Store::open(&dir.path().join("jarvis.db")).unwrap()
@@ -254,7 +259,7 @@ fn recovery_marks_unfinished_tasks() {
 
     let store = open(&dir);
     assert_eq!(
-        store.recover().unwrap(),
+        store.recover(MAX_ATTEMPTS).unwrap(),
         Recovery {
             tasks: 3,
             approvals: 0,
@@ -275,7 +280,7 @@ fn recovery_marks_unfinished_tasks() {
         .collect();
     assert_eq!(recovered.len(), 3);
     assert!(
-        store.recover().unwrap().is_empty(),
+        store.recover(MAX_ATTEMPTS).unwrap().is_empty(),
         "recovery is idempotent"
     );
 }
@@ -645,7 +650,7 @@ fn an_approval_is_used_at_most_once_even_across_restarts() {
         // Dropped mid-execution, as after a crash.
     }
     let store = open(&dir);
-    let recovered = store.recover().unwrap();
+    let recovered = store.recover(MAX_ATTEMPTS).unwrap();
     assert_eq!(recovered.approvals, 0, "a consumed approval is not open");
     assert_eq!(recovered.tasks, 1);
     assert_eq!(approval_status(&store, id), ApprovalStatus::Consumed);
@@ -823,7 +828,7 @@ fn closing_a_session_expires_its_approvals_only() {
 }
 
 #[test]
-fn no_approval_or_queued_job_survives_a_restart() {
+fn no_approval_survives_a_restart_and_queued_jobs_stay_queued() {
     let dir = tempfile::tempdir().unwrap();
     let (waiting, granted, queued, running);
     {
@@ -845,11 +850,11 @@ fn no_approval_or_queued_job_survives_a_restart() {
     }
     let store = open(&dir);
     assert_eq!(
-        store.recover().unwrap(),
+        store.recover(MAX_ATTEMPTS).unwrap(),
         Recovery {
             tasks: 2,
             approvals: 2,
-            jobs: 2
+            jobs: 1
         }
     );
     for p in [&waiting, &granted] {
@@ -871,15 +876,15 @@ fn no_approval_or_queued_job_survives_a_restart() {
             Err(ApprovalError::NotGranted(ApprovalStatus::Expired))
         ));
     }
-    assert_eq!(
-        store.job(running.job_id).unwrap().unwrap().status,
-        JobStatus::Interrupted
-    );
-    assert_eq!(
-        store.job(queued.job_id).unwrap().unwrap().status,
-        JobStatus::Cancelled
-    );
-    assert!(store.recover().unwrap().is_empty());
+    // The running job did nothing that could have acted, so it goes back to
+    // the queue. Its approvals are gone either way.
+    for job in [&running, &queued] {
+        assert_eq!(
+            store.job(job.job_id).unwrap().unwrap().status,
+            JobStatus::Queued
+        );
+    }
+    assert!(store.recover(MAX_ATTEMPTS).unwrap().is_empty());
 }
 
 #[test]

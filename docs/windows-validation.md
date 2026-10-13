@@ -106,7 +106,7 @@ Every test must pass. They are read-only towards your files: the canaries they c
 
 In the window running `serve`, press Ctrl+C once: logs show `shutdown requested`, the worker exits with code 0, the Core exits with code 0, `jarvis audit` ends with `session_closed`, `worker_exited`, `core_stopped`. Start again and press Ctrl+C twice quickly: exit code 130; the next start records recovery events. Also check `jarvis shutdown` and closing the console window.
 
-Kill the worker (`Stop-Process -Id <worker pid> -Force`): `health` shows `restarting`, then `idle` with a new pid. Kill it more than `restart_budget` times within `restart_window_ms`: `health` reports the worker failed and `submit` is refused. Kill it while a write waits for approval: the approval becomes `expired`.
+Kill the worker (`Stop-Process -Id <worker pid> -Force`): `health` shows `restarting`, then `idle` with a new pid. Kill it more than `restart_budget` times within `restart_window_ms`: `health` reports the worker failed and `submit` is refused. Kill it while a write waits for approval: the approval becomes `expired`, the job goes back to the queue (`job_requeued` in `jarvis audit`), and the next worker asks for the write again with a new approval.
 
 Submit a write, leave it pending, end `jarvis-core.exe` from Task Manager, start it again: `approvals list` is empty and the old approval is `expired`.
 

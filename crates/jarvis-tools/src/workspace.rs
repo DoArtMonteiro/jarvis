@@ -50,9 +50,19 @@ impl WorkspaceRoot {
         let path = path.clone();
         let content = content.to_owned();
         let max_bytes = self.max_bytes;
-        tokio::task::spawn_blocking(move || write_blocking(&dir, &path, &content, max_bytes))
+        match tokio::task::spawn_blocking(move || write_blocking(&dir, &path, &content, max_bytes))
             .await
-            .map_err(|_| ToolError::new(ToolErrorKind::Io, "workspace write did not complete"))?
+        {
+            Ok(outcome) => outcome,
+            // A panic is not an error the tool reports: the write may have
+            // happened. Re-raise it so the gateway records an unknown outcome
+            // (`internal`) and not a failure that changed nothing.
+            Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+            Err(_) => Err(ToolError::new(
+                ToolErrorKind::Io,
+                "workspace write did not complete",
+            )),
+        }
     }
 }
 

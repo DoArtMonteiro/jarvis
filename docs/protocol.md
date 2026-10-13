@@ -104,7 +104,7 @@ There is no field for capabilities, approvals, task IDs or policy. Adding one ma
 
 `goal` is 1 to 2000 characters without control characters.
 
-`tool_response`, sent for every `tool_request` that becomes a task (it decodes, belongs to the current job, is within the request cap and does not reuse a `request_id`):
+`tool_response`, sent for every `tool_request` that becomes a task (it decodes, belongs to the current job, is within the request cap and does not reuse a `request_id`), and for a request answered from the job's earlier work (below):
 
 ```json
 {"protocol": 2, "type": "tool_response", "request_id": "req-0001", "task_id": "…",
@@ -118,7 +118,9 @@ There is no field for capabilities, approvals, task IDs or policy. Adding one ma
 | `declined` | `approval_id`, `reason` | A person refused. Nothing ran |
 | `expired` | `approval_id` | Nobody decided before the approval expired. Nothing ran |
 | `rejected` | `error` | Unknown tool or invalid arguments. Nothing ran |
-| `failed` | `error` | The tool failed, timed out, was cancelled, or its result was rejected |
+| `failed` | `error` | The tool failed, panicked, timed out, was cancelled, or its result was rejected |
+
+A job can be handed out again after its worker or the Core stopped. Requests are counted from 1 in each attempt. If an earlier attempt already completed the step at a position, and the worker now sends the same call there, the Core answers `completed` with the stored result and the `task_id` of the original task. No task is created, no tool runs and no approval is needed. A request that differs from the completed step ends the job as failed and closes the session with a fatal `unexpected_message`. Only positions with a completed step are checked: a request at any other position is a new request with a new task and, for class B, a new approval. A worker that plans the same calls in the same order on every attempt, as the current planner does, never sees the difference.
 
 `error`, sent for frames that did not create a task. `request_id` is always present, `null` when it could not be recovered. `fatal: true` means the Core is closing the session:
 
@@ -144,7 +146,7 @@ There is no field for capabilities, approvals, task IDs or policy. Adding one ma
 | `cancelled` | `tool_response` (`failed`) | No |
 | `result_rejected` | `tool_response` (`failed`) | No |
 | `limit_exceeded` | `error` | Yes |
-| `internal` | `error` | Yes |
+| `internal` | `error`, or `tool_response` (`failed`) when a tool panicked | Yes as an `error`; no as a `tool_response` |
 
 ### Tools
 

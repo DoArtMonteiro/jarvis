@@ -68,7 +68,7 @@ The limits are stated plainly in the [threat model](docs/threat-model.md). The w
 - Human approval for class B requests, bound by fingerprint, single use, with expiry, audited from request to consumption.
 - Three tools: `system.info` (no hostname, username, environment or paths), `filesystem.read_fixture` (one configured directory) and `workspace.write_file` (one configured directory, handle-based resolution, atomic replace, no links followed out).
 - Worker isolation on Windows (AppContainer) and Linux (Landlock and seccomp), checked at every start by a probe (loopback TCP and UDP, a file next to the database, the user's home, starting a process) and by hostile probes from a real child process on CI; `isolation check` and `isolation remove` commands, and an optional Windows script that adds firewall rules for the worker as defence in depth.
-- SQLite store with migrations, jobs, tasks, approvals, an append-only audit log, replay protection and crash recovery.
+- SQLite store with migrations, jobs, tasks, approvals, an append-only audit log, replay protection and crash recovery. A job whose worker or Core stopped is resumed without repeating a recorded step, or quarantined when a step's outcome is unknown (ADR 0015).
 - Python worker with a job loop and a deterministic planner.
 
 ## Planned
@@ -153,7 +153,7 @@ cd services/intelligence-python
 uv sync && uv run pytest && uv run mypy && uv run ruff check .
 ```
 
-The Rust suite covers the request pipeline and every refusal path, approvals (grant, deny, expiry, wrong fingerprint, single use, restart, the worker leaving while a request waits, database failures before and after execution), the workspace writer against traversal, links and races, isolation probes (a real Python child trying to read the profile, write files, reach the network, start processes, signal or read the Core, use a leaked handle and open the RPC endpoint), the start-up check failing closed, worker crashes and restart budgets, signals, recovery and the RPC interface. CI runs it on Linux and Windows, along with `isolation check`, the Windows provisioning script, the isolation overhead measurement, the Python checks, the minimum supported Rust version, the documented quick start and a secret scan.
+The Rust suite covers the request pipeline and every refusal path, approvals (grant, deny, expiry, wrong fingerprint, single use, restart, the worker leaving while a request waits, database failures before and after execution), the workspace writer against traversal, links and races, isolation probes (a real Python child trying to read the profile, write files, reach the network, start processes, signal or read the Core, use a leaked handle and open the RPC endpoint), the start-up check failing closed, worker crashes and restart budgets, signals, recovery, resuming a job across a killed Core and a dying worker without repeating a completed step, quarantine of steps with an unknown outcome, the upgrade of a database from before the step ledger, and the RPC interface. CI runs it on Linux and Windows, along with `isolation check`, the Windows provisioning script, the isolation overhead measurement, the Python checks, the minimum supported Rust version, the documented quick start and a secret scan.
 
 ## Repository layout
 

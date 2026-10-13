@@ -18,6 +18,9 @@ Modes:
   crash          exit with status 7 right after the handshake
   crash-waiting  take one job, ask for a write that needs approval, then exit
                  with status 9 while the request waits for a person
+  die-after-first-response
+                 take one job, ask for `system.info`, and exit with status 5
+                 as soon as the answer arrives, on every attempt
   silent         never send hello
   stubborn       complete the handshake, then ignore end-of-input
 """
@@ -216,6 +219,13 @@ def crash_waiting() -> None:
     sys.exit(9)
 
 
+def die_after_first_response() -> None:
+    handshake()
+    job = take_job()
+    expect("first step", request(job, "r1", "system.info", {}), outcome__status="completed")
+    sys.exit(5)
+
+
 def main() -> None:
     mode = sys.argv[1]
     if mode == "bypass":
@@ -227,6 +237,8 @@ def main() -> None:
         sys.exit(7)
     elif mode == "crash-waiting":
         crash_waiting()
+    elif mode == "die-after-first-response":
+        die_after_first_response()
     elif mode == "silent":
         time.sleep(60)
     elif mode == "stubborn":

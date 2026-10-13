@@ -60,7 +60,7 @@ Do not weaken these without an ADR in `docs/decisions/` and an update to the thr
 3. `jarvis-protocol`: a new `Capability` with its class if no existing one describes the intent.
 4. `jarvis-core/src/policy.rs`: map the call to its capabilities.
 5. `jarvis-core/src/approval.rs`: describe its arguments for a person in `describe` (display-safe, bounded).
-6. `jarvis-tools`: implement it in `Toolbox`, returning typed results and errors without host paths.
+6. `jarvis-tools`: implement it in `Toolbox`, returning typed results and errors without host paths. An error the tool reports must mean it made no change, because a job that failed with `tool_failed` may run that step again (ADR 0015).
 7. `jarvis-core/src/gateway.rs`: add tool-specific result checks if the result has invariants.
 8. Tests: allowed, denied, invalid arguments, tool failure, and the session test for the full path; for class B also approved, declined and expired.
 9. `docs/protocol.md` and the fixtures in `tests/protocol/`, then the Python worker's types.

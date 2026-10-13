@@ -36,6 +36,9 @@ tool_timeout_ms = 5000
 write_timeout_ms = 5000
 max_requests_per_session = 1000
 max_protocol_errors = 16
+# How often a job may be claimed. A job whose worker or Core stopped goes back
+# to the queue until this many attempts are spent, then ends as interrupted.
+max_job_attempts = 3
 shutdown_grace_ms = 2000
 
 [approvals]

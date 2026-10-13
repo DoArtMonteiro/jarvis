@@ -107,6 +107,26 @@ pub enum AuditEventKind {
         job_id: JobId,
         status: JobStatus,
     },
+    /// A running job went back to the queue because its worker or the Core
+    /// stopped. `attempts` is how many times it has been claimed so far.
+    JobRequeued {
+        job_id: JobId,
+        attempts: u32,
+        reason: String,
+    },
+    /// A job was ended instead of resumed because `task_id` started
+    /// executing and its outcome was not recorded.
+    JobQuarantined {
+        job_id: JobId,
+        task_id: TaskId,
+    },
+    /// A request was answered with the stored result of the completed task
+    /// `task_id` at position `seq`. No task was created and no tool ran.
+    StepReplayed {
+        job_id: JobId,
+        seq: u32,
+        task_id: TaskId,
+    },
     ApprovalRequested {
         approval_id: ApprovalId,
         tool: ToolName,
@@ -164,6 +184,9 @@ impl AuditEventKind {
             Self::JobSubmitted { .. } => "job_submitted",
             Self::JobStarted { .. } => "job_started",
             Self::JobFinished { .. } => "job_finished",
+            Self::JobRequeued { .. } => "job_requeued",
+            Self::JobQuarantined { .. } => "job_quarantined",
+            Self::StepReplayed { .. } => "step_replayed",
             Self::ApprovalRequested { .. } => "approval_requested",
             Self::ApprovalGranted { .. } => "approval_granted",
             Self::ApprovalDenied { .. } => "approval_denied",
@@ -201,6 +224,20 @@ mod tests {
             AuditEventKind::JobFinished {
                 job_id: JobId::new(),
                 status: JobStatus::Completed,
+            },
+            AuditEventKind::JobRequeued {
+                job_id: JobId::new(),
+                attempts: 1,
+                reason: "worker stream failed".into(),
+            },
+            AuditEventKind::JobQuarantined {
+                job_id: JobId::new(),
+                task_id: TaskId::new(),
+            },
+            AuditEventKind::StepReplayed {
+                job_id: JobId::new(),
+                seq: 2,
+                task_id: TaskId::new(),
             },
         ];
         for event in events {

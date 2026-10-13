@@ -541,7 +541,8 @@ fn a_write_runs_only_after_a_person_approves_it_through_another_client() {
 }
 
 /// Pending approvals do not survive a restart, and a consumed approval stays
-/// consumed: neither can be used after the Core comes back.
+/// consumed: neither can be used after the Core comes back. The job that was
+/// waiting is queued again and asks again with a new approval.
 #[test]
 fn no_approval_can_be_used_after_the_core_restarts() {
     let setup = Setup::new("real", POLICY, "");
@@ -563,7 +564,9 @@ fn no_approval_can_be_used_after_the_core_restarts() {
     daemon.crash();
 
     let daemon = setup.serve();
-    assert!(setup.json(&["approvals", "list"]).is_empty());
+    let renewed = setup.pending_approval();
+    assert_ne!(renewed["approval_id"], second_id.as_str());
+    assert_ne!(renewed["fingerprint"], second["fingerprint"]);
     let shown = setup.json(&["approvals", "show", &second_id]).remove(0);
     assert_eq!(shown["status"], "expired");
     let shown = setup.json(&["approvals", "show", &first_id]).remove(0);
@@ -573,7 +576,7 @@ fn no_approval_can_be_used_after_the_core_restarts() {
         assert_eq!(output.status.code(), Some(1), "{id} was approved again");
     }
     let job = setup.json(&["job", &job]).remove(0);
-    assert_eq!(job["status"], "interrupted");
+    assert_eq!(job["status"], "running", "waiting for the new approval");
     assert_eq!(setup.workspace_file("a.txt").as_deref(), Some("first"));
     assert_eq!(setup.workspace_file("b.txt"), None);
     assert!(setup.shutdown(daemon).success());
@@ -674,22 +677,28 @@ fn a_worker_that_dies_while_waiting_for_approval_leaves_nothing_usable() {
     let setup = Setup::new("crash-waiting", POLICY, "");
     let daemon = setup.serve();
     let job = setup.submit("anything");
-    setup.wait_for_kind("approval_requested", 1);
-    setup.wait_for_kind("worker_restart_scheduled", 1);
-    let approval = setup
+    // Nothing the worker did completed or started, so the job is tried again
+    // until its attempts are spent. Every attempt asks anew.
+    setup.wait_for_kind("job_finished", 1);
+    let approvals: Vec<_> = setup
         .events()
         .into_iter()
-        .find_map(|event| match event.event {
+        .filter_map(|event| match event.event {
             AuditEventKind::ApprovalRequested { approval_id, .. } => Some(approval_id),
             _ => None,
         })
-        .unwrap();
-    let record = setup.store().approval(approval).unwrap().unwrap();
-    assert_eq!(record.status, ApprovalStatus::Expired);
-    let output = setup.run(&["approvals", "approve", &approval.to_string(), "--yes"]);
-    assert_eq!(output.status.code(), Some(1));
+        .collect();
+    assert_eq!(approvals.len(), 3);
+    for approval in approvals {
+        let record = setup.store().approval(approval).unwrap().unwrap();
+        assert_eq!(record.status, ApprovalStatus::Expired);
+        let output = setup.run(&["approvals", "approve", &approval.to_string(), "--yes"]);
+        assert_eq!(output.status.code(), Some(1));
+    }
+    assert_eq!(setup.count("job_requeued"), 2);
     let job = setup.json(&["job", &job]).remove(0);
     assert_eq!(job["status"], "interrupted");
+    assert!(job["summary"].as_str().unwrap().contains("attempt limit"));
     assert_eq!(setup.workspace_file("never.txt"), None);
     drop(daemon);
 }
@@ -797,6 +806,7 @@ fn start_up_recovers_what_a_previous_run_left_open() {
                 task_id,
                 session_id: SessionId::new(),
                 job_id: None,
+                step: None,
                 request_id: RequestId::try_from("r1".to_owned()).unwrap(),
                 tool: ToolName::try_from("system.info".to_owned()).unwrap(),
                 args: serde_json::json!({}),
@@ -814,13 +824,22 @@ fn start_up_recovers_what_a_previous_run_left_open() {
         store.submit_job(&goal, "test").unwrap();
     }
     let daemon = setup.serve();
+    // The queued job is carried over and run by the new worker.
+    setup.wait_for_kind("job_finished", 1);
     assert!(setup.shutdown(daemon).success());
     let store = setup.store();
     assert_eq!(
         store.task(task_id).unwrap().unwrap().status,
         TaskStatus::Interrupted
     );
-    assert_eq!(store.jobs(1).unwrap()[0].status, JobStatus::Cancelled);
+    let job = &store.jobs(1).unwrap()[0];
+    // The worker ran it: the goal names nothing it knows how to do.
+    assert_eq!(job.status, JobStatus::Failed);
+    let summary = job.summary.as_ref().unwrap();
+    assert!(summary.as_str().contains("known action"), "{summary:?}");
+    assert_eq!(job.attempts, 1);
+    assert_eq!(setup.count("job_started"), 1);
+    assert_eq!(setup.count("job_requeued"), 0);
     assert!(
         store
             .audit_events(Some(task_id), 100)
@@ -1026,4 +1045,97 @@ fn the_rpc_socket_is_private_to_the_user() {
     let output = setup.run(&["serve"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("mode 0700"), "{}", stderr(&output));
+}
+
+/// The Core is killed while step 2, a write, waits for a person. After the
+/// restart the job comes back, step 1 is answered from its stored result, and
+/// step 2 asks again with a new approval.
+#[test]
+fn a_job_resumes_after_a_core_crash_without_repeating_a_completed_step() {
+    let setup = Setup::new("real", POLICY, "");
+    let mut daemon = setup.serve();
+    let job = setup.submit("system info, then write b.txt: hello");
+    let first = setup.pending_approval();
+    let first_id = first["approval_id"].as_str().unwrap().to_owned();
+    assert_eq!(setup.count("execution_started"), 1, "system.info ran");
+    let completed = setup
+        .store()
+        .tasks(10)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.tool == "system.info")
+        .unwrap();
+    daemon.crash();
+
+    let daemon = setup.serve();
+    let second = setup.pending_approval();
+    let second_id = second["approval_id"].as_str().unwrap().to_owned();
+    assert_ne!(second_id, first_id, "a new approval, not the old one");
+    assert_ne!(second["fingerprint"], first["fingerprint"]);
+    assert_eq!(second["arguments"]["path"], "b.txt");
+    assert_eq!(setup.count("job_requeued"), 1);
+    assert_eq!(setup.count("step_replayed"), 1);
+    assert_eq!(
+        setup.count("execution_started"),
+        1,
+        "system.info did not run again"
+    );
+    let shown = setup.json(&["approvals", "show", &first_id]).remove(0);
+    assert_eq!(shown["status"], "expired");
+    let output = setup.run(&["approvals", "approve", &first_id, "--yes"]);
+    assert_eq!(output.status.code(), Some(1), "the old approval is dead");
+    assert_eq!(setup.workspace_file("b.txt"), None);
+
+    let fingerprint = second["fingerprint"].as_str().unwrap();
+    let output = setup.run(&[
+        "approvals",
+        "approve",
+        &second_id,
+        "--yes",
+        "--fingerprint",
+        fingerprint,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let done = setup.json(&["job", &job, "--wait"]).remove(0);
+    assert_eq!(done["status"], "completed", "{done}");
+    assert_eq!(setup.workspace_file("b.txt").as_deref(), Some("hello"));
+    assert!(setup.shutdown(daemon).success());
+
+    assert_eq!(setup.count("execution_started"), 2, "one per tool, no more");
+    assert_eq!(setup.count("approval_consumed"), 1);
+    let replayed: Vec<_> = setup
+        .events()
+        .into_iter()
+        .filter_map(|event| match event.event {
+            AuditEventKind::StepReplayed { seq, task_id, .. } => Some((seq, task_id)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replayed, [(1, completed.task_id)]);
+    let old = setup
+        .store()
+        .approval(first_id.parse().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.status, ApprovalStatus::Expired);
+}
+
+/// A worker that dies right after step 1 is answered, on every attempt. Each
+/// attempt replays step 1, so the tool ran once, and the job ends when its
+/// attempts are spent.
+#[test]
+fn a_job_whose_worker_keeps_dying_replays_its_first_step_until_the_attempts_are_spent() {
+    let setup = Setup::new("die-after-first-response", POLICY, "");
+    let daemon = setup.serve();
+    let job = setup.submit("anything");
+    setup.wait_for_kind("job_finished", 1);
+    let job = setup.json(&["job", &job]).remove(0);
+    assert_eq!(job["status"], "interrupted");
+    assert!(job["summary"].as_str().unwrap().contains("attempt limit"));
+    assert_eq!(setup.count("job_started"), 3);
+    assert_eq!(setup.count("job_requeued"), 2);
+    assert_eq!(setup.count("execution_started"), 1, "the tool ran once");
+    assert_eq!(setup.count("step_replayed"), 2, "attempts 2 and 3 replayed");
+    assert_eq!(setup.store().tasks(10).unwrap().len(), 1);
+    drop(daemon);
 }
