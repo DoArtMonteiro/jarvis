@@ -10,6 +10,10 @@
 //!                          ─► consume approval + record decision ─► Gateway ─► …
 //! ```
 //!
+//! A job handed out again after its worker or the Core stopped is resumed:
+//! a request for a position an earlier attempt completed is answered from
+//! the stored result without creating a task (ADR 0015).
+//!
 //! Requests are handled one at a time, in order. That is the simplest
 //! correct model for a single worker and doubles as a resource limit: a
 //! worker can never have more than one tool running or more than one request

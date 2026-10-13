@@ -1,6 +1,6 @@
 # 0009. Pending approvals do not survive a restart
 
-**Status:** Accepted
+**Status:** Accepted. Amended by [0015](0015-durable-jobs.md): the sentences about jobs.
 
 ## Context
 
@@ -12,7 +12,7 @@ Start-up recovery closes everything that carries authority, in one transaction, 
 
 - pending and granted approvals become `expired`, each with an `approval_expired` event;
 - tasks waiting for confirmation become `expired`, tasks that were received or executing become `interrupted`, each with a `task_recovered` event;
-- running jobs become `interrupted` and queued jobs `cancelled`.
+- running jobs are requeued or closed, and queued jobs stay queued (ADR 0015). Their approvals are expired all the same.
 
 The same applies, without a restart, when a session ends: the worker exiting, crashing or being restarted expires the approvals of that session.
 
@@ -20,4 +20,4 @@ The same applies, without a restart, when a session ends: the worker exiting, cr
 
 - No approval issued by one run of the Core can be used by another, and no approval outlives the worker process that asked for it.
 - A person who approved just before a crash has to approve again, after the worker asks again. That is the intended cost.
-- Queued jobs are not resumed automatically. Resubmitting is a client's decision.
+- Queued jobs stay queued and are handed to the next worker. A job that was waiting for a person asks again, with a new task and a new approval (ADR 0015).
