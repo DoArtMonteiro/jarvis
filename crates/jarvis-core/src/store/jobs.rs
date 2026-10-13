@@ -135,41 +135,20 @@ impl Store {
         summary: Option<&Summary>,
         session_id: Option<SessionId>,
     ) -> Result<(), StoreError> {
-        let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            "UPDATE jobs SET status = ?1, summary = ?2, updated_at = ?3
-             WHERE job_id = ?4 AND status = 'running'",
-            params![
-                status.as_str(),
-                summary.map(Summary::as_str),
-                now(),
-                job_id.to_string()
-            ],
-        )?;
-        if changed != 1 || !status.is_terminal() {
+        if !status.is_terminal() {
             return Err(StoreError::Corrupt(format!(
                 "job {job_id} is not running or `{status}` is not terminal"
             )));
         }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
         // A job that ends without a retry still says if a task of it may have
         // acted without a recorded result.
-        if matches!(status, JobStatus::Failed | JobStatus::Interrupted)
-            && let Some(task_id) = uncertain_task(&tx, job_id)?
-        {
-            insert_event(
-                &tx,
-                session_id,
-                None,
-                &AuditEventKind::JobQuarantined { job_id, task_id },
-            )?;
-        }
-        insert_event(
-            &tx,
-            session_id,
-            None,
-            &AuditEventKind::JobFinished { job_id, status },
-        )?;
+        let uncertain = match status {
+            JobStatus::Failed | JobStatus::Interrupted => uncertain_task(&tx, job_id)?,
+            _ => None,
+        };
+        close(&tx, job_id, status, summary, uncertain, session_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -339,45 +318,37 @@ fn settle(
         _ => return Err(StoreError::Corrupt(format!("job {job_id} is not running"))),
     };
 
-    if let Some(task_id) = uncertain_task(tx, job_id)? {
-        let summary = format!(
-            "not resumed: task {task_id} started and its outcome was not recorded ({reason})"
-        );
-        set_status(tx, job_id, JobStatus::Interrupted, Some(&summary))?;
+    let uncertain = uncertain_task(tx, job_id)?;
+    let summary = if let Some(task_id) = uncertain {
+        format!("not resumed: task {task_id} started and its outcome was not recorded ({reason})")
+    } else if attempts == 0 {
+        format!("the job predates the step ledger and cannot be resumed safely ({reason})")
+    } else if attempts >= max_attempts {
+        format!("attempt limit of {max_attempts} reached ({reason})")
+    } else {
+        set_status(tx, job_id, JobStatus::Queued, None)?;
         insert_event(
             tx,
             session_id,
             None,
-            &AuditEventKind::JobQuarantined { job_id, task_id },
+            &AuditEventKind::JobRequeued {
+                job_id,
+                attempts,
+                reason: reason.to_owned(),
+            },
         )?;
-        finished(tx, session_id, job_id, JobStatus::Interrupted)?;
-        return Ok(JobStatus::Interrupted);
-    }
-    if attempts == 0 {
-        let summary =
-            format!("the job predates the step ledger and cannot be resumed safely ({reason})");
-        set_status(tx, job_id, JobStatus::Interrupted, Some(&summary))?;
-        finished(tx, session_id, job_id, JobStatus::Interrupted)?;
-        return Ok(JobStatus::Interrupted);
-    }
-    if attempts >= max_attempts {
-        let summary = format!("attempt limit of {max_attempts} reached ({reason})");
-        set_status(tx, job_id, JobStatus::Interrupted, Some(&summary))?;
-        finished(tx, session_id, job_id, JobStatus::Interrupted)?;
-        return Ok(JobStatus::Interrupted);
-    }
-    set_status(tx, job_id, JobStatus::Queued, None)?;
-    insert_event(
+        return Ok(JobStatus::Queued);
+    };
+    let summary = Summary::lossy(&summary);
+    close(
         tx,
+        job_id,
+        JobStatus::Interrupted,
+        Some(&summary),
+        uncertain,
         session_id,
-        None,
-        &AuditEventKind::JobRequeued {
-            job_id,
-            attempts,
-            reason: reason.to_owned(),
-        },
     )?;
-    Ok(JobStatus::Queued)
+    Ok(JobStatus::Interrupted)
 }
 
 /// A task of the job that started executing and whose outcome is not known.
@@ -401,20 +372,20 @@ fn uncertain_task(tx: &Transaction<'_>, job_id: JobId) -> Result<Option<TaskId>,
     .transpose()
 }
 
-/// Change a running job's status. A summary is bounded like any other.
+/// Change a running job's status. `None` leaves the summary as it is, and a
+/// running job has none: a summary is only ever written as a job ends.
 fn set_status(
     tx: &Transaction<'_>,
     job_id: JobId,
     to: JobStatus,
-    summary: Option<&str>,
+    summary: Option<&Summary>,
 ) -> Result<(), StoreError> {
-    let summary = summary.map(Summary::lossy);
     let changed = tx.execute(
         "UPDATE jobs SET status = ?1, summary = COALESCE(?2, summary), updated_at = ?3
          WHERE job_id = ?4 AND status = 'running'",
         params![
             to.as_str(),
-            summary.as_ref().map(Summary::as_str),
+            summary.map(Summary::as_str),
             now(),
             job_id.to_string()
         ],
@@ -425,12 +396,26 @@ fn set_status(
     Ok(())
 }
 
-fn finished(
+/// End a running job in `status`. The one place that does it: the status
+/// change, then `job_quarantined` when `uncertain` names a task that may have
+/// acted without a recorded result, then `job_finished`.
+fn close(
     tx: &Transaction<'_>,
-    session_id: Option<SessionId>,
     job_id: JobId,
     status: JobStatus,
+    summary: Option<&Summary>,
+    uncertain: Option<TaskId>,
+    session_id: Option<SessionId>,
 ) -> Result<(), StoreError> {
+    set_status(tx, job_id, status, summary)?;
+    if let Some(task_id) = uncertain {
+        insert_event(
+            tx,
+            session_id,
+            None,
+            &AuditEventKind::JobQuarantined { job_id, task_id },
+        )?;
+    }
     insert_event(
         tx,
         session_id,
