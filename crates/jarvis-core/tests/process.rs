@@ -1153,9 +1153,37 @@ fn unique_game_name() -> String {
     }
 }
 
+/// A stand-in process that is killed and reaped when it goes out of scope,
+/// so that a failing assertion does not leave it running.
+struct StandIn(Child);
+
+impl StandIn {
+    fn kill(&mut self) {
+        self.0.kill().unwrap();
+        self.0.wait().unwrap();
+    }
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_stand_in_does_not_outlive_its_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let stand_in = start_stand_in(dir.path(), &unique_game_name());
+    let pid = stand_in.0.id();
+    assert!(jarvis_sandbox::process_exists(pid));
+    drop(stand_in);
+    assert!(!jarvis_sandbox::process_exists(pid));
+}
+
 /// Copy a harmless system binary to `dir/name` and run it for two minutes.
 /// It is a stand-in for a game, found by its file name like one.
-fn start_stand_in(dir: &Path, name: &str) -> Child {
+fn start_stand_in(dir: &Path, name: &str) -> StandIn {
     let target = dir.join(name);
     let (source, args): (&str, &[&str]) = if cfg!(windows) {
         (r"C:\Windows\System32\PING.EXE", &["-n", "120", "127.0.0.1"])
@@ -1163,13 +1191,14 @@ fn start_stand_in(dir: &Path, name: &str) -> Child {
         ("/bin/sleep", &["120"])
     };
     std::fs::copy(source, &target).unwrap();
-    Command::new(&target)
+    let child = Command::new(&target)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap()
+        .unwrap();
+    StandIn(child)
 }
 
 impl Setup {
@@ -1235,8 +1264,7 @@ fn queued_jobs_wait_while_a_game_runs_and_start_after_it_exits() {
     assert_eq!(setup.count("job_started"), 0);
     assert_eq!(setup.health()["queued_jobs"], 1);
 
-    stand_in.kill().unwrap();
-    stand_in.wait().unwrap();
+    stand_in.kill();
     let done = setup
         .json(&["job", &job, "--wait", "--timeout", "30s"])
         .remove(0);
