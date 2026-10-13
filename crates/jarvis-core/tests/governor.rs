@@ -105,6 +105,92 @@ fn broken() -> Reading {
     Err(ActivityError("the process list is unavailable".into()))
 }
 
+/// The first read says the list is clear. The second does not finish until
+/// the test sends its answer. Later reads repeat that answer.
+#[derive(Debug)]
+struct Stalling {
+    reads: AtomicUsize,
+    answer: Mutex<Option<tokio::sync::oneshot::Receiver<Reading>>>,
+    last: Mutex<Reading>,
+}
+
+impl Stalling {
+    fn new() -> (Arc<Self>, tokio::sync::oneshot::Sender<Reading>) {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let source = Arc::new(Self {
+            reads: AtomicUsize::new(0),
+            answer: Mutex::new(Some(receive)),
+            last: Mutex::new(clear()),
+        });
+        (source, send)
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl ActivitySource for Stalling {
+    fn read(&self) -> ReadingFuture<'_> {
+        Box::pin(async move {
+            let number = self.reads.fetch_add(1, Ordering::SeqCst);
+            if number == 1 {
+                let receive = self.answer.lock().unwrap().take().unwrap();
+                let answer = receive.await.unwrap_or_else(|_| broken());
+                *self.last.lock().unwrap() = answer;
+            }
+            self.last.lock().unwrap().clone()
+        })
+    }
+}
+
+/// Reads fine once, then panics inside `read`.
+#[derive(Debug)]
+struct Panicking(AtomicUsize);
+
+impl ActivitySource for Panicking {
+    fn read(&self) -> ReadingFuture<'_> {
+        Box::pin(async move {
+            if self.0.fetch_add(1, Ordering::SeqCst) > 0 {
+                panic!("the source broke");
+            }
+            clear()
+        })
+    }
+}
+
+/// Collects what `tracing` prints on this thread.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Captured {
+        self.clone()
+    }
+}
+
+impl Captured {
+    fn lines_with(&self, text: &str) -> usize {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter(|line| line.contains(text))
+            .count()
+    }
+}
+
 // --- the loop -----------------------------------------------------------------------------------
 
 fn settings(poll_ms: u64, resume_ms: u64, alert_ms: u64) -> GovernorConfig {
@@ -128,7 +214,7 @@ struct Rig {
 }
 
 impl Rig {
-    fn start(source: Arc<Scripted>, config: &GovernorConfig) -> Self {
+    fn start(source: Arc<impl ActivitySource>, config: &GovernorConfig) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("jarvis.db")).unwrap();
         let hub = Arc::new(Hub::default());
@@ -178,6 +264,19 @@ impl Rig {
             .map(|event| event.event)
             .filter(|event| event.name().starts_with("governor_"))
             .collect()
+    }
+
+    /// Wait until at least `count` governor events are on the record. A hold
+    /// closes the gate first and is written after.
+    async fn recorded(&self, count: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while self.audit().len() < count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the events were never recorded"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Run SQL on a second connection to the Core's database.
@@ -241,6 +340,7 @@ async fn the_gate_opens_after_exactly_the_resume_delay_and_the_release_is_record
 
     let held = rig.holds_for(GovernorReason::Game).await;
     assert_eq!(held.process.as_deref(), Some("cs2.exe"));
+    rig.recorded(1).await;
     assert_eq!(rig.audit(), [hold_game()]);
 
     // The game is gone at the third reading (2 s). The delay runs from there.
@@ -299,6 +399,7 @@ async fn a_long_hold_raises_one_alert_and_is_never_released_by_time() {
         .clone();
     assert_eq!(status.phase, GovernorPhase::Held);
     assert_eq!(rig.elapsed_ms(), 5_000);
+    rig.recorded(2).await;
     assert_eq!(
         rig.audit(),
         [
@@ -398,6 +499,137 @@ async fn the_task_ends_when_the_core_shuts_down() {
     tokio::time::timeout(Duration::from_secs(60), rig.stop())
         .await
         .expect("the governor did not stop");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_game_closes_the_gate_before_the_hold_is_recorded() {
+    let config = settings(1_000, 2_000, 86_400_000);
+    let mut rig = Rig::start(Scripted::script(vec![clear(), game()]), &config);
+    rig.reaches(GovernorPhase::Open).await;
+
+    // Another connection holds the write lock on the database, so the hold
+    // cannot be written until it lets go (the Core waits up to 5 s for it).
+    let lock = rusqlite::Connection::open(rig.dir.path().join("jarvis.db")).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let locked_at = std::time::Instant::now();
+
+    rig.holds_for(GovernorReason::Game).await;
+    assert!(!rig.hub.governor_status().is_open());
+    assert!(
+        locked_at.elapsed() < Duration::from_secs(2),
+        "the gate waited for the audit write"
+    );
+    assert!(rig.audit().is_empty(), "the hold is not on the record yet");
+
+    // Once the database is free the hold is recorded after all.
+    lock.execute_batch("ROLLBACK").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while rig.audit().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the hold was never recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(rig.audit(), [hold_game()]);
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_that_never_finishes_holds_the_jobs_and_is_not_started_again() {
+    let config = settings(1_000, 2_000, 86_400_000);
+    let (source, _never_answered) = Stalling::new();
+    let mut rig = Rig::start(Arc::clone(&source), &config);
+    rig.reaches(GovernorPhase::Open).await;
+
+    rig.holds_for(GovernorReason::DetectionFailed).await;
+    assert_eq!(rig.elapsed_ms(), 2_000, "one poll after the read began");
+    assert!(!rig.hub.governor_status().is_open());
+
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(source.reads(), 2, "no second read while one is in flight");
+    assert_eq!(rig.hub.governor_status().phase, GovernorPhase::Held);
+    assert_eq!(rig.audit(), [hold_failed()], "one streak, one event");
+    // The governor can still stop with the read outstanding.
+    tokio::time::timeout(Duration::from_secs(60), rig.stop())
+        .await
+        .expect("a hung read blocked the governor's shutdown");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_answer_to_the_one_read_in_flight_is_used() {
+    let config = settings(1_000, 2_000, 86_400_000);
+    let (source, answer) = Stalling::new();
+    let mut rig = Rig::start(Arc::clone(&source), &config);
+    rig.holds_for(GovernorReason::DetectionFailed).await;
+    assert_eq!(source.reads(), 2);
+
+    answer.send(game()).unwrap();
+    let held = rig.holds_for(GovernorReason::Game).await;
+    assert_eq!(held.process.as_deref(), Some("cs2.exe"));
+    assert_eq!(source.reads(), 2, "the late answer came from the same read");
+
+    // After it, reads go on every poll again.
+    while source.reads() < 4 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn if_the_governor_task_dies_the_gate_is_closed() {
+    let config = settings(1_000, 2_000, 86_400_000);
+    let mut rig = Rig::start(Arc::new(Panicking(AtomicUsize::new(0))), &config);
+    rig.reaches(GovernorPhase::Open).await;
+
+    let outcome = (&mut rig.task).await;
+    assert!(outcome.is_err_and(|error| error.is_panic()));
+    let status = rig.hub.governor_status();
+    assert_eq!(status.phase, GovernorPhase::Held);
+    assert_eq!(status.reason, Some(GovernorReason::DetectionFailed));
+    assert!(!status.is_open());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_task_that_is_stopped_leaves_the_gate_as_it_was() {
+    let config = settings(1_000, 2_000, 86_400_000);
+    let mut rig = Rig::start(Scripted::script(vec![clear()]), &config);
+    rig.reaches(GovernorPhase::Open).await;
+    let hub = Arc::clone(&rig.hub);
+    rig.stop().await;
+    assert_eq!(hub.governor_status().phase, GovernorPhase::Open);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_release_that_cannot_be_recorded_is_logged_once_per_streak() {
+    let captured = Captured::default();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let config = settings(1_000, 2_000, 86_400_000);
+    let mut rig = Rig::start(Scripted::script(vec![game(), clear()]), &config);
+    rig.sql(
+        "CREATE TRIGGER no_release BEFORE INSERT ON audit_events
+         WHEN NEW.kind = 'governor_released'
+         BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;",
+    );
+    rig.reaches(GovernorPhase::Releasing).await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(
+        captured.lines_with("could not record the release"),
+        1,
+        "one line for the whole streak"
+    );
+    let status = rig.hub.governor_status();
+    assert_eq!(status.phase, GovernorPhase::Releasing);
+    assert!(!status.is_open());
+
+    rig.sql("DROP TRIGGER no_release");
+    rig.reaches(GovernorPhase::Open).await;
+    rig.stop().await;
 }
 
 // --- the gate -----------------------------------------------------------------------------------

@@ -167,6 +167,9 @@ pub struct Governor {
     /// Whether the previous reading failed, so that a streak of failures is
     /// logged once.
     failing: bool,
+    /// Whether the last attempt to record a release failed, so that a
+    /// streak of failures is logged once.
+    release_failing: bool,
 }
 
 impl Governor {
@@ -191,22 +194,53 @@ impl Governor {
             origin,
             state,
             failing: false,
+            release_failing: false,
         }
     }
 
     /// Read, decide, record and publish every `poll` until `stop`.
+    ///
+    /// At most one read is ever in flight. A read that has not finished
+    /// after `poll` counts as a failed reading (so the jobs are held), and
+    /// the next tick goes on waiting for that same read instead of starting
+    /// another: a hung operating-system call costs one blocked thread, not
+    /// one per tick. If the read finishes late, its answer is used.
     pub async fn run(mut self, stop: CancellationToken) {
+        let mut guard = FailClosed {
+            hub: Arc::clone(&self.hub),
+            origin: self.origin,
+            armed: true,
+        };
+        let source = Arc::clone(&self.source);
+        let mut in_flight: Option<ReadingFuture<'_>> = None;
         loop {
-            let reading = tokio::select! {
+            let read = in_flight.get_or_insert_with(|| source.read());
+            let outcome = tokio::select! {
                 biased;
-                () = stop.cancelled() => return,
-                reading = self.source.read() => reading,
+                () = stop.cancelled() => {
+                    guard.armed = false;
+                    return;
+                }
+                outcome = tokio::time::timeout(self.poll, read) => outcome,
             };
-            self.apply(reading).await;
-            tokio::select! {
-                biased;
-                () = stop.cancelled() => return,
-                () = tokio::time::sleep(self.poll) => {}
+            match outcome {
+                Ok(reading) => {
+                    in_flight = None;
+                    self.apply(reading).await;
+                    tokio::select! {
+                        biased;
+                        () = stop.cancelled() => {
+                            guard.armed = false;
+                            return;
+                        }
+                        () = tokio::time::sleep(self.poll) => {}
+                    }
+                }
+                Err(_) => {
+                    let late =
+                        ActivityError("the read of the process list is still running".into());
+                    self.apply(Err(late)).await;
+                }
             }
         }
     }
@@ -228,22 +262,48 @@ impl Governor {
         let now = millis(self.origin.elapsed());
         let (next, events) = step(self.state.clone(), observation, now, self.timing);
 
-        // Every event is recorded before the state it leads to takes effect.
-        // A hold or an alert that cannot be recorded still applies: holding
-        // is the safe direction. A release that cannot be recorded does not:
-        // the gate stays shut and the next reading tries again.
+        if !events.iter().any(|e| matches!(e, Event::Released { .. })) {
+            // Holding is the safe direction, so the gate closes first and the
+            // record follows. A slow or failing database must not keep jobs
+            // starting while a game runs.
+            self.publish(next);
+            for event in &events {
+                if let Err(error) = self.record(event).await {
+                    tracing::error!(%error, ?event, "could not record a governor event");
+                }
+            }
+            return;
+        }
+
+        // Opening the gate is the other direction: it waits for the record.
+        // If the release cannot be written the gate stays shut and the next
+        // reading tries again.
         let mut released = true;
         for event in &events {
             if let Err(error) = self.record(event).await {
-                tracing::error!(%error, ?event, "could not record a governor event");
-                released &= !matches!(event, Event::Released { .. });
+                if matches!(event, Event::Released { .. }) {
+                    released = false;
+                    if !self.release_failing {
+                        tracing::error!(
+                            %error,
+                            "could not record the release; queued jobs stay held until it can be"
+                        );
+                    }
+                } else {
+                    tracing::error!(%error, ?event, "could not record a governor event");
+                }
             }
         }
-        let next = if released {
-            next
+        self.release_failing = !released;
+        if released {
+            self.publish(next);
         } else {
-            staying(self.state.clone(), &events)
-        };
+            self.publish(staying(self.state.clone(), &events));
+        }
+    }
+
+    /// Make `next` the state sessions see.
+    fn publish(&mut self, next: State) {
         if next != self.state {
             tracing::info!(state = ?next, "governor");
             self.state = next;
@@ -256,6 +316,31 @@ impl Governor {
         self.store
             .call(move |s| s.append(None, None, &kind).map(|_| ()))
             .await
+    }
+}
+
+/// Closes the gate if the governor task ends for any reason but a stop
+/// request: a panic in a source, or the task being dropped. Nothing would
+/// update the gate afterwards, so it must not be left open.
+struct FailClosed {
+    hub: Arc<Hub>,
+    origin: Instant,
+    armed: bool,
+}
+
+impl Drop for FailClosed {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        tracing::error!("the governor stopped unexpectedly; queued jobs are held");
+        let now = millis(self.origin.elapsed());
+        let state = State::Held {
+            since: now,
+            hold: Hold::DetectionFailed,
+            overdue: false,
+        };
+        self.hub.set_governor(Status::of(&state, self.origin));
     }
 }
 

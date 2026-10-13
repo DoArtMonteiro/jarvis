@@ -274,7 +274,8 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 /// Returns false if the worker exhausted its restart budget.
 fn serve(config_path: &Path) -> anyhow::Result<bool> {
     let config = Config::load(config_path)?;
-    runtime()?.block_on(async {
+    let runtime = runtime()?;
+    let outcome = runtime.block_on(async {
         let shutdown = CancellationToken::new();
         let signal = tokio::spawn(cancel_on_signal(shutdown.clone()));
         let result = daemon::serve(&config, shutdown, |endpoint| {
@@ -287,7 +288,11 @@ fn serve(config_path: &Path) -> anyhow::Result<bool> {
         signal.abort();
         let report = result?;
         Ok(!report.gave_up)
-    })
+    });
+    // A read of the process list that never returns would otherwise keep the
+    // process alive: dropping a runtime waits for blocking threads.
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    outcome
 }
 
 fn isolation(command: IsolationCommand) -> anyhow::Result<bool> {
