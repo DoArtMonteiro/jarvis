@@ -1,4 +1,4 @@
-//! What the worker may reach, and proof that the OS enforces it.
+//! What the worker may reach, and a check that the OS enforces it.
 //!
 //! [`launch`] decides what the worker legitimately needs (read and execute
 //! on its interpreter and the libraries that load it, read on its own
@@ -7,12 +7,14 @@
 //! OS (ADRs 0013 and 0014).
 //!
 //! [`verify`] does not take the enforcement on trust. Before the first
-//! worker starts, the Core runs a short probe under the identical isolation
-//! and checks, from its own side, that the probe could not connect to a
-//! loopback listener the Core holds, could not send it a datagram, could not
-//! read a file the Core just wrote next to its database, and could not start
-//! a process. If any check fails, or the probe cannot run at all, the Core
-//! refuses to start the worker.
+//! worker starts, the Core runs a short probe under the identical isolation.
+//! It observes itself that its loopback listener accepted nothing, its
+//! loopback socket received no datagram, and the secret in a file it just
+//! wrote next to its database does not appear in the probe's output. The
+//! probe's own report must also say that the connection, the file read, a
+//! listing of the user's home directory (when one is found) and starting a
+//! process were refused. If any check fails, or the probe cannot run at all,
+//! the Core refuses to start the worker.
 
 use std::collections::hash_map::RandomState;
 use std::ffi::OsString;
