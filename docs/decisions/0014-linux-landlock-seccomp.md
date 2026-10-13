@@ -13,7 +13,7 @@ Two kernel mechanisms cover the goals, and testing on the development kernel (6.
 
 ## Decision
 
-On Linux the worker is confined with Landlock **and** seccomp, built in the parent and applied in the child between fork and exec. If either cannot be applied, the spawn fails; there is no silent fallback. Before the first worker starts, the Core proves the boundary with a probe (ADR 0013, "start-up proof"; it is the same on both platforms).
+On Linux the worker is confined with Landlock **and** seccomp, built in the parent and applied in the child between fork and exec. If either cannot be applied, the spawn fails; there is no silent fallback. Before the first worker starts, the Core checks the boundary with a probe (ADR 0013; the check is the same on both platforms).
 
 **Filesystem (Landlock).** The Core grants the least right each path needs:
 
@@ -38,7 +38,7 @@ Nothing is writable. The worker needs no scratch space today (the protocol carri
 
 ## Consequences
 
-- A compromised Linux worker cannot read the user's files, write anywhere, open any network connection, start another program, signal or read another process, or reach the Core's socket. These are enforced by the kernel and covered by the probes in `crates/jarvis-sandbox/tests/contain.rs`, which CI runs on the GitHub Linux runner.
+- A compromised Linux worker cannot read the user's files, write anywhere, open any network connection, create a process, signal or read another process, or reach the Core's socket. These are enforced by the kernel and covered by the probes in `crates/jarvis-sandbox/tests/contain.rs`, which CI runs on the GitHub Linux runner.
 - Because it cannot create sockets, the worker is removed from the RPC attack surface structurally; the Core's peer check (ADR 0010) remains as a second layer.
 - No root, no services, and no dependency beyond `libc`. It does not use namespaces and is not a container.
 - A kernel without Landlock (or with it disabled at boot) makes the Core refuse to start a worker.
