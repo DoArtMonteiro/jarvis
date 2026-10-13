@@ -16,8 +16,11 @@ use crate::{Confinement, Contained, Report, Spawned, WorkerCommand};
 
 #[cfg(target_os = "linux")]
 mod landlock;
+mod processes;
 #[cfg(target_os = "linux")]
 mod seccomp;
+
+pub(crate) use processes::{PROCESS_NAME_LIMIT, visit_process_names};
 
 pub(crate) type Stdin = tokio::process::ChildStdin;
 pub(crate) type Stdout = tokio::process::ChildStdout;

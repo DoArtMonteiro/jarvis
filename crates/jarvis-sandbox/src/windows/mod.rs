@@ -62,8 +62,10 @@ use crate::{Confinement, Report};
 
 mod appcontainer;
 mod launch;
+mod processes;
 
 pub(crate) use launch::{Process, Stderr, Stdin, Stdout, spawn};
+pub(crate) use processes::{PROCESS_NAME_LIMIT, visit_process_names};
 
 /// Describe the AppContainer the worker would run in, without creating it.
 pub(crate) fn report(_confinement: &Confinement) -> io::Result<Report> {
