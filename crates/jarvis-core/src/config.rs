@@ -168,7 +168,7 @@ impl Default for GovernorConfig {
         Self {
             enabled: false,
             processes: vec!["cs2.exe".to_owned()],
-            poll: Duration::from_millis(2_000),
+            poll: Duration::from_millis(5_000),
             resume_delay: Duration::from_millis(30_000),
             alert_after: Duration::from_millis(4 * 60 * 60 * 1_000),
         }
@@ -745,7 +745,7 @@ mod tests {
         let governor = config.governor;
         assert!(!governor.enabled);
         assert_eq!(governor.processes, ["cs2.exe"]);
-        assert_eq!(governor.poll, Duration::from_millis(2_000));
+        assert_eq!(governor.poll, Duration::from_millis(5_000));
         assert_eq!(governor.resume_delay, Duration::from_millis(30_000));
         assert_eq!(governor.alert_after, Duration::from_millis(14_400_000));
         let governor = self::governor("enabled = true").unwrap();

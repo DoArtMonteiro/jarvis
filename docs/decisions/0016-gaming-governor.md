@@ -44,7 +44,7 @@ Notes on the table:
 - A zero `resume_delay_ms` releases on the first clear reading.
 - `held_ms` counts from the beginning of the hold, resume delay included, and a game that returns during the delay does not start a new hold.
 - Detection errors are logged and audited once per streak. A streak that starts while the gate is open produces one `governor_hold`, and the readings that fail after it change nothing. A failure while already held changes the reason shown in `health` and nothing else.
-- The release is recorded before the gate opens. If that write fails, the gate stays shut and the next reading tries again. A hold, in contrast, applies even when its record cannot be written: holding is the safe direction.
+- The release is recorded before the gate opens. If that write fails, the gate stays shut and the next reading tries again; the failure is logged once per streak. A hold is the other way round: the gate closes first and the record is written after, so a slow, locked or failing database cannot keep jobs starting while a game runs. A hold that cannot be recorded still applies, and an error is logged.
 
 ### Start-up
 
@@ -52,7 +52,11 @@ When the governor is enabled the Core starts held, with reason `starting`, and t
 
 The first reading ends it. A clear list opens the gate at once, without a resume delay, because nothing had been held that could need a settling period, and records nothing: it was not a decision. A game or a failure on the first reading is a hold that began when the Core started, and is recorded as one. The `starting` hold itself has no event, because it is neither a decision nor something a person acted on.
 
-A reading that never returns changes nothing. At start-up the gate stays closed; later it stays as it was, and no alert is raised for it, because the alert is raised when a reading is processed. The real source reads the list on a blocking thread and applies no timeout. A snapshot of the process table or a scan of `/proc` is not expected to hang, but nothing here would notice if one did.
+### Reads that hang, and a governor that stops
+
+The real source reads the list on a blocking thread, which Tokio cannot cancel. At most one read is in flight. A read that has not finished within `poll_ms` counts as a failed reading, so the jobs are held with reason `detection_failed`, and the next tick goes on waiting for that same read instead of starting another. If it finishes late, its answer is used. A hung operating-system call therefore costs one blocked thread, not one per tick. The Core stops waiting for blocking threads five seconds after shutdown, so a hung call delays the exit of the process by at most that long.
+
+If the governor task ends for any reason but a stop request (a panic in a source, the task being dropped), a guard sets the gate to held with reason `detection_failed` and logs an error, and `health` shows it. Nothing would update the gate afterwards, so it must not stay open.
 
 ### Time never ends a hold
 
@@ -67,20 +71,24 @@ The alert is raised when a reading is processed, so it can be late by up to `pol
 
 ### The accepted race
 
-The gate is checked, and then the job is claimed. A game that starts between the two is not seen until the next reading, and the job that was claimed in between runs. Closing the gap would mean claiming and then holding, which counts an attempt and starts a timer for nothing, or pausing a running job, which is outside the scope above. The window is the time between two statements in one loop, and a running job is never paused. The same applies to a game that starts a moment after a job begins.
+The gate is checked, and then the job is claimed. A game that starts between the two is not seen until the next reading, and the job that was claimed in between runs. Closing the gap would mean claiming and then holding, which counts an attempt and starts a timer for nothing, or pausing a running job, which is outside the scope above. The window is not two adjacent statements: the claim goes through the store (a mutex, a transaction with a flush to disk, a thread hop), so it is tens of milliseconds or so, and longer if the database is slow. A running job is never paused. The same applies to a game that starts a moment after a job begins.
 
 ### Detection
 
 Detection lives in `jarvis-sandbox::processes::find_running(names)`, the crate that already holds the operating-system calls.
 
-- **Windows** reads a Toolhelp snapshot (`CreateToolhelp32Snapshot` with `TH32CS_SNAPPROCESS`), checks the result against `INVALID_HANDLE_VALUE`, sets `dwSize`, walks the list with `Process32FirstW` and `Process32NextW`, and treats only `ERROR_NO_MORE_FILES` as the end. Any other failure is an error. The file name is the text before the first NUL in `szExeFile`. The snapshot handle is closed by the existing RAII `Handle`.
-- **No process is opened.** There is no `OpenProcess`, so the Core never holds a handle to the game and has no access to it. That is the point: the Core only needs to name a process, and it also avoids the kind of handle some anti-cheat software looks for. The design has not been tested against any game or anti-cheat product, and no claim is made about how one would treat it.
-- **Linux** reads `/proc/<pid>/comm` for each numeric entry of `/proc`. A process that exits between the listing and the read (`ENOENT` or `ESRCH`) is skipped. Failing to read `/proc`, or any other failure on an entry, is an error. On a system where `/proc` hides other users' processes the list may be incomplete or unreadable; an unreadable entry is reported as an error and the governor holds, rather than assuming nothing runs.
+- **Windows** reads a Toolhelp snapshot (`CreateToolhelp32Snapshot` with `TH32CS_SNAPPROCESS`), checks the result against `INVALID_HANDLE_VALUE`, sets `dwSize`, walks the list with `Process32FirstW` and `Process32NextW`, and treats only `ERROR_NO_MORE_FILES` as the end. Any other failure is an error. The file name is the text before the first NUL in `szExeFile`, and it includes the extension, so a configured name on Windows must include `.exe`, as the Details tab of Task Manager shows it. The snapshot handle is closed by the existing RAII `Handle`.
+- **No process is opened.** There is no `OpenProcess`; the Core opens no handle to any process, only to the snapshot. It has not been tried against any game.
+- **Linux** reads `/proc/<pid>/comm` for each numeric entry of `/proc`. A process that exits between the listing and the read (`ENOENT` or `ESRCH`) is skipped. Failing to read `/proc`, or any other failure on an entry, is an error. An unreadable entry (for example under `hidepid=1`) is an error and the governor holds. But `/proc` can also simply show fewer processes: with `hidepid=2`, or when the Core runs in a different PID namespace (a container), a game outside what the Core sees is not seen, and nothing reports it.
 - **Other Unix systems** return `Unsupported`. An enabled governor there holds with reason `detection_failed` until the configuration turns it off; `health` shows the reason and the log says why.
 - Names are compared ASCII case-insensitively. A configured name is 1 to 64 printable ASCII bytes with no `/` or `\`, and at most 16 are accepted. The Linux kernel keeps only 15 bytes of a process name (`comm`), so on Linux the configured name is cut to 15 bytes before the comparison. Two different programs whose names share their first 15 bytes cannot be told apart, and a configured name longer than that can match another program. The names are not paths and are never used as one.
 - `find_running` returns the first configured name, in configuration order, that matches, spelled as configured. It never returns the list.
 
 On the Core's side the real source runs `find_running` on a blocking thread. Tests substitute a source that does not, so that Tokio's paused clock stays exact.
+
+### Cost
+
+Measured on a Windows machine with 1019 processes, a release build, over 60 s of real time: with the governor off the Core used no measurable CPU; on, with `poll_ms = 2000`, it used 687.5 ms of CPU, about 1.15% of one core. One Toolhelp snapshot costs about 17 ms of CPU there. That cost is inherent to listing the process table and grows with the number of processes. The cheaper Windows ways to ask whether a named process runs need `OpenProcess` on the target, which this design excludes. The default `poll_ms` is therefore 5000, and the cost at that setting has not been measured. A longer poll also means a game can run for that long before the gate closes.
 
 ### Privacy
 
@@ -88,7 +96,7 @@ The audit log records the configured name that matched and nothing else: not the
 
 ### Health and the RPC version
 
-`health` carries a `governor` object: `state` (`off`, `open`, `held`, `releasing`), `reason`, `process`, `held_ms` and `overdue`. The reply type rejects unknown and missing fields, so a client built before the change cannot read it. ADR 0007 makes any change to the wire format a version change, so the local RPC version goes from 1 to 2. The worker protocol is unchanged. No operation, tool or capability was added, and the worker does not know the governor exists.
+`health` carries a `governor` object: `state` (`off`, `open`, `held`, `releasing`), `reason`, `process`, `held_ms` and `overdue`. The reply type rejects unknown and missing fields, so a client built before the change cannot read it. ADR 0010 gives the RPC the same strict decoding rules as the worker protocol, and ADR 0007 and the doc comment on `ProtocolVersion` in the protocol crate make any change to the wire format a version change, so the local RPC version goes from 1 to 2. The worker protocol is unchanged. No operation, tool or capability was added, and the worker does not know the governor exists.
 
 ### Audit events
 
@@ -102,4 +110,4 @@ The audit log records the configured name that matched and nothing else: not the
 - A job that is held never has an attempt counted and never has its timer started, so a long game session does not use up `max_job_attempts` or `job_timeout`.
 - Approvals are not affected. They belong to a running job and a running job is not touched.
 - The Linux comm truncation is a real false-positive risk for long names and is documented in the example configuration.
-- The governor reads the process list on every poll, which is the only cost while it is on. While it is off, nothing is read.
+- The governor reads the process list on every poll, which is the only cost while it is on (see Cost). While it is off, nothing is read.

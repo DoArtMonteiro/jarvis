@@ -73,8 +73,9 @@ enabled = false
 # printable ASCII characters, no `/` or `\`. On Linux the kernel keeps only
 # the first 15 bytes of a process name, so list the name as `ps` shows it.
 processes = ["cs2.exe"]
-# How often the process list is read (250 to 60000).
-poll_ms = 2000
+# How often the process list is read (250 to 60000). Each read costs CPU in
+# proportion to the number of processes on the machine (see ADR 0016).
+poll_ms = 5000
 # How long the list must stay clear before queued jobs start again (0 to
 # 600000).
 resume_delay_ms = 30000
