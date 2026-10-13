@@ -1006,6 +1006,9 @@ enum Stop {
     /// `execution_started` was recorded, then the task ended like this
     /// (`None`: it never ended).
     Started(Option<TaskStatus>),
+    /// `execution_started` was recorded, then the task ended `failed` with
+    /// this error code (`None`: no error was recorded).
+    Failed(Option<ErrorCode>),
 }
 
 /// Create the task for position `seq` of `attempt` and leave it as `stop`.
@@ -1032,7 +1035,11 @@ fn step(
                 &[],
             )
             .unwrap(),
-        Stop::Started(end) => {
+        Stop::Started(_) | Stop::Failed(_) => {
+            let end = match stop {
+                Stop::Started(end) => end,
+                _ => Some(TaskStatus::Failed),
+            };
             let started = AuditEventKind::ExecutionStarted {
                 tool: "system.info".into(),
             };
@@ -1045,8 +1052,13 @@ fn step(
                 )
                 .unwrap();
             if let Some(end) = end {
+                let error = match stop {
+                    Stop::Failed(code) => code.map(|code| WireError::new(code, "failed")),
+                    _ => None,
+                };
                 let change = TaskChange {
                     result: (end == TaskStatus::Completed).then(|| "{}".to_owned()),
+                    error,
                     ..TaskChange::to(end)
                 };
                 store
@@ -1216,7 +1228,10 @@ fn a_known_outcome_does_not_quarantine_a_job() {
     let stops = [
         (Stop::Received, "received"),
         (Stop::Awaiting, "awaiting confirmation"),
-        (Stop::Started(Some(TaskStatus::Failed)), "failed"),
+        (
+            Stop::Failed(Some(ErrorCode::ToolFailed)),
+            "failed by the tool",
+        ),
         (Stop::Started(Some(TaskStatus::Completed)), "completed"),
     ];
     for (stop, name) in stops {
@@ -1324,7 +1339,7 @@ fn a_completed_step_is_found_for_later_attempts_only() {
     let job = running_job(&store, session);
     let ok = Stop::Started(Some(TaskStatus::Completed));
     let done = step(&store, session, job, (1, 1), ok);
-    let failed = Stop::Started(Some(TaskStatus::Failed));
+    let failed = Stop::Failed(Some(ErrorCode::ToolFailed));
     step(&store, session, job, (1, 2), failed);
     step(&store, session, job, (1, 3), Stop::Awaiting);
     let found = |seq, attempt| store.completed_step(job, seq, attempt).unwrap();
@@ -1375,4 +1390,152 @@ fn replaying_a_step_is_one_audit_event_and_no_task() {
         store.replay_step(first, job, 1, done, &used),
         Err(StoreError::DuplicateRequest(_))
     ));
+}
+
+#[test]
+fn a_failure_the_tool_did_not_report_quarantines_its_job() {
+    // The tool may have acted before the Core's own check or the tool itself
+    // went wrong, so these are not known outcomes.
+    let stops = [
+        (
+            Stop::Failed(Some(ErrorCode::ResultRejected)),
+            "result rejected",
+        ),
+        (Stop::Failed(Some(ErrorCode::Internal)), "internal"),
+        (Stop::Failed(None), "no error recorded"),
+    ];
+    for (stop, name) in stops {
+        for at_recovery in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = open(&dir);
+            let session = SessionId::new();
+            let job = running_job(&store, session);
+            let task = step(&store, session, job, (1, 1), stop);
+            let status = if at_recovery {
+                store.recover(MAX_ATTEMPTS).unwrap();
+                status_of(&store, job)
+            } else {
+                store
+                    .requeue_or_close(job, MAX_ATTEMPTS, Some(session), "worker stopped")
+                    .unwrap()
+            };
+            let which = format!("{name} at_recovery={at_recovery}");
+            assert_eq!(status, JobStatus::Interrupted, "{which}");
+            let quarantined = AuditEventKind::JobQuarantined {
+                job_id: job,
+                task_id: task,
+            };
+            assert!(
+                store
+                    .audit_events(None, 1000)
+                    .unwrap()
+                    .iter()
+                    .any(|event| event.event == quarantined),
+                "{which}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_job_from_before_the_ledger_is_never_requeued() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let job = store.submit_job(&goal("old"), "client").unwrap().job_id;
+    // As migration 0003 leaves a job that was running when the Core stopped.
+    store
+        .conn()
+        .unwrap()
+        .execute("UPDATE jobs SET status = 'running'", [])
+        .unwrap();
+    assert_eq!(store.recover(MAX_ATTEMPTS).unwrap().jobs, 1);
+    let done = store.job(job).unwrap().unwrap();
+    assert_eq!(done.status, JobStatus::Interrupted);
+    assert!(done.summary.unwrap().as_str().contains("step ledger"));
+    assert_eq!(job_kinds(&store).last(), Some(&"job_finished"));
+    assert!(!job_kinds(&store).contains(&"job_requeued"));
+}
+
+/// Recovery must look at the tasks before it rewrites them. The rewrite turns
+/// an `executing` task into `interrupted`, which would hide what it was doing
+/// if the job were settled afterwards, so the audit order is the evidence.
+#[test]
+fn recovery_settles_a_job_before_it_rewrites_its_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let session = SessionId::new();
+    let job = running_job(&store, session);
+    let task = step(&store, session, job, (1, 1), Stop::Started(None));
+    assert_eq!(
+        store.task(task).unwrap().unwrap().status,
+        TaskStatus::Executing
+    );
+    store.recover(MAX_ATTEMPTS).unwrap();
+    assert_eq!(status_of(&store, job), JobStatus::Interrupted);
+    let seq_of = |wanted: &dyn Fn(&AuditEventKind) -> bool| {
+        store
+            .audit_events(None, 1000)
+            .unwrap()
+            .into_iter()
+            .find(|event| wanted(&event.event))
+            .map(|event| event.seq)
+            .unwrap()
+    };
+    let quarantined = seq_of(&|event| {
+        *event
+            == AuditEventKind::JobQuarantined {
+                job_id: job,
+                task_id: task,
+            }
+    });
+    let rewritten = seq_of(&|event| matches!(event, AuditEventKind::TaskRecovered { .. }));
+    assert!(quarantined < rewritten, "the job was settled first");
+}
+
+#[test]
+fn a_job_ended_without_a_retry_still_records_an_unknown_outcome() {
+    let ends = [JobStatus::Failed, JobStatus::Interrupted];
+    for end in ends {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir);
+        let session = SessionId::new();
+        let job = running_job(&store, session);
+        let task = step(
+            &store,
+            session,
+            job,
+            (1, 1),
+            Stop::Started(Some(TaskStatus::TimedOut)),
+        );
+        store.finish_job(job, end, None, Some(session)).unwrap();
+        assert_eq!(status_of(&store, job), end);
+        let kinds = job_kinds(&store);
+        assert_eq!(
+            &kinds[kinds.len() - 2..],
+            ["job_quarantined", "job_finished"],
+            "{end:?}"
+        );
+        let quarantined = AuditEventKind::JobQuarantined {
+            job_id: job,
+            task_id: task,
+        };
+        assert!(
+            store
+                .audit_events(None, 1000)
+                .unwrap()
+                .iter()
+                .any(|event| event.event == quarantined)
+        );
+    }
+    // Known outcomes, and a job that completed, leave no such record.
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let session = SessionId::new();
+    let job = running_job(&store, session);
+    let failed = Stop::Failed(Some(ErrorCode::ToolFailed));
+    step(&store, session, job, (1, 1), failed);
+    store
+        .finish_job(job, JobStatus::Failed, None, Some(session))
+        .unwrap();
+    assert!(!job_kinds(&store).contains(&"job_quarantined"));
 }

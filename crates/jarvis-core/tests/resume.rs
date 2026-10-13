@@ -733,6 +733,19 @@ async fn a_job_whose_attempts_are_spent_ends_interrupted() {
 }
 
 #[tokio::test]
+async fn a_requeued_job_wakes_whoever_waits_for_work() {
+    let env = Env::new();
+    let job = env.submit("system info");
+    let mut h = env.session(Options::default()).await;
+    h.takes(job).await;
+    let hub = Arc::clone(&h.hub);
+    h.worker_exits().await;
+    assert_eq!(env.job(job).0, JobStatus::Queued);
+    let woken = tokio::time::timeout(Duration::from_millis(500), hub.jobs.notified()).await;
+    assert!(woken.is_ok(), "an idle session must learn about the job");
+}
+
+#[tokio::test]
 async fn a_worker_whose_stream_fails_leaves_its_job_in_the_queue() {
     let env = Env::new();
     let job = env.submit("system info");

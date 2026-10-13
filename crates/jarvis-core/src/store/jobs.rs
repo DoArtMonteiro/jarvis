@@ -152,6 +152,18 @@ impl Store {
                 "job {job_id} is not running or `{status}` is not terminal"
             )));
         }
+        // A job that ends without a retry still says if a task of it may have
+        // acted without a recorded result.
+        if matches!(status, JobStatus::Failed | JobStatus::Interrupted)
+            && let Some(task_id) = uncertain_task(&tx, job_id)?
+        {
+            insert_event(
+                &tx,
+                session_id,
+                None,
+                &AuditEventKind::JobQuarantined { job_id, task_id },
+            )?;
+        }
         insert_event(
             &tx,
             session_id,
@@ -302,6 +314,9 @@ pub(super) fn settle_running(tx: &Transaction<'_>, max_attempts: u32) -> Result<
 /// - A task of the job started executing and did not end `completed` or
 ///   `failed`: the tool may have acted without a recorded result, so the job
 ///   is quarantined (`interrupted`) and never resumed.
+/// - The job was running before attempts were counted (`attempts` is 0, a
+///   job left over from before migration 0003): it has no ledger of steps, so
+///   it cannot be resumed safely and ends `interrupted`.
 /// - The job has been claimed `max_attempts` times: `interrupted`.
 /// - Otherwise it goes back to the queue.
 fn settle(
@@ -337,6 +352,13 @@ fn settle(
         finished(tx, session_id, job_id, JobStatus::Interrupted)?;
         return Ok(JobStatus::Interrupted);
     }
+    if attempts == 0 {
+        let summary =
+            format!("the job predates the step ledger and cannot be resumed safely ({reason})");
+        set_status(tx, job_id, JobStatus::Interrupted, Some(&summary))?;
+        finished(tx, session_id, job_id, JobStatus::Interrupted)?;
+        return Ok(JobStatus::Interrupted);
+    }
     if attempts >= max_attempts {
         let summary = format!("attempt limit of {max_attempts} reached ({reason})");
         set_status(tx, job_id, JobStatus::Interrupted, Some(&summary))?;
@@ -357,12 +379,16 @@ fn settle(
     Ok(JobStatus::Queued)
 }
 
-/// A task of the job that started executing and is not known to have
-/// completed or failed.
+/// A task of the job that started executing and whose outcome is not known.
+/// Known means `completed`, or `failed` with an error the tool itself
+/// reported. A tool that panicked, a result the Core rejected after the tool
+/// ran, and anything that did not end are unknown.
 fn uncertain_task(tx: &Transaction<'_>, job_id: JobId) -> Result<Option<TaskId>, StoreError> {
     tx.query_row(
         "SELECT t.task_id FROM tasks t
-         WHERE t.job_id = ?1 AND t.status NOT IN ('completed', 'failed')
+         WHERE t.job_id = ?1
+           AND NOT (t.status = 'completed'
+                    OR (t.status = 'failed' AND COALESCE(t.error_code, '') = 'tool_failed'))
            AND EXISTS (SELECT 1 FROM audit_events e
                        WHERE e.task_id = t.task_id AND e.kind = 'execution_started')
          ORDER BY t.created_at, t.task_id LIMIT 1",

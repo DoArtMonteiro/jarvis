@@ -375,6 +375,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             .call(move |s| s.requeue_or_close(job_id, max_attempts, Some(session_id), &reason))
             .await?;
         tracing::info!(session = %self.id, job = %job_id, %status, "job settled after the session ended");
+        if status == JobStatus::Queued {
+            self.ctx.hub.jobs.notify_one();
+        }
         self.ctx.hub.set_worker_state(WorkerState::Idle);
         self.ctx.hub.changed();
         Ok(())

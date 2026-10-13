@@ -77,7 +77,8 @@ impl Gateway {
                 Ok(Err(error)) => failed(TaskStatus::Failed, ErrorCode::ToolFailed, error.to_string()),
                 Err(join) if join.is_panic() => {
                     tracing::error!(tool = call.tool_name(), "tool panicked");
-                    failed(TaskStatus::Failed, ErrorCode::ToolFailed, "tool failed unexpectedly".into())
+                    // Not an error the tool reported: the Core cannot know what it did.
+                    failed(TaskStatus::Failed, ErrorCode::Internal, "tool failed unexpectedly".into())
                 }
                 Err(_) => failed(TaskStatus::Cancelled, ErrorCode::Cancelled, "tool task was aborted".into()),
             },
@@ -261,7 +262,7 @@ mod tests {
             .await;
         assert_eq!(
             error_code(&executed),
-            (TaskStatus::Failed, ErrorCode::ToolFailed)
+            (TaskStatus::Failed, ErrorCode::Internal)
         );
     }
 
