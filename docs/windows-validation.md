@@ -156,6 +156,7 @@ Set `[governor] enabled = true` and `processes = ["<your game>.exe"]` in the con
 - With the game running, `jarvis submit "describe the runtime"` queues the job and `jarvis job <id>` stays `queued`; no `job_started` appears in `jarvis audit`. After the game exits and `resume_delay_ms` has passed, the job runs, and `governor_released` precedes `job_started` in the audit log.
 - `jarvis audit` shows `governor_hold` with the configured name and nothing else about the process list.
 - Record whether the game, its launcher or its anti-cheat software reported or did anything because the Core was running. The Core opens no handle to the game; this is the check that matters.
+- If the queue stays held, `jarvis health` names the reason and, for a game, the configured process. Close that process, or stop the Core, set `[governor] enabled = false` (or correct `processes`) and start it again: the queued jobs then start, and none is lost. A process of the same user with the same name holds the queue as well.
 
 ## Results
 

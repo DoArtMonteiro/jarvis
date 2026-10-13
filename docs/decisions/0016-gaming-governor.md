@@ -44,7 +44,7 @@ Notes on the table:
 - A zero `resume_delay_ms` releases on the first clear reading.
 - `held_ms` counts from the beginning of the hold, resume delay included, and a game that returns during the delay does not start a new hold.
 - Detection errors are logged and audited once per streak. A streak that starts while the gate is open produces one `governor_hold`, and the readings that fail after it change nothing. A failure while already held changes the reason shown in `health` and nothing else.
-- The release is recorded before the gate opens. If that write fails, the gate stays shut, `health` shows `releasing` (also when `resume_delay_ms` is 0, where the step would otherwise have gone straight from held to open) and the next reading tries again; the failure is logged once per streak. A hold is the other way round: the gate closes first and the record is written after, so a slow, locked or failing database cannot keep jobs starting while a game runs. A hold that cannot be recorded still applies, and an error is logged.
+- The release is recorded before the gate opens. If that write fails, the gate stays shut, `health` shows `releasing` (also when `resume_delay_ms` is 0, where the step would otherwise have gone straight from held to open) and the next reading tries again; the failure is logged once per streak. A hold is the other way round: the gate closes first and the record is written after, so a slow, locked or failing database cannot keep jobs starting while a game runs. A hold that cannot be recorded still applies, and is retried (see Audit events).
 
 ### Start-up
 
@@ -101,6 +101,24 @@ The audit log records the configured name that matched and nothing else: not the
 ### Audit events
 
 `governor_hold` (`reason`, and `process` for a game), `governor_released` (`held_ms`) and `governor_hold_overdue` (`held_ms`).
+
+The contract for recording them:
+
+- Each event is recorded at least once, in the order it happened, as soon as the database accepts writes. A failed write is never counted as done, and an event is written again only after such a failure. An event that cannot be written waits in memory and is tried again at every later reading, oldest first, before anything newer. It leaves the list only after a successful write.
+- The gate closes before a hold is recorded. A hold or an alert that cannot be recorded does not delay or undo the state it describes.
+- The gate opens only after everything before the release, and the release itself, is recorded. Until then `health` shows `releasing` and the jobs stay held. The release is not queued; the state machine emits it again at the next reading.
+- While anything waits to be written the gate cannot open, so at most one hold and one alert can wait. The list is capped at eight and an error is logged if that is ever exceeded.
+- A failing database is logged once per streak of failures, not once per reading.
+- Limitation: events that wait when the Core stops are lost, because they are only in memory. The next start begins held (reason `starting`) and records afresh, so the log can be missing a hold or an alert from the run that ended, and nothing says so.
+
+### If the queue stays held
+
+A held queue loses nothing: jobs stay queued, with no attempt counted and no timer running. To find out why it is held, run `jarvis-core health` and read the governor line: the reason (`game`, `detection_failed` or `starting`) and, for a game, the configured name that matched. Then, in the order that disturbs least:
+
+1. Close the process that is named. A process of the same user with that name holds the queue as well as the game does (see Consequences).
+2. Or stop the Core, set `[governor] enabled = false` in its configuration (or correct `processes`), and start it again. The queued jobs then start.
+
+For `detection_failed`, `jarvis-core health` reports it and the Core log says why the list could not be read; it is also what an enabled governor reports on a platform without detection.
 
 ## Consequences
 

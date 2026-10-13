@@ -206,9 +206,20 @@ A job can be handed out again after its worker or the Core stopped. Requests are
 | `held_ms` | While held or releasing: how long the hold has lasted; otherwise `null` |
 | `overdue` | True once a hold has lasted longer than the configured alert time |
 
-Version 2 added `governor`. A Core and a client of different versions refuse each other's frames (above), so the CLI and the Core must come from the same build.
+Version 2 added `governor` (see Compatibility below).
 
 The governor also writes three audit events, which are not part of either wire protocol: `governor_hold` (`reason`, and `process` when a game caused it), `governor_released` (`held_ms`) and `governor_hold_overdue` (`held_ms`). They carry the configured process name that matched and nothing else about the process list (ADR 0016).
+
+### Compatibility
+
+The RPC version changes with any change to the wire format, including a field added to a reply: strict decoding means a peer built before the change cannot read it. There is one version at a time and no negotiation. The Core and the CLI must come from the same build.
+
+On a mismatch each side refuses, and neither falls back:
+
+- A newer CLI talking to an older Core: the Core refuses the request with `unsupported_version`, and the CLI, which reads the answer as the older version, reports `the Core speaks RPC version N, this command speaks version M` and exits with a failure.
+- An older CLI talking to a newer Core: the Core refuses with `unsupported_version`, encoded at its own version. The older CLI cannot decode that answer either, so it can only report an invalid response. The Core keeps serving.
+
+To upgrade, stop the Core, replace the binaries, and start it again. The database is migrated on start-up and is not affected by the RPC version.
 
 ### Approvals
 
