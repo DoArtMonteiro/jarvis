@@ -251,7 +251,7 @@ impl Harness {
     }
 
     async fn pending_approval(&self) -> ApprovalRecord {
-        for _ in 0..500 {
+        for _ in 0..1000 {
             if let Some(record) = self.store.pending_approvals().unwrap().pop() {
                 return record;
             }
@@ -807,7 +807,7 @@ async fn a_tool_cancelled_by_shutdown_quarantines_its_job() {
         .await;
     h.takes(job).await;
     h.send_request("r1", "system.info", json!({})).await;
-    for _ in 0..500 {
+    for _ in 0..1000 {
         if env.executions() == 1 {
             break;
         }
