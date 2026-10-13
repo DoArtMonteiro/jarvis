@@ -12,6 +12,13 @@
     "restarts": 0,
     "containment": "process group"
   },
+  "governor": {
+    "state": "off",
+    "reason": null,
+    "process": null,
+    "held_ms": null,
+    "overdue": false
+  },
   "queued_jobs": 0,
   "pending_approvals": 1
 }
