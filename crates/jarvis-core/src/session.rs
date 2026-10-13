@@ -911,8 +911,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
                 SessionEnd::WorkerClosed | SessionEnd::WorkerGone | SessionEnd::Shutdown => {
                     self.requeue_or_close(job.id, end).await?;
                 }
-                // The worker broke the protocol: retrying would repeat it.
-                _ => {
+                // A protocol violation or a job past its time limit: retrying
+                // would repeat it.
+                SessionEnd::Terminated(_)
+                | SessionEnd::JobTimedOut(_)
+                | SessionEnd::HandshakeTimeout => {
                     let summary = Some(Summary::lossy(&format!(
                         "the worker stopped: {}",
                         end.describe()
