@@ -17,7 +17,9 @@
 //!
 //! Time never ends a hold. Once a hold has lasted the alert time it is
 //! marked overdue and one event says so; the jobs keep waiting until the
-//! game is gone.
+//! game is gone. The start-up hold raises no alert: it is not a decision, and
+//! the alert for the hold that follows it comes at the first reading at or
+//! after the alert time, never before that hold is recorded.
 
 /// Why queued jobs are held.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,8 +104,18 @@ pub fn step(
     let mut events = Vec::new();
 
     // The alert comes first, so that when the same reading also releases the
-    // gate the log still shows the hold was overdue before it ended.
-    if let State::Held { since, overdue, .. } | State::Releasing { since, overdue, .. } = &mut state
+    // gate the log still shows the hold was overdue before it ended. The
+    // start-up hold is not a decision and raises none: if the first reading
+    // turns it into a real hold, the alert follows at the next reading, and
+    // it is never recorded before the hold it is about.
+    if !matches!(
+        state,
+        State::Held {
+            hold: Hold::Starting,
+            ..
+        }
+    ) && let State::Held { since, overdue, .. } | State::Releasing { since, overdue, .. } =
+        &mut state
     {
         let held_ms = now.saturating_sub(*since);
         if !*overdue && held_ms >= timing.alert_after_ms {
@@ -396,6 +408,34 @@ mod tests {
     }
 
     #[test]
+    fn a_clear_first_reading_after_the_alert_time_opens_the_gate_with_no_event() {
+        let (state, events) = step(State::starting(0), Observation::Clear, ALERT, TIMING);
+        assert_eq!(state, State::Open);
+        assert!(events.is_empty(), "no alert for a hold that was never one");
+    }
+
+    #[test]
+    fn a_hold_found_on_a_late_first_reading_is_recorded_before_its_alert() {
+        for (observation, hold) in [
+            (Observation::Failed, Hold::DetectionFailed),
+            (game(), Hold::Game("cs2.exe".into())),
+        ] {
+            let (state, events) = step(State::starting(0), observation.clone(), ALERT, TIMING);
+            assert_eq!(events, [Event::Hold(hold.clone())]);
+            assert_eq!(state, held(0, hold));
+
+            let (state, events) = step(state, observation, ALERT + 1_000, TIMING);
+            assert_eq!(
+                events,
+                [Event::Overdue {
+                    held_ms: ALERT + 1_000
+                }]
+            );
+            assert!(matches!(state, State::Held { overdue: true, .. }));
+        }
+    }
+
+    #[test]
     fn the_alert_fires_once_at_the_alert_time_and_the_hold_goes_on() {
         let mut state = held(1_000, Hold::Game("cs2.exe".into()));
         let mut seen = Vec::new();
@@ -506,19 +546,6 @@ mod tests {
         let (state, events) = step(State::starting(100), Observation::Failed, 2_100, TIMING);
         assert_eq!(state, held(100, Hold::DetectionFailed));
         assert_eq!(events, [Event::Hold(Hold::DetectionFailed)]);
-    }
-
-    #[test]
-    fn the_start_up_hold_counts_toward_the_alert_when_the_first_reading_comes_late() {
-        let (state, events) = step(State::starting(0), Observation::Failed, ALERT, TIMING);
-        assert!(matches!(state, State::Held { overdue: true, .. }));
-        assert_eq!(
-            events,
-            [
-                Event::Overdue { held_ms: ALERT },
-                Event::Hold(Hold::DetectionFailed)
-            ]
-        );
     }
 
     #[test]
