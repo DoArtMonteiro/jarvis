@@ -50,7 +50,7 @@ Notes on the table:
 
 When the governor is enabled the Core starts held, with reason `starting`, and the gate is closed before the RPC endpoint answers and before the first session can run. Nothing is known about the machine yet, and jobs queued before a restart are waiting in the database. Without this rule such a job could start in the moments before the first reading found the game, which is the situation the governor exists to avoid.
 
-The first reading ends it. A clear list opens the gate at once, without a resume delay, because nothing had been held that could need a settling period, and records nothing: it was not a decision. A game or a failure on the first reading is a hold that began when the Core started, and is recorded as one. The `starting` hold itself has no event, because it is neither a decision nor something a person acted on.
+The first reading ends it. A clear list opens the gate at once, without a resume delay, because nothing had been held that could need a settling period, and records nothing: it was not a decision. A game or a failure on the first reading is a hold that began when the Core started, and is recorded as one. The `starting` hold itself has no event, because it is neither a decision nor something a person acted on, and it raises no alert: if the first reading turns it into a hold, the alert for that hold comes at a later reading, after the hold event.
 
 ### Reads that hang, and a governor that stops
 
@@ -78,7 +78,7 @@ The gate is checked, and then the job is claimed. A game that starts between the
 Detection lives in `jarvis-sandbox::processes::find_running(names)`, the crate that already holds the operating-system calls.
 
 - **Windows** reads a Toolhelp snapshot (`CreateToolhelp32Snapshot` with `TH32CS_SNAPPROCESS`), checks the result against `INVALID_HANDLE_VALUE`, sets `dwSize`, walks the list with `Process32FirstW` and `Process32NextW`, and treats only `ERROR_NO_MORE_FILES` as the end. Any other failure is an error. The file name is the text before the first NUL in `szExeFile`, and it includes the extension, so a configured name on Windows must include `.exe`, as the Details tab of Task Manager shows it. The snapshot handle is closed by the existing RAII `Handle`.
-- **No process is opened.** There is no `OpenProcess`; the Core opens no handle to any process, only to the snapshot. It has not been tried against any game.
+- **No process is opened.** There is no `OpenProcess`; detection opens no handle to any process, only to the snapshot, and the governor never opens the game's process. It has not been tried against any game.
 - **Linux** reads `/proc/<pid>/comm` for each numeric entry of `/proc`. A process that exits between the listing and the read (`ENOENT` or `ESRCH`) is skipped. Failing to read `/proc`, or any other failure on an entry, is an error. An unreadable entry (for example under `hidepid=1`) is an error and the governor holds. But `/proc` can also simply show fewer processes: with `hidepid=2`, or when the Core runs in a different PID namespace (a container), a game outside what the Core sees is not seen, and nothing reports it.
 - **Other Unix systems** return `Unsupported`. An enabled governor there holds with reason `detection_failed` until the configuration turns it off; `health` shows the reason and the log says why.
 - Names are compared ASCII case-insensitively. A configured name is 1 to 64 printable ASCII bytes with no `/` or `\`, and at most 16 are accepted. The Linux kernel keeps only 15 bytes of a process name (`comm`), so on Linux the configured name is cut to 15 bytes before the comparison. Two different programs whose names share their first 15 bytes cannot be told apart, and a configured name longer than that can match another program. The names are not paths and are never used as one.
@@ -107,18 +107,18 @@ The contract for recording them:
 - Each event is recorded at least once, in the order it happened, as soon as the database accepts writes. A failed write is never counted as done, and an event is written again only after such a failure. An event that cannot be written waits in memory and is tried again at every later reading, oldest first, before anything newer. It leaves the list only after a successful write.
 - The gate closes before a hold is recorded. A hold or an alert that cannot be recorded does not delay or undo the state it describes.
 - The gate opens only after everything before the release, and the release itself, is recorded. Until then `health` shows `releasing` and the jobs stay held. The release is not queued; the state machine emits it again at the next reading.
-- While anything waits to be written the gate cannot open, so at most one hold and one alert can wait. The list is capped at eight and an error is logged if that is ever exceeded.
+- While anything waits to be written the gate cannot open, so at most one hold and one alert can wait. Nothing is dropped; an error is logged if more than eight ever wait.
 - A failing database is logged once per streak of failures, not once per reading.
-- Limitation: events that wait when the Core stops are lost, because they are only in memory. The next start begins held (reason `starting`) and records afresh, so the log can be missing a hold or an alert from the run that ended, and nothing says so.
+- Limitation: events that wait when the Core stops are lost, because they are only in memory. The next start begins held (reason `starting`) and records afresh, so the log can be missing a hold or an alert from the run that ended. When the Core is asked to stop, it logs an error that names the events it could not record. If the governor task panics instead, the events are lost without that log, and the gate closes (see above).
 
 ### If the queue stays held
 
-A held queue loses nothing: jobs stay queued, with no attempt counted and no timer running. To find out why it is held, run `jarvis-core health` and read the governor line: the reason (`game`, `detection_failed` or `starting`) and, for a game, the configured name that matched. Then, in the order that disturbs least:
+A held queue loses nothing: jobs stay queued, with no attempt counted and no timer running. To find out why it is held, run `jarvis-core health` and read the governor line, which says in words why the queue is held and, for a game, the configured name that matched. `jarvis-core health --json` shows the identifier of the reason (`game`, `detection_failed` or `starting`). Then, in the order that disturbs least:
 
 1. Close the process that is named. A process of the same user with that name holds the queue as well as the game does (see Consequences).
 2. Or stop the Core, set `[governor] enabled = false` in its configuration (or correct `processes`), and start it again. The queued jobs then start.
 
-For `detection_failed`, `jarvis-core health` reports it and the Core log says why the list could not be read; it is also what an enabled governor reports on a platform without detection.
+For `detection_failed`, `jarvis-core health` says the process list cannot be read and the Core log says why the list could not be read; it is also what an enabled governor reports on a platform without detection.
 
 ## Consequences
 

@@ -216,7 +216,7 @@ The RPC version changes with any change to the wire format, including a field ad
 
 On a mismatch each side refuses, and neither falls back:
 
-- A newer CLI talking to an older Core: the Core refuses the request with `unsupported_version`, and the CLI, which reads the answer as the older version, reports `the Core speaks RPC version N, this command speaks version M` and exits with a failure.
+- A newer CLI talking to an older Core: the Core refuses the request with `unsupported_version`, and the refusal carries the Core's older version number, so the CLI reports `the Core speaks RPC version N, this command speaks version M` and exits with a failure.
 - An older CLI talking to a newer Core: the Core refuses with `unsupported_version`, encoded at its own version. The older CLI cannot decode that answer either, so it can only report an invalid response. The Core keeps serving.
 
 To upgrade, stop the Core, replace the binaries, and start it again. The database is migrated on start-up and is not affected by the RPC version.
