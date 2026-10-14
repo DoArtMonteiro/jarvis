@@ -35,16 +35,17 @@ The function is `governor::machine::step(state, observation, now, timing) -> (st
 | `Held` | clear | `Releasing`, until now + `resume_delay_ms` | |
 | `Releasing` | game or failed | `Held`, same `since` | |
 | `Releasing` | clear, before `until` | `Releasing` | |
-| `Releasing` | clear, at or after `until` | `Open` | `governor_released` (`held_ms`) |
+| `Releasing` | clear, at or after `until` | `Releasing` (unchanged) | `governor_released` (`held_ms`) |
 | start-up `Held` | clear | `Open` | |
 | start-up `Held` | game or failed | `Held`, `since` = start-up | `governor_hold` |
 
 Notes on the table:
 
-- A zero `resume_delay_ms` releases on the first clear reading.
+- The state machine never opens the gate on a release: a release that is due returns `Releasing` with the `governor_released` event, and the governor opens the gate only after that event is recorded. The one step from a closed state straight to `Open` is the start-up hold, which has nothing to record.
+- A zero `resume_delay_ms` makes the release due on the first clear reading.
 - `held_ms` counts from the beginning of the hold, resume delay included, and a game that returns during the delay does not start a new hold.
 - Detection errors are logged and audited once per streak. A streak that starts while the gate is open produces one `governor_hold`, and the readings that fail after it change nothing. A failure while already held changes the reason shown in `health` and nothing else.
-- The release is recorded before the gate opens. If that write fails, the gate stays shut, `health` shows `releasing` (also when `resume_delay_ms` is 0, where the step would otherwise have gone straight from held to open) and the next reading tries again; the failure is logged once per streak. A hold is the other way round: the gate closes first and the record is written after, so a slow, locked or failing database cannot keep jobs starting while a game runs. A hold that cannot be recorded still applies, and is retried (see Audit events).
+- The release is recorded before the gate opens. If that write fails, the gate stays shut, `health` shows `releasing` (also when `resume_delay_ms` is 0) and the next reading tries again; the failure is logged once per streak. A hold is the other way round: the gate closes first and the record is written after, so a slow, locked or failing database cannot keep jobs starting while a game runs. A hold that cannot be recorded still applies, and is retried (see Audit events).
 
 ### Start-up
 
@@ -115,7 +116,7 @@ The contract for recording them:
 
 A held queue loses nothing: jobs stay queued, with no attempt counted and no timer running. To find out why it is held, run `jarvis-core health` and read the governor line, which says in words why the queue is held and, for a game, the configured name that matched. `jarvis-core health --json` shows the identifier of the reason (`game`, `detection_failed` or `starting`). Then, in the order that disturbs least:
 
-1. Close the process that is named. A process of the same user with that name holds the queue as well as the game does (see Consequences).
+1. Close the process that is named. A process of any account with that name holds the queue as well as the game does (see Consequences).
 2. Or stop the Core, set `[governor] enabled = false` in its configuration (or correct `processes`), and start it again. The queued jobs then start.
 
 For `detection_failed`, `jarvis-core health` says the process list cannot be read and the Core log says why the list could not be read; it is also what an enabled governor reports on a platform without detection.
@@ -123,7 +124,7 @@ For `detection_failed`, `jarvis-core health` says the process list cannot be rea
 ## Consequences
 
 - A person sees a held queue in `health` and in the audit log, with the reason and how long. Nothing is hidden, and nothing is released behind their back.
-- **A process on the same account named like a configured game holds jobs indefinitely.** Copying a harmless program to `cs2.exe` and running it is enough. The alert makes this visible after `alert_after_ms`, and the audit log names the configured name that matched. It does not prevent it. The same account is already inside the trust boundary and can edit the configuration, approve requests and change the database (threat model, known gaps), so the governor adds no authority to it. It does not bound spoofing and is not meant to.
+- **Any local process named like a configured game holds jobs indefinitely, whatever account it runs as.** On Windows a Toolhelp snapshot lists the processes of every account and session; on Linux every `/proc` entry that is visible and readable counts, including other users' processes (unless `hidepid` hides them). Copying a harmless program to `cs2.exe` and running it is enough. This is an accepted availability risk, not a privilege escalation: the hold grants no authority and starts nothing. It is visible through `health` and the overdue alert after `alert_after_ms`, and the audit log names the configured name that matched. The governor does not prevent it, does not bound spoofing and is not meant to.
 - Holding is the answer to every doubt: a failed or missing detection, a release that cannot be recorded, a start-up that has not looked yet. The cost is a queue that waits when it could have run. The alert is how a person finds out.
 - A job that is held never has an attempt counted and never has its timer started, so a long game session does not use up `max_job_attempts` or `job_timeout`.
 - Approvals are not affected. They belong to a running job and a running job is not touched.
