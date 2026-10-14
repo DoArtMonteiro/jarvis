@@ -11,9 +11,16 @@
 //! | `Held` | clear | `Releasing` (until now + delay) | |
 //! | `Releasing` | game or failed | `Held`, same `since` | |
 //! | `Releasing` | clear, delay not over | `Releasing` | |
-//! | `Releasing` | clear, delay over | `Open` | `Released` |
+//! | `Releasing` | clear, delay over | `Releasing`, same `since` and `until` | `Released` |
 //! | start-up `Held` | clear | `Open` | |
 //! | start-up `Held` | game or failed | `Held`, same `since` | `Hold` |
+//!
+//! The machine never opens the gate on a release. A due release returns
+//! `Releasing` together with the `Released` event; the caller opens the gate
+//! once that event is on the record, and if it cannot be recorded the state is
+//! still `Releasing` and the next clear reading emits the event again. The only
+//! way from a closed state to `Open` in one step is the start-up hold, which
+//! has nothing to record.
 //!
 //! Time never ends a hold. Once a hold has lasted the alert time it is
 //! marked overdue and one event says so; the jobs keep waiting until the
@@ -192,7 +199,9 @@ pub fn step(
     (next, events)
 }
 
-/// `Open` once `now` has reached `until`, otherwise still releasing.
+/// Still releasing, and once `now` has reached `until` the release is due:
+/// the `Released` event is emitted every time this is called after that, until
+/// the caller has recorded it and opened the gate. Never returns `Open`.
 fn release_or_wait(
     since: u64,
     now: u64,
@@ -204,13 +213,11 @@ fn release_or_wait(
         events.push(Event::Released {
             held_ms: now.saturating_sub(since),
         });
-        State::Open
-    } else {
-        State::Releasing {
-            since,
-            until,
-            overdue,
-        }
+    }
+    State::Releasing {
+        since,
+        until,
+        overdue,
     }
 }
 
@@ -245,12 +252,18 @@ mod tests {
         }
     }
 
+    /// Feed `steps` the way the governor does when every event can be
+    /// recorded: the gate opens as soon as a release has been emitted.
     fn run(state: State, steps: &[(u64, Observation)]) -> (State, Vec<Event>) {
         let mut state = state;
         let mut events = Vec::new();
         for (now, observation) in steps {
             let (next, mut more) = step(state, observation.clone(), *now, TIMING);
-            state = next;
+            state = if more.iter().any(|e| matches!(e, Event::Released { .. })) {
+                State::Open
+            } else {
+                next
+            };
             events.append(&mut more);
         }
         (state, events)
@@ -297,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_opens_exactly_when_the_delay_is_over_and_counts_the_whole_hold() {
+    fn a_release_is_due_exactly_when_the_delay_is_over_and_counts_the_whole_hold() {
         let releasing = State::Releasing {
             since: 1_000,
             until: 35_000,
@@ -306,13 +319,27 @@ mod tests {
         let (state, events) = step(releasing.clone(), Observation::Clear, 34_999, TIMING);
         assert_eq!(state, releasing);
         assert!(events.is_empty());
-        let (state, events) = step(releasing, Observation::Clear, 35_000, TIMING);
-        assert_eq!(state, State::Open);
+        let (state, events) = step(releasing.clone(), Observation::Clear, 35_000, TIMING);
+        assert_eq!(state, releasing, "the machine never opens on a release");
         assert_eq!(events, [Event::Released { held_ms: 34_000 }]);
     }
 
     #[test]
-    fn a_zero_delay_opens_the_gate_on_the_first_clear_reading() {
+    fn a_release_that_is_due_again_is_emitted_again_until_the_caller_opens_the_gate() {
+        let releasing = State::Releasing {
+            since: 1_000,
+            until: 35_000,
+            overdue: false,
+        };
+        let (state, events) = step(releasing.clone(), Observation::Clear, 35_000, TIMING);
+        assert_eq!(events, [Event::Released { held_ms: 34_000 }]);
+        let (state, events) = step(state, Observation::Clear, 40_000, TIMING);
+        assert_eq!(state, releasing);
+        assert_eq!(events, [Event::Released { held_ms: 39_000 }]);
+    }
+
+    #[test]
+    fn a_zero_delay_makes_the_release_due_on_the_first_clear_reading() {
         let timing = Timing {
             resume_delay_ms: 0,
             ..TIMING
@@ -323,7 +350,14 @@ mod tests {
             4_000,
             timing,
         );
-        assert_eq!(state, State::Open);
+        assert_eq!(
+            state,
+            State::Releasing {
+                since: 1_000,
+                until: 4_000,
+                overdue: false
+            }
+        );
         assert_eq!(events, [Event::Released { held_ms: 3_000 }]);
     }
 
@@ -517,7 +551,14 @@ mod tests {
             overdue: false,
         };
         let (state, events) = step(releasing, Observation::Clear, ALERT, TIMING);
-        assert_eq!(state, State::Open);
+        assert_eq!(
+            state,
+            State::Releasing {
+                since: 0,
+                until: ALERT,
+                overdue: true
+            }
+        );
         assert_eq!(
             events,
             [

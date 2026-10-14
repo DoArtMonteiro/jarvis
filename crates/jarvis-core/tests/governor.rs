@@ -841,6 +841,46 @@ async fn a_release_waits_for_every_event_before_it_to_be_recorded() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_alert_and_a_release_due_on_the_same_reading_keep_the_gate_shut_until_both_are_recorded()
+{
+    // The game leaves at 1 s, so the release is due at 3 s: the same reading
+    // at which the hold reaches the alert time.
+    let config = settings(1_000, 2_000, 3_000);
+    let source = Scripted::script(vec![game(), clear()]);
+    let mut rig = Rig::start(Arc::clone(&source), &config);
+    refuse(&rig, "governor_released");
+
+    let status = within_real(10, "the alert", rig.status.wait_for(|s| s.overdue))
+        .await
+        .unwrap()
+        .clone();
+    assert_eq!(status.phase, GovernorPhase::Releasing);
+    assert_eq!(rig.elapsed_ms(), 3_000);
+    rig.recorded(2).await;
+    source.handled(source.reads() + 6).await;
+    let status = rig.hub.governor_status();
+    assert_eq!(status.phase, GovernorPhase::Releasing);
+    assert!(status.overdue);
+    assert!(!status.is_open());
+    assert_eq!(
+        rig.audit(),
+        [hold_game(), overdue(3_000)],
+        "the alert is on the record and the release is not"
+    );
+
+    accept(&rig, "governor_released");
+    rig.reaches(GovernorPhase::Open).await;
+    let audit = rig.audit();
+    assert_eq!(audit.len(), 3, "{audit:?}");
+    assert_eq!(audit[0], hold_game());
+    assert_eq!(audit[1], overdue(3_000));
+    assert!(matches!(audit[2], AuditEventKind::GovernorReleased { .. }));
+    source.handled(source.reads() + 5).await;
+    assert_eq!(rig.audit().len(), 3, "the alert is recorded once");
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_hold_and_an_alert_that_wait_together_are_recorded_in_order() {
     let config = settings(1_000, 2_000, 3_000);
     let source = Scripted::script(vec![game()]);

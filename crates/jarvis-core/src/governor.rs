@@ -266,64 +266,48 @@ impl Governor {
 
         let now = millis(self.origin.elapsed());
         let (next, events) = step(self.state.clone(), observation, now, self.timing);
-        let releasing = events.iter().any(|e| matches!(e, Event::Released { .. }));
-        let alerted = events.iter().any(|e| matches!(e, Event::Overdue { .. }));
 
         // Holding is the safe direction, so the gate closes first and the
         // record follows. A slow or failing database must not keep jobs
-        // starting while a game runs.
-        let next = if releasing {
-            Some(next)
-        } else {
-            self.publish(next);
-            None
-        };
+        // starting while a game runs. The state machine never opens the gate
+        // on a release (it only returns `Releasing`), so this cannot open it
+        // either; the gate opens below, once the release is on the record.
+        self.publish(next);
 
         // Events are recorded in the order they happened. One that cannot be
         // written waits in `pending` and is tried again, before anything
-        // newer, at every later reading.
+        // newer, at every later reading. While `pending` is not empty,
+        // nothing newer may be written.
         let mut streak = false;
-        let mut in_order = self.flush_pending(&mut streak).await;
-        let mut release_recorded = false;
+        self.flush_pending(&mut streak).await;
         for event in events {
             if matches!(event, Event::Released { .. }) {
-                // Never queued: the state machine emits it again at the next
-                // reading for as long as the gate has not opened.
-                if in_order && self.try_record(&event, &mut streak).await {
-                    release_recorded = true;
+                // Opening the gate is the other direction: it waits for the
+                // record of the release and of everything before it. The
+                // release is never queued: the state is still `Releasing`,
+                // so the next reading emits it again until it is recorded.
+                if self.pending.is_empty() && self.try_record(&event, &mut streak).await {
+                    self.publish(State::Open);
                 }
                 continue;
             }
-            if in_order && self.try_record(&event, &mut streak).await {
+            if self.pending.is_empty() && self.try_record(&event, &mut streak).await {
                 continue;
             }
-            in_order = false;
             self.queue(event);
         }
         self.record_failing = streak;
-
-        // Opening the gate is the other direction: it waits for the record
-        // of the release and of everything before it. Otherwise the gate
-        // stays shut and the next reading tries again.
-        if let Some(next) = next {
-            if release_recorded {
-                self.publish(next);
-            } else {
-                self.publish(staying(self.state.clone(), alerted, now));
-            }
-        }
     }
 
     /// Retry the events that earlier readings could not record, oldest
-    /// first. Returns whether none is left.
-    async fn flush_pending(&mut self, streak: &mut bool) -> bool {
+    /// first, and stop at the first one that still cannot be written.
+    async fn flush_pending(&mut self, streak: &mut bool) {
         while let Some(event) = self.pending.first().cloned() {
             if !self.try_record(&event, streak).await {
-                return false;
+                return;
             }
             self.pending.remove(0);
         }
-        true
     }
 
     /// Write one event. A failure is logged once per streak of failures.
@@ -412,30 +396,6 @@ impl Drop for FailClosed {
             overdue: false,
         };
         self.hub.set_governor(Status::of(&state, self.origin));
-    }
-}
-
-/// The state to keep when a release could not be recorded: the game is gone
-/// but the jobs stay held, so it is releasing and the next reading tries
-/// again. (Without a resume delay the step went straight from held to open.)
-/// An alert raised in the same step is not raised again.
-fn staying(state: State, alerted: bool, now: u64) -> State {
-    match state {
-        State::Held { since, overdue, .. } => State::Releasing {
-            since,
-            until: now,
-            overdue: overdue || alerted,
-        },
-        State::Releasing {
-            since,
-            until,
-            overdue,
-        } => State::Releasing {
-            since,
-            until,
-            overdue: overdue || alerted,
-        },
-        State::Open => State::Open,
     }
 }
 
