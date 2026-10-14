@@ -222,6 +222,7 @@ impl Governor {
                 biased;
                 () = stop.cancelled() => {
                     guard.armed = false;
+                    self.report_unrecorded();
                     return;
                 }
                 outcome = tokio::time::timeout(self.poll, read) => outcome,
@@ -234,6 +235,7 @@ impl Governor {
                         biased;
                         () = stop.cancelled() => {
                             guard.armed = false;
+                            self.report_unrecorded();
                             return;
                         }
                         () = tokio::time::sleep(self.poll) => {}
@@ -343,17 +345,31 @@ impl Governor {
         }
     }
 
-    /// Keep an event that could not be written. While anything waits the gate
-    /// cannot open, so the state machine produces at most one hold and one
-    /// alert in that time; the cap only guards against a mistake.
+    /// Keep an event that could not be written. It is never dropped: a later
+    /// release would otherwise open the gate with an event missing. While
+    /// anything waits the gate cannot open, so the state machine produces at
+    /// most one hold and one alert in that time; more than [`MAX_PENDING`]
+    /// waiting means a mistake, which is logged.
     fn queue(&mut self, event: Event) {
-        if self.pending.len() >= MAX_PENDING {
+        self.pending.push(event);
+        if self.pending.len() > MAX_PENDING {
             tracing::error!(
-                ?event,
-                "too many governor events wait to be recorded; dropped"
+                waiting = self.pending.len(),
+                "more governor events wait to be recorded than there should ever be"
             );
-        } else {
-            self.pending.push(event);
+        }
+    }
+
+    /// Events that never reached the audit log are held only in memory, so
+    /// stopping loses them. Say so rather than drop them silently.
+    fn report_unrecorded(&self) {
+        if !self.pending.is_empty() {
+            tracing::error!(
+                lost = self.pending.len(),
+                events = ?self.pending,
+                "the governor stopped with events that were never recorded; \
+                 they are lost because they were only held in memory"
+            );
         }
     }
 
@@ -423,7 +439,8 @@ fn staying(state: State, alerted: bool, now: u64) -> State {
     }
 }
 
-/// More events than this waiting to be written means a mistake.
+/// More events than this waiting to be written means a mistake. They are
+/// still kept; only an error is logged.
 const MAX_PENDING: usize = 8;
 
 fn millis(duration: Duration) -> u64 {

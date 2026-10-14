@@ -774,6 +774,40 @@ async fn a_hold_that_could_not_be_recorded_is_recorded_once_when_the_database_re
 }
 
 #[tokio::test(start_paused = true)]
+async fn events_that_were_never_recorded_are_reported_when_the_core_stops() {
+    let captured = Captured::install();
+    let config = settings(1_000, 2_000, 86_400_000);
+    let source = Scripted::script(vec![clear(), game()]);
+    let mut rig = Rig::start(Arc::clone(&source), &config);
+    refuse(&rig, "governor_hold");
+
+    rig.holds_for(GovernorReason::Game).await;
+    source.handled(6).await;
+    assert!(rig.audit().is_empty());
+    assert_eq!(captured.lines_with("were never recorded"), 0);
+
+    rig.stop().await;
+    assert_eq!(
+        captured.lines_with("were never recorded"),
+        1,
+        "one line when the task ends"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn nothing_is_reported_at_shutdown_when_every_event_was_recorded() {
+    let captured = Captured::install();
+    let config = settings(1_000, 2_000, 86_400_000);
+    let source = Scripted::script(vec![clear(), game()]);
+    let mut rig = Rig::start(Arc::clone(&source), &config);
+
+    rig.holds_for(GovernorReason::Game).await;
+    rig.recorded(1).await;
+    rig.stop().await;
+    assert_eq!(captured.lines_with("were never recorded"), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_release_waits_for_every_event_before_it_to_be_recorded() {
     let config = settings(1_000, 2_000, 3_000);
     // The game runs past the alert time and then leaves.
