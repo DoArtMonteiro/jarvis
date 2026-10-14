@@ -32,6 +32,8 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
+pub mod processes;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]

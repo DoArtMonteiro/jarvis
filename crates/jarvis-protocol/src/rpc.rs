@@ -8,7 +8,7 @@
 //! request being approved.
 //!
 //! ```json
-//! {"rpc":1,"type":"approve","approval_id":"…","fingerprint":"…"}
+//! {"rpc":2,"type":"approve","approval_id":"…","fingerprint":"…"}
 //! ```
 
 use std::collections::BTreeMap;
@@ -29,7 +29,7 @@ use crate::{
 pub struct RpcVersion(pub u32);
 
 impl RpcVersion {
-    pub const CURRENT: Self = Self(1);
+    pub const CURRENT: Self = Self(2);
 }
 
 impl fmt::Display for RpcVersion {
@@ -118,6 +118,60 @@ pub struct WorkerView {
     pub containment: String,
 }
 
+/// Where the gaming governor stands. `Off` is a Core that was started with
+/// the governor disabled: jobs start whenever a worker is free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernorPhase {
+    Off,
+    /// No game is running; queued jobs may start.
+    Open,
+    /// Queued jobs wait. Running jobs are not affected.
+    Held,
+    /// The game has gone; queued jobs keep waiting out the resume delay.
+    Releasing,
+}
+
+/// Why the governor holds queued jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernorReason {
+    /// The first check since the Core started has not finished.
+    Starting,
+    /// A configured process is running.
+    Game,
+    /// The process list could not be read, so the governor cannot say
+    /// whether a game runs.
+    DetectionFailed,
+}
+
+/// The governor as `health` reports it. `reason` and `process` are set while
+/// held; `held_ms` while held or releasing; `overdue` once a hold has lasted
+/// longer than the configured alert time. `process` is the configured name
+/// that matched, never anything read from the process list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernorView {
+    pub state: GovernorPhase,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub reason: Option<GovernorReason>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub process: Option<String>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub held_ms: Option<u64>,
+    pub overdue: bool,
+}
+
+impl GovernorView {
+    /// The view of a Core whose governor is disabled.
+    pub const OFF: Self = Self {
+        state: GovernorPhase::Off,
+        reason: None,
+        process: None,
+        held_ms: None,
+        overdue: false,
+    };
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthReport {
@@ -128,6 +182,7 @@ pub struct HealthReport {
     pub rpc_protocol: RpcVersion,
     pub uptime_ms: u64,
     pub worker: WorkerView,
+    pub governor: GovernorView,
     pub queued_jobs: u32,
     pub pending_approvals: u32,
 }
@@ -283,37 +338,46 @@ mod tests {
             fingerprint: Fingerprint::from_digest(&[7; 32]),
         };
         let bytes = encode_rpc_request(&request).unwrap();
-        assert!(bytes.starts_with(br#"{"rpc":1,"type":"approve""#));
+        assert!(bytes.starts_with(br#"{"rpc":2,"type":"approve""#));
         assert_eq!(decode_rpc_request(&bytes).unwrap(), request);
         let health = encode_rpc_request(&RpcRequest::Health {}).unwrap();
-        assert_eq!(health, br#"{"rpc":1,"type":"health"}"#);
+        assert_eq!(health, br#"{"rpc":2,"type":"health"}"#);
     }
 
     #[test]
     fn requests_are_strict() {
         for value in [
-            json!({"rpc": 1, "type": "health", "extra": true}),
-            json!({"rpc": 1, "type": "run_command", "command": "id"}),
-            json!({"rpc": 1, "type": "submit_job"}),
-            json!({"rpc": 1, "type": "submit_job", "goal": ""}),
-            json!({"rpc": 1, "type": "submit_job", "goal": "a\nb"}),
-            json!({"rpc": 1, "type": "get_job", "job_id": JobId::new()}),
-            json!({"rpc": 1, "type": "approve", "approval_id": ApprovalId::new()}),
-            json!({"rpc": 1, "type": "approve", "approval_id": ApprovalId::new(),
+            json!({"rpc": 2, "type": "health", "extra": true}),
+            json!({"rpc": 2, "type": "run_command", "command": "id"}),
+            json!({"rpc": 2, "type": "submit_job"}),
+            json!({"rpc": 2, "type": "submit_job", "goal": ""}),
+            json!({"rpc": 2, "type": "submit_job", "goal": "a\nb"}),
+            json!({"rpc": 2, "type": "get_job", "job_id": JobId::new()}),
+            json!({"rpc": 2, "type": "approve", "approval_id": ApprovalId::new()}),
+            json!({"rpc": 2, "type": "approve", "approval_id": ApprovalId::new(),
                    "fingerprint": "abc"}),
-            json!({"rpc": 1, "type": "approve", "approval_id": ApprovalId::new(),
+            json!({"rpc": 2, "type": "approve", "approval_id": ApprovalId::new(),
                    "fingerprint": "a".repeat(64), "approved": true}),
             json!({"protocol": 2, "type": "health"}),
         ] {
             let error = decode_rpc_request(&frame(value.clone())).unwrap_err();
             assert_eq!(error.code(), crate::ErrorCode::MalformedFrame, "{value}");
         }
-        let error = decode_rpc_request(&frame(json!({"rpc": 2, "type": "health"}))).unwrap_err();
+        let error = decode_rpc_request(&frame(json!({"rpc": 3, "type": "health"}))).unwrap_err();
         assert!(matches!(
             error,
             DecodeError::UnsupportedVersion {
-                found: 2,
-                expected: 1,
+                found: 3,
+                expected: 2,
+                ..
+            }
+        ));
+        let error = decode_rpc_request(&frame(json!({"rpc": 1, "type": "health"}))).unwrap_err();
+        assert!(matches!(
+            error,
+            DecodeError::UnsupportedVersion {
+                found: 1,
+                expected: 2,
                 ..
             }
         ));
@@ -323,6 +387,36 @@ mod tests {
     fn worker_frames_are_not_rpc_requests() {
         let worker = br#"{"protocol":2,"type":"hello","worker":"w","worker_version":"1"}"#;
         assert!(decode_rpc_request(worker).is_err());
+    }
+
+    #[test]
+    fn the_governor_view_is_strict() {
+        let valid = json!({"state": "held", "reason": "game", "process": "cs2.exe",
+                           "held_ms": 5, "overdue": false});
+        let view: GovernorView = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(view.state, GovernorPhase::Held);
+        assert_eq!(view.reason, Some(GovernorReason::Game));
+        assert_eq!(serde_json::to_value(&view).unwrap(), valid);
+        assert_eq!(
+            serde_json::to_value(GovernorView::OFF).unwrap(),
+            json!({"state": "off", "reason": null, "process": null,
+                   "held_ms": null, "overdue": false})
+        );
+        for bad in [
+            json!({"state": "held", "reason": "game", "process": null, "held_ms": 5}),
+            json!({"state": "held", "reason": "game", "held_ms": 5, "overdue": false}),
+            json!({"state": "paused", "reason": null, "process": null,
+                   "held_ms": null, "overdue": false}),
+            json!({"state": "held", "reason": "gaming", "process": null,
+                   "held_ms": null, "overdue": false}),
+            json!({"state": "off", "reason": null, "process": null,
+                   "held_ms": null, "overdue": false, "extra": 1}),
+        ] {
+            assert!(
+                serde_json::from_value::<GovernorView>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

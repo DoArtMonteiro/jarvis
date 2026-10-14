@@ -19,3 +19,4 @@ Short records of decisions that shape the codebase. Each one states the context,
 | [0013](0013-windows-appcontainer.md) | Isolate the Windows worker in an AppContainer, and check it at start-up |
 | [0014](0014-linux-landlock-seccomp.md) | Isolate the Linux worker with Landlock and seccomp |
 | [0015](0015-durable-jobs.md) | Durable jobs: resume what is safe, quarantine what is not (amends 0009) |
+| [0016](0016-gaming-governor.md) | A gaming governor that defers starting jobs while a configured game runs |

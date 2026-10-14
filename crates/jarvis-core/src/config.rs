@@ -38,6 +38,7 @@ pub struct Config {
     pub approvals: ApprovalConfig,
     pub supervisor: SupervisorConfig,
     pub rpc: RpcConfig,
+    pub governor: GovernorConfig,
     pub policy: Policy,
 }
 
@@ -141,6 +142,39 @@ pub struct RpcConfig {
     pub idle_timeout: Duration,
 }
 
+/// The gaming governor (ADR 0016): while a listed process runs, queued jobs
+/// wait. Off by default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GovernorConfig {
+    pub enabled: bool,
+    /// Executable names that count as a game, compared ASCII
+    /// case-insensitively. Validated even when the governor is off.
+    pub processes: Vec<String>,
+    /// How often the process list is read.
+    pub poll: Duration,
+    /// How long the list must stay clear before queued jobs start again.
+    pub resume_delay: Duration,
+    /// After this long a hold raises an alert. It never ends the hold.
+    pub alert_after: Duration,
+}
+
+impl GovernorConfig {
+    pub const MAX_PROCESSES: usize = 16;
+    pub const MAX_NAME_BYTES: usize = 64;
+}
+
+impl Default for GovernorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            processes: vec!["cs2.exe".to_owned()],
+            poll: Duration::from_millis(5_000),
+            resume_delay: Duration::from_millis(30_000),
+            alert_after: Duration::from_millis(4 * 60 * 60 * 1_000),
+        }
+    }
+}
+
 impl RpcConfig {
     /// Largest request frame a client may send.
     pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
@@ -163,6 +197,8 @@ struct RawConfig {
     supervisor: RawSupervisor,
     #[serde(default)]
     rpc: RawRpc,
+    #[serde(default)]
+    governor: RawGovernor,
     policy: BTreeMap<Capability, PolicyDecision>,
 }
 
@@ -220,6 +256,16 @@ struct RawRpc {
     allow_shutdown: Option<bool>,
     max_connections: Option<usize>,
     idle_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGovernor {
+    enabled: Option<bool>,
+    processes: Option<Vec<String>>,
+    poll_ms: Option<u64>,
+    resume_delay_ms: Option<u64>,
+    alert_after_ms: Option<u64>,
 }
 
 impl Config {
@@ -446,6 +492,37 @@ impl Config {
             )?,
         };
 
+        let governor_defaults = GovernorConfig::default();
+        let governor = GovernorConfig {
+            enabled: raw.governor.enabled.unwrap_or(governor_defaults.enabled),
+            processes: process_names(
+                raw.governor
+                    .processes
+                    .unwrap_or(governor_defaults.processes),
+            )?,
+            poll: ms(
+                "governor.poll_ms",
+                raw.governor.poll_ms,
+                governor_defaults.poll,
+                250,
+                60_000,
+            )?,
+            resume_delay: ms(
+                "governor.resume_delay_ms",
+                raw.governor.resume_delay_ms,
+                governor_defaults.resume_delay,
+                0,
+                600_000,
+            )?,
+            alert_after: ms(
+                "governor.alert_after_ms",
+                raw.governor.alert_after_ms,
+                governor_defaults.alert_after,
+                60_000,
+                86_400_000,
+            )?,
+        };
+
         for (&capability, &decision) in &raw.policy {
             let ceiling = capability.class().ceiling();
             if decision < ceiling {
@@ -466,9 +543,35 @@ impl Config {
             approvals,
             supervisor,
             rpc,
+            governor,
             policy: Policy::new(raw.policy),
         })
     }
+}
+
+fn process_names(names: Vec<String>) -> Result<Vec<String>, ConfigError> {
+    if names.is_empty() || names.len() > GovernorConfig::MAX_PROCESSES {
+        return Err(ConfigError::Invalid(format!(
+            "governor.processes must list 1 to {} names, got {}",
+            GovernorConfig::MAX_PROCESSES,
+            names.len()
+        )));
+    }
+    for name in &names {
+        let printable = name.bytes().all(|b| (0x20..=0x7e).contains(&b));
+        let separator = name
+            .bytes()
+            .any(|b| matches!(b, b'/' | 0x5c /* backslash */));
+        if name.is_empty() || name.len() > GovernorConfig::MAX_NAME_BYTES || !printable || separator
+        {
+            return Err(ConfigError::Invalid(format!(
+                "governor.processes names must be 1 to {} printable ASCII characters without \
+                 a slash or backslash, got {name:?}",
+                GovernorConfig::MAX_NAME_BYTES
+            )));
+        }
+    }
+    Ok(names)
 }
 
 fn ms(
@@ -631,6 +734,118 @@ mod tests {
         assert!(Config::from_toml(&text, Path::new(".")).is_err());
     }
 
+    fn governor(section: &str) -> Result<GovernorConfig, ConfigError> {
+        let text = format!("{MINIMAL}\n[governor]\n{section}\n");
+        Config::from_toml(&text, Path::new(".")).map(|config| config.governor)
+    }
+
+    #[test]
+    fn the_governor_is_off_unless_asked_for() {
+        let config = Config::from_toml(MINIMAL, Path::new(".")).unwrap();
+        let governor = config.governor;
+        assert!(!governor.enabled);
+        assert_eq!(governor.processes, ["cs2.exe"]);
+        assert_eq!(governor.poll, Duration::from_millis(5_000));
+        assert_eq!(governor.resume_delay, Duration::from_millis(30_000));
+        assert_eq!(governor.alert_after, Duration::from_millis(14_400_000));
+        let governor = self::governor("enabled = true").unwrap();
+        assert!(governor.enabled);
+        assert_eq!(governor.processes, ["cs2.exe"]);
+    }
+
+    #[test]
+    fn governor_settings_are_read() {
+        let governor = governor(
+            "enabled = true\nprocesses = [\"Game.exe\", \"other\"]\npoll_ms = 500\n\
+             resume_delay_ms = 0\nalert_after_ms = 120000",
+        )
+        .unwrap();
+        assert_eq!(governor.processes, ["Game.exe", "other"]);
+        assert_eq!(governor.poll, Duration::from_millis(500));
+        assert_eq!(governor.resume_delay, Duration::ZERO);
+        assert_eq!(governor.alert_after, Duration::from_millis(120_000));
+    }
+
+    #[test]
+    fn governor_times_are_range_checked_at_each_bound() {
+        for (key, low, high) in [
+            ("poll_ms", 250, 60_000),
+            ("resume_delay_ms", 0, 600_000),
+            ("alert_after_ms", 60_000, 86_400_000),
+        ] {
+            for ok in [low, high] {
+                assert!(governor(&format!("{key} = {ok}")).is_ok(), "{key} = {ok}");
+            }
+            let mut bad = vec![high + 1];
+            if low > 0 {
+                bad.push(low - 1);
+            }
+            for value in bad {
+                let error = governor(&format!("{key} = {value}")).unwrap_err();
+                assert!(error.to_string().contains(key), "{key} = {value}: {error}");
+            }
+        }
+        assert!(governor("poll_ms = -1").is_err());
+    }
+
+    #[test]
+    fn governor_process_names_are_validated() {
+        let names = |list: &str| governor(&format!("processes = {list}"));
+        assert!(names("[\"a\"]").is_ok());
+        assert!(
+            names("[\"Counter Strike 2.exe\"]").is_ok(),
+            "spaces are printable"
+        );
+        let sixteen = vec!["\"p\""; 16].join(",");
+        assert!(names(&format!("[{sixteen}]")).is_ok());
+        let seventeen = vec!["\"p\""; 17].join(",");
+        assert!(names(&format!("[{seventeen}]")).is_err());
+        assert!(
+            names("[]").is_err(),
+            "an enabled governor needs something to look for"
+        );
+        assert!(names("[\"\"]").is_err());
+        assert!(names(&format!("[\"{}\"]", "a".repeat(64))).is_ok());
+        assert!(names(&format!("[\"{}\"]", "a".repeat(65))).is_err());
+        for bad in [
+            r#""dir/game.exe""#,
+            r#""nul\u0000byte""#,
+            r#""tab\there""#,
+            r#""new\nline""#,
+            r#""del\u007f""#,
+            r#""sp\u00e4ter.exe""#,
+        ] {
+            let error = names(&format!("[{bad}]")).unwrap_err();
+            assert!(
+                error.to_string().contains("governor.processes"),
+                "{bad}: {error}"
+            );
+        }
+        // A literal TOML string, so that the backslash reaches the check.
+        for bad in ["dir{}game.exe", "C:{}game.exe"] {
+            let bad = bad.replace("{}", "\u{5c}");
+            let error = names(&format!("['{bad}']")).unwrap_err();
+            assert!(
+                error.to_string().contains("governor.processes"),
+                "{bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_example_config_documents_the_governor_defaults_and_leaves_it_off() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/jarvis.example.toml");
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.governor, GovernorConfig::default());
+        assert!(!config.governor.enabled);
+    }
+
+    #[test]
+    fn governor_rejects_unknown_keys() {
+        assert!(governor("unknown_key_ms = 1000").is_err());
+        assert!(governor("enabled = \"yes\"").is_err());
+        assert!(governor("processes = \"cs2.exe\"").is_err());
+    }
     #[test]
     fn missing_policy_entries_default_to_deny() {
         let text = MINIMAL.replace("\"filesystem.read.fixture\" = \"require_confirmation\"", "");

@@ -368,6 +368,10 @@ async fn health(state: &RpcState) -> Result<RpcResponse, RpcError> {
         rpc_protocol: RpcVersion::CURRENT,
         uptime_ms: u64::try_from(state.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         worker,
+        governor: state
+            .hub
+            .governor_status()
+            .view(tokio::time::Instant::now()),
         queued_jobs,
         pending_approvals,
     }))

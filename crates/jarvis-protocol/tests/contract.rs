@@ -84,6 +84,13 @@ fn invalid_rpc_requests_are_rejected_with_expected_code() {
     check_invalid("invalid/rpc", |frame| decode_rpc_request(frame).map(|_| ()));
 }
 
+#[test]
+fn invalid_rpc_responses_are_rejected_with_expected_code() {
+    check_invalid("invalid/rpc_response", |frame| {
+        decode_rpc_response(frame).map(|_| ())
+    });
+}
+
 fn check_invalid(subdir: &str, decode: fn(&[u8]) -> Result<(), DecodeError>) {
     for path in fixtures(subdir) {
         let (case, _) = compact(&path);

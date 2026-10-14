@@ -1,0 +1,24 @@
+{
+  "rpc": 2,
+  "type": "health",
+  "ok": true,
+  "core_version": "0.2.0",
+  "worker_protocol": 2,
+  "rpc_protocol": 2,
+  "uptime_ms": 90000,
+  "worker": {
+    "state": "idle",
+    "pid": 4242,
+    "restarts": 0,
+    "containment": "process group"
+  },
+  "governor": {
+    "state": "held",
+    "reason": "game",
+    "process": "cs2.exe",
+    "held_ms": 61000,
+    "overdue": true
+  },
+  "queued_jobs": 2,
+  "pending_approvals": 0
+}

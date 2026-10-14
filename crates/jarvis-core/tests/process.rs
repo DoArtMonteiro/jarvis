@@ -349,7 +349,7 @@ fn the_daemon_runs_jobs_from_clients_with_the_python_worker() {
     let health = setup.health();
     assert_eq!(health["ok"], true);
     assert_eq!(health["worker_protocol"], 2);
-    assert_eq!(health["rpc_protocol"], 1);
+    assert_eq!(health["rpc_protocol"], 2);
     assert!(health["worker"]["pid"].is_u64());
     assert!(!health["worker"]["containment"].as_str().unwrap().is_empty());
 
@@ -943,17 +943,18 @@ fn the_rpc_interface_is_strict_and_bounded() {
     let endpoint = setup.endpoint();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
-        let health = br#"{"rpc":1,"type":"health"}"#;
+        let health = br#"{"rpc":2,"type":"health"}"#;
         let replies = raw_exchange(
             &endpoint,
             &[
                 b"not json",
-                br#"{"rpc":1,"type":"health","extra":1}"#,
-                br#"{"rpc":1,"type":"run_command","command":"id"}"#,
-                br#"{"rpc":2,"type":"health"}"#,
+                br#"{"rpc":2,"type":"health","extra":1}"#,
+                br#"{"rpc":2,"type":"run_command","command":"id"}"#,
+                br#"{"rpc":3,"type":"health"}"#,
+                br#"{"rpc":1,"type":"health"}"#,
                 br#"{"protocol":2,"type":"hello","worker":"w","worker_version":"1"}"#,
-                br#"{"rpc":1,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aa","approved":true}"#,
-                br#"{"rpc":1,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                br#"{"rpc":2,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aa","approved":true}"#,
+                br#"{"rpc":2,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
                 health,
             ],
         )
@@ -969,17 +970,22 @@ fn the_rpc_interface_is_strict_and_bounded() {
                 "malformed_request",
                 "malformed_request",
                 "unsupported_version",
+                "unsupported_version",
                 "malformed_request",
                 "malformed_request",
                 "not_found",
                 "-",
             ]
         );
-        assert_eq!(replies[7]["type"], "health", "the connection survives bad requests");
+        // A client of the previous version is refused, and the answer is
+        // encoded at this version: an older client cannot decode it either.
+        assert_eq!(replies[4]["rpc"], 2);
+        assert!(replies[4]["message"].as_str().unwrap().contains("version 1"));
+        assert_eq!(replies[8]["type"], "health", "the connection survives bad requests");
 
         // An oversized request is answered once, then the connection closes.
         let huge = format!(
-            r#"{{"rpc":1,"type":"submit_job","goal":"{}"}}"#,
+            r#"{{"rpc":2,"type":"submit_job","goal":"{}"}}"#,
             "x".repeat(20 * 1024)
         );
         let replies = raw_exchange(&endpoint, &[huge.as_bytes(), health]).await;
@@ -991,7 +997,7 @@ fn the_rpc_interface_is_strict_and_bounded() {
         let stream = jarvis_core::rpc::transport::connect(&endpoint).await.unwrap();
         let (_, mut writer) = tokio::io::split(stream);
         writer
-            .write_all(b"{\"rpc\":1,\"type\":\"list_approvals\",\"wait_ms\":30000}\n")
+            .write_all(b"{\"rpc\":2,\"type\":\"list_approvals\",\"wait_ms\":30000}\n")
             .await
             .unwrap();
         drop(writer);
@@ -1138,4 +1144,156 @@ fn a_job_whose_worker_keeps_dying_replays_its_first_step_until_the_attempts_are_
     assert_eq!(setup.count("step_replayed"), 2, "attempts 2 and 3 replayed");
     assert_eq!(setup.store().tasks(10).unwrap().len(), 1);
     drop(daemon);
+}
+
+// --- gaming governor (ADR 0016) -----------------------------------------------------------------
+
+/// A name no other process uses, short enough for a Linux `comm`.
+fn unique_game_name() -> String {
+    let id = TaskId::new().to_string().replace('-', "");
+    let stem = format!("jv{}", &id[id.len() - 12..]);
+    if cfg!(windows) {
+        format!("{stem}.exe")
+    } else {
+        stem
+    }
+}
+
+/// A stand-in process that is killed and reaped when it goes out of scope,
+/// so that a failing assertion does not leave it running.
+struct StandIn(Child);
+
+impl StandIn {
+    fn kill(&mut self) {
+        self.0.kill().unwrap();
+        self.0.wait().unwrap();
+    }
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_stand_in_does_not_outlive_its_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let stand_in = start_stand_in(dir.path(), &unique_game_name());
+    let pid = stand_in.0.id();
+    assert!(jarvis_sandbox::process_exists(pid));
+    drop(stand_in);
+    assert!(!jarvis_sandbox::process_exists(pid));
+}
+
+/// Copy a harmless system binary to `dir/name` and run it for two minutes.
+/// It is a stand-in for a game, found by its file name like one.
+fn start_stand_in(dir: &Path, name: &str) -> StandIn {
+    let target = dir.join(name);
+    let (source, args): (&str, &[&str]) = if cfg!(windows) {
+        (r"C:\Windows\System32\PING.EXE", &["-n", "120", "127.0.0.1"])
+    } else {
+        ("/bin/sleep", &["120"])
+    };
+    std::fs::copy(source, &target).unwrap();
+    let child = Command::new(&target)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    StandIn(child)
+}
+
+impl Setup {
+    fn wait_for_governor(&self, state: &str) -> Value {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let governor = self.health()["governor"].clone();
+            if governor["state"] == state {
+                return governor;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the governor never became {state}, last {governor}: {}",
+                self.log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[test]
+fn the_governor_is_off_unless_the_config_turns_it_on() {
+    let setup = Setup::new("real", POLICY, "");
+    let daemon = setup.serve();
+    setup.wait_for_worker("idle");
+    let governor = setup.health()["governor"].clone();
+    assert_eq!(
+        governor,
+        serde_json::json!({"state": "off", "reason": null, "process": null,
+                           "held_ms": null, "overdue": false})
+    );
+    let job = setup.json(&["submit", "describe the runtime", "--wait"]);
+    assert_eq!(job[0]["status"], "completed");
+    assert!(setup.shutdown(daemon).success());
+    assert_eq!(setup.count("governor_hold"), 0);
+}
+
+#[test]
+fn queued_jobs_wait_while_a_game_runs_and_start_after_it_exits() {
+    let game = unique_game_name();
+    let setup = Setup::new(
+        "real",
+        POLICY,
+        &format!(
+            "[governor]\nenabled = true\nprocesses = [{game:?}]\npoll_ms = 250\n\
+             resume_delay_ms = 500\nalert_after_ms = 600000\n"
+        ),
+    );
+    let daemon = setup.serve();
+    setup.wait_for_worker("idle");
+    setup.wait_for_governor("open");
+
+    let mut stand_in = start_stand_in(setup.dir.path(), &game);
+    let held = setup.wait_for_governor("held");
+    assert_eq!(held["reason"], "game");
+    assert_eq!(held["process"], game.as_str());
+    setup.wait_for_kind("governor_hold", 1);
+
+    let job = setup.submit("describe the runtime");
+    std::thread::sleep(Duration::from_millis(1500));
+    let status = setup.json(&["job", &job]).remove(0);
+    assert_eq!(status["status"], "queued", "held while the game runs");
+    assert_eq!(setup.count("job_started"), 0);
+    assert_eq!(setup.health()["queued_jobs"], 1);
+
+    stand_in.kill();
+    let done = setup
+        .json(&["job", &job, "--wait", "--timeout", "30s"])
+        .remove(0);
+    assert_eq!(done["status"], "completed", "{}", setup.log());
+    assert_eq!(setup.health()["governor"]["state"], "open");
+
+    let events = setup.events();
+    let seq = |kind: &str| {
+        events
+            .iter()
+            .find(|event| event.event.name() == kind)
+            .map(|event| event.seq)
+            .unwrap_or_else(|| panic!("no {kind} in the audit log"))
+    };
+    assert!(seq("governor_hold") < seq("governor_released"));
+    assert!(
+        seq("governor_released") < seq("job_started"),
+        "the release is recorded before the job starts"
+    );
+    let process = events.iter().find_map(|event| match &event.event {
+        AuditEventKind::GovernorHold { process, .. } => process.clone(),
+        _ => None,
+    });
+    assert_eq!(process.as_deref(), Some(game.as_str()));
+    assert!(setup.shutdown(daemon).success(), "{}", setup.log());
 }

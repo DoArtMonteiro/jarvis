@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use jarvis_protocol::{RpcRequest, RpcResponse, decode_rpc_response, encode_rpc_request};
+use jarvis_protocol::{
+    DecodeError, RpcRequest, RpcResponse, decode_rpc_response, encode_rpc_request,
+};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::transport::{self, Endpoint};
@@ -26,6 +28,10 @@ pub enum ClientError {
     Timeout,
     #[error("the Core closed the connection")]
     Closed,
+    #[error(
+        "the Core speaks RPC version {found}, this command speaks version {expected}: use the jarvis-core binary from the same build as the running Core (restart the Core after an upgrade)"
+    )]
+    VersionMismatch { found: u64, expected: u32 },
     #[error("invalid response from the Core: {0}")]
     Invalid(String),
 }
@@ -73,8 +79,17 @@ impl Client {
             match self.reader.next_frame().await? {
                 None => Err(ClientError::Closed),
                 Some(Frame::TooLarge) => Err(ClientError::Invalid("response too large".into())),
-                Some(Frame::Line(line)) => decode_rpc_response(&line)
-                    .map_err(|error| ClientError::Invalid(error.to_string())),
+                Some(Frame::Line(line)) => {
+                    decode_rpc_response(&line).map_err(|error| match error {
+                        // Another version is not "invalid": say which, so that a
+                        // person knows to match the binaries. There is no
+                        // fallback to the other version.
+                        DecodeError::UnsupportedVersion {
+                            found, expected, ..
+                        } => ClientError::VersionMismatch { found, expected },
+                        other => ClientError::Invalid(other.to_string()),
+                    })
+                }
             }
         };
         tokio::time::timeout(wait + SLACK, exchange)

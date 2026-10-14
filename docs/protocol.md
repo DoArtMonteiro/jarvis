@@ -5,7 +5,7 @@ JARVIS has two wire protocols with separate version keys:
 | Protocol | Between | Version key | Version |
 | --- | --- | --- | --- |
 | Worker protocol | The Core and its worker process, over the worker's stdio | `protocol` | 2 |
-| Local RPC | Local clients (the CLI) and the long-lived Core | `rpc` | 1 |
+| Local RPC | Local clients (the CLI) and the long-lived Core | `rpc` | 2 |
 
 The Rust types in `crates/jarvis-protocol` are the reference implementation. The fixtures in `tests/protocol/` are checked by the Rust suite (both protocols) and the Python suite (worker protocol).
 
@@ -162,7 +162,7 @@ A job can be handed out again after its worker or the Core stopped. Requests are
 
 `workspace.write_file` creates or replaces one UTF-8 text file up to the configured size. The parent directory must already exist inside the workspace. The file is written to a temporary name and renamed into place, so a reader sees either the old or the new content, and an existing symlink or hard link at the target is replaced rather than written through. Because the capability is class B, every call needs a person's approval.
 
-## Local RPC, version 1
+## Local RPC, version 2
 
 ### Transport
 
@@ -175,7 +175,7 @@ A job can be handed out again after its worker or the Core stopped. Requests are
 ### Requests
 
 ```json
-{"rpc": 1, "type": "approve", "approval_id": "…", "fingerprint": "3f3f…"}
+{"rpc": 2, "type": "approve", "approval_id": "…", "fingerprint": "3f3f…"}
 ```
 
 | `type` | Fields | Reply |
@@ -191,6 +191,35 @@ A job can be handed out again after its worker or the Core stopped. Requests are
 | `shutdown` | | `shutting_down`, or `forbidden` unless the configuration allows it |
 
 `wait_ms` is capped at 60 000. There is no operation that runs a command or a tool directly.
+
+### Health
+
+`health` reports the worker (`state`, `pid`, `restarts`, `containment`), the governor, the number of queued jobs and the number of pending approvals. `ok` is false once the worker has failed for good.
+
+`governor` has five fields, all required:
+
+| Field | Meaning |
+| --- | --- |
+| `state` | `off` (the governor is disabled), `open`, `held` or `releasing` |
+| `reason` | While held: `starting` (the first check has not finished), `game` or `detection_failed`; otherwise `null` |
+| `process` | While held for `game`: the configured process name that matched; otherwise `null` |
+| `held_ms` | While held or releasing: how long the hold has lasted; otherwise `null` |
+| `overdue` | True once a hold has lasted longer than the configured alert time |
+
+Version 2 added `governor` (see Compatibility below).
+
+The governor also writes three audit events, which are not part of either wire protocol: `governor_hold` (`reason`, and `process` when a game caused it), `governor_released` (`held_ms`) and `governor_hold_overdue` (`held_ms`). They carry the configured process name that matched and nothing else about the process list (ADR 0016).
+
+### Compatibility
+
+The RPC version changes with any change to the wire format, including a field added to a reply: strict decoding means a peer built before the change cannot read it. There is one version at a time and no negotiation. The Core and the CLI must come from the same build.
+
+On a mismatch each side refuses, and neither falls back:
+
+- A newer CLI talking to an older Core: the Core refuses the request with `unsupported_version`, and the refusal carries the Core's older version number, so the CLI reports `the Core speaks RPC version N, this command speaks version M` and exits with a failure.
+- An older CLI talking to a newer Core: the Core refuses with `unsupported_version`, encoded at its own version. The older CLI cannot decode that answer either, so it can only report an invalid response. The Core keeps serving.
+
+To upgrade, stop the Core, replace the binaries, and start it again. The database is migrated on start-up and is not affected by the RPC version.
 
 ### Approvals
 

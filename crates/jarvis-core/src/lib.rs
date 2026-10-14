@@ -12,6 +12,7 @@ pub mod config;
 pub mod daemon;
 pub mod framing;
 pub mod gateway;
+pub mod governor;
 pub mod hub;
 pub mod isolation;
 pub mod policy;

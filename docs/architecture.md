@@ -16,6 +16,7 @@ This document describes what exists in Phase 3. Planned components are marked as
 |  rpc         peer identification, strict requests, long polls     |
 |  isolation   worker confinement; start-up check that it holds     |
 |  supervisor  start the isolated worker, forward stderr, kill      |
+|  governor    optional: hold job starts while a game runs          |
 |  session     handshake, jobs, request pipeline, limits            |
 |  policy      capability extraction, policy evaluation             |
 |  approval    fingerprints, display-safe descriptions, wake-ups    |
@@ -115,6 +116,7 @@ The store checks the expected source state of every transition inside the transa
 - Before the first worker starts, `isolation::verify` runs a probe under the worker's exact isolation and checks that it cannot reach a loopback listener, send a datagram, read a file next to the database, list the home directory (when one is found) or start a process. The Core observes the loopback and file results itself; the home and process results come from the probe's own report. If any check fails, `serve` stops with an error (ADR 0013).
 - The worker is started directly from the resolved absolute program path and the configured arguments, without a shell, with an environment cleared apart from `PATH` and `SYSTEMROOT` (plus, on Windows, the profile variables an AppContainer launch requires). Every isolation control is in force before it runs any code (ADRs 0013, 0014): it can read its interpreter and its source directory and no other user files, can write nowhere (on Windows, nowhere but its own AppContainer folder, emptied before every start), and has no network by design (the start-up check covers loopback only) and no child processes. On Windows it can still read system files and registry keys open to every AppContainer, including parts of `HKEY_CURRENT_USER`, and can obtain a screen device context (ADR 0013). Its stdout carries protocol frames, its stdin carries replies, and its stderr is forwarded to the Core's log as escaped, length-limited lines.
 - A worker that does not complete the handshake, or a job that runs past `job_timeout`, is killed. When the worker stops for any reason, the session expires its approvals and either puts its job back in the queue or ends it (ADR 0015), and the supervisor restarts the worker with exponential backoff, within a restart budget per time window. Once the budget is spent the Core reports itself unhealthy and refuses jobs.
+- With `[governor]` enabled (ADR 0016), a task reads the process list every `poll_ms` and publishes whether queued jobs may start. The Core starts held and the gate is closed until the first reading. Each session reads the gate before it claims a job and does not claim while it is closed, so a held job is not counted as an attempt and its job timer never starts; jobs already running are left alone. A hold is never ended by time: after `alert_after_ms` it is flagged overdue and one event is recorded. A read that takes longer than `poll_ms` counts as failed (the jobs are held) and at most one read is in flight; a hold closes the gate before it is recorded, a release is recorded before the gate opens. The governor does not exist when it is disabled, and the gate is open.
 - On SIGINT, SIGTERM, Ctrl+C, Ctrl+Break or console close, or an authorised `shutdown` request, the Core cancels the running tool, expires pending approvals, closes the worker's stdin, kills it after the grace period, stops the RPC server and records `core_stopped`. A second signal exits immediately.
 - The client commands (`health`, `submit`, `job`, `jobs`, `approvals`, `shutdown`) connect to the endpoint named in the same config file. `tasks` and `audit` read the database directly, read-only.
 
@@ -143,8 +145,8 @@ The Core runs on Tokio. A session handles one request at a time: a worker can ne
 ## Observability
 
 - Structured logs on stderr through `tracing`, as text or JSON (`--log-format json`), filtered with `JARVIS_LOG`.
-- The audit log is typed: every row deserialises back into `AuditEventKind`. Besides the task pipeline it records jobs, approvals (`approval_requested`, `_granted`, `_denied`, `_expired`, `_consumed`), the worker's life (`worker_spawned`, `_exited`, `_killed`, `_restart_scheduled`, `_restart_abandoned`), refused RPC clients and the Core's start and stop.
-- `jarvis-core health` reports the worker's state, pid, restarts and containment, queued jobs and pending approvals.
+- The audit log is typed: every row deserialises back into `AuditEventKind`. Besides the task pipeline it records jobs, approvals (`approval_requested`, `_granted`, `_denied`, `_expired`, `_consumed`), the worker's life (`worker_spawned`, `_exited`, `_killed`, `_restart_scheduled`, `_restart_abandoned`), the governor (`governor_hold`, `governor_released`, `governor_hold_overdue`), refused RPC clients and the Core's start and stop.
+- `jarvis-core health` reports the worker's state, pid, restarts and containment, the governor (off, open, held with its reason, or releasing, how long, and whether the hold is overdue), queued jobs and pending approvals.
 
 ## Testing strategy
 
@@ -157,6 +159,8 @@ The Core runs on Tokio. A session handles one request at a time: a worker can ne
 | Policy, restarts, config | Default deny, class ceilings, backoff and budget | Unit tests |
 | Session | Every failure path over in-memory pipes with an untrusted peer, including approvals and database failures before and after execution | `crates/jarvis-core/tests/session.rs` |
 | Processes | The real binary as a daemon with the real Python worker and a hostile worker: CLI approvals, restarts, crashes, signals, recovery, the RPC interface | `crates/jarvis-core/tests/process.rs` |
+| Gaming governor | The state machine as a pure function; the loop against a scripted source on a paused clock (exact release time, one alert, errors, failing audit writes); the gate in a real session (held jobs are not claimed, no attempt, no timer, wake on release, start-up); the real binary with a stand-in process started and killed | `crates/jarvis-core/src/governor/machine.rs`, `tests/governor.rs`, `tests/process.rs` |
+| Process detection | The production function finds the test binary's own name, a stand-in copied to a unique name while it runs and not after it exits | `crates/jarvis-sandbox/tests/processes.rs` |
 | Worker | Protocol client, job loop, planner, contract fixtures, a guard that the package performs no privileged operations | `services/intelligence-python/tests` |
 
 ## Not built yet

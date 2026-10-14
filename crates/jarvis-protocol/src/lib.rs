@@ -29,9 +29,9 @@ pub use message::{
     decode_core_message, decode_worker_message, encode_core_message, encode_worker_message,
 };
 pub use rpc::{
-    ApprovalView, HealthReport, JobView, RpcError, RpcErrorCode, RpcRequest, RpcResponse,
-    RpcVersion, WorkerState, WorkerView, decode_rpc_request, decode_rpc_response,
-    encode_rpc_request, encode_rpc_response,
+    ApprovalView, GovernorPhase, GovernorReason, GovernorView, HealthReport, JobView, RpcError,
+    RpcErrorCode, RpcRequest, RpcResponse, RpcVersion, WorkerState, WorkerView, decode_rpc_request,
+    decode_rpc_response, encode_rpc_request, encode_rpc_response,
 };
 pub use task::{ApprovalStatus, JobStatus, PolicyDecision, TaskStatus};
 pub use text::{Goal, Summary};

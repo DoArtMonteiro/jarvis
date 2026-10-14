@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::message::Label;
 use crate::{
-    ApprovalId, Capability, Fingerprint, JobId, JobStatus, PolicyDecision, ProtocolVersion,
-    RequestId, SessionId, TaskId, TaskStatus, ToolName, WireError,
+    ApprovalId, Capability, Fingerprint, GovernorReason, JobId, JobStatus, PolicyDecision,
+    ProtocolVersion, RequestId, SessionId, TaskId, TaskStatus, ToolName, WireError,
 };
 
 /// One entry of the append-only audit log.
@@ -152,6 +152,25 @@ pub enum AuditEventKind {
     ApprovalConsumed {
         approval_id: ApprovalId,
     },
+    /// The gaming governor stopped queued jobs from starting. `process` is
+    /// the configured name that matched when `reason` is `game`; nothing
+    /// else about the process list is recorded. Jobs already running are
+    /// not affected.
+    GovernorHold {
+        reason: GovernorReason,
+        process: Option<String>,
+    },
+    /// Queued jobs may start again. `held_ms` counts from the hold, resume
+    /// delay included. Recorded before the jobs are released.
+    GovernorReleased {
+        held_ms: u64,
+    },
+    /// A hold has lasted longer than the configured alert time. Recorded
+    /// once per hold. Jobs keep waiting: the governor never releases
+    /// because of elapsed time.
+    GovernorHoldOverdue {
+        held_ms: u64,
+    },
     /// A connection to the RPC interface was refused, for example because
     /// it came from the worker process.
     RpcClientRejected {
@@ -192,6 +211,9 @@ impl AuditEventKind {
             Self::ApprovalDenied { .. } => "approval_denied",
             Self::ApprovalExpired { .. } => "approval_expired",
             Self::ApprovalConsumed { .. } => "approval_consumed",
+            Self::GovernorHold { .. } => "governor_hold",
+            Self::GovernorReleased { .. } => "governor_released",
+            Self::GovernorHoldOverdue { .. } => "governor_hold_overdue",
             Self::RpcClientRejected { .. } => "rpc_client_rejected",
         }
     }
@@ -238,6 +260,18 @@ mod tests {
                 job_id: JobId::new(),
                 seq: 2,
                 task_id: TaskId::new(),
+            },
+            AuditEventKind::GovernorHold {
+                reason: GovernorReason::Game,
+                process: Some("cs2.exe".into()),
+            },
+            AuditEventKind::GovernorHold {
+                reason: GovernorReason::DetectionFailed,
+                process: None,
+            },
+            AuditEventKind::GovernorReleased { held_ms: 61_000 },
+            AuditEventKind::GovernorHoldOverdue {
+                held_ms: 14_400_000,
             },
         ];
         for event in events {
