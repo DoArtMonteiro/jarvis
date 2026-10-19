@@ -114,6 +114,8 @@ Expected: `other-health.txt` reports access denied (os error 5). The pipe's DACL
 
 Then check that a client does not talk to a pipe another account created. As the other account, create a pipe that every account may open under a name of your choice (a short PowerShell script with `NamedPipeServerStream` and a `PipeSecurity` that allows `Everyone`), and record what it receives. As yourself, point a copy of the config's `[rpc] pipe` at that name and run `jarvis health`. Expected: the client says the pipe belongs to another user or to a low-integrity process, and the other account's pipe records a connection that received nothing.
 
+Repeat both checks from a process of your own account at low integrity. Copy `powershell.exe` into a scratch folder and give the copy and the folder a low label (`icacls <copy> /setintegritylevel low`, and `(OI)(CI)low` on the folder); a process started from that copy runs at low integrity (`whoami /groups` shows `S-1-16-4096`). From it, opening the Core's pipe for reading and for reading and writing fails with access denied, and `jarvis audit` shows no new `rpc_client_rejected` event. Then let it create a pipe that every account may open, point a config at that name and run `jarvis health` as yourself. Expected: the client says the pipe belongs to another user or to a low-integrity process, and the low-integrity pipe receives nothing.
+
 ## 7. Lifecycle
 
 In the window running `serve`, press Ctrl+C once: logs show `shutdown requested`, the worker exits with code 0, the Core exits with code 0, `jarvis audit` ends with `session_closed`, `worker_exited`, `core_stopped`. Start again and press Ctrl+C twice quickly: exit code 130; the next start records recovery events. Also check `jarvis shutdown` and closing the console window.
@@ -188,6 +190,7 @@ Set `[governor] enabled = true` and `processes = ["<your game>.exe"]` in the con
 | Manual probes: Documents, OneDrive, credentials, DNS, internet, local service, IPv6 loopback, LAN address, child process, Core process | | |
 | Open items: registry read (`HKCU\Software`, `RecentDocs`), screen device context and capture, keyboard state | | |
 | RPC from another account: access denied, nothing audited; another account's pipe refused by the client and sent nothing | | |
+| RPC from a low-integrity process of the same user: access denied for reading and for reading and writing; its pipe refused by the client and sent nothing | | |
 | Ctrl+C once and twice, `shutdown`, console close | | |
 | Crash, restart, budget, pending approval expiry, restart recovery | | |
 | Overhead: interpreter start, idle memory, probe, RPC, idle CPU | | |

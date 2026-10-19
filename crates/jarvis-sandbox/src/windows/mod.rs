@@ -37,12 +37,13 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     ACE_HEADER, ACL, AdjustTokenPrivileges, EqualSid, GetAce, GetSidSubAuthority,
-    GetSidSubAuthorityCount, GetTokenInformation, LABEL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES,
-    LookupPrivilegeValueW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
-    SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_REMOVED, SECURITY_ATTRIBUTES, SYSTEM_MANDATORY_LABEL_ACE,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_MANDATORY_LABEL,
-    TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid, TokenCapabilities,
-    TokenIntegrityLevel, TokenIsAppContainer, TokenPrivileges, TokenUser,
+    GetSidSubAuthorityCount, GetTokenInformation, INHERIT_ONLY_ACE, IsValidSid,
+    LABEL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, RevertToSelf, SE_CHANGE_NOTIFY_NAME,
+    SE_PRIVILEGE_REMOVED, SECURITY_ATTRIBUTES, SYSTEM_MANDATORY_LABEL_ACE, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES,
+    TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenIntegrityLevel,
+    TokenIsAppContainer, TokenPrivileges, TokenUser,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
@@ -549,6 +550,9 @@ unsafe fn label_rid(label: *const ACL) -> io::Result<u32> {
     }
     // SAFETY: the caller guarantees a valid ACL.
     let count = unsafe { (*label).AceCount };
+    // The lowest label that applies to the object itself counts; an
+    // inherit-only entry labels only children.
+    let mut lowest: Option<u32> = None;
     for index in 0..u32::from(count) {
         let mut ace = null_mut();
         // SAFETY: `index` is below the ACL's entry count.
@@ -559,18 +563,24 @@ unsafe fn label_rid(label: *const ACL) -> io::Result<u32> {
         // starts at `SidStart`.
         unsafe {
             let header = &*ace.cast::<ACE_HEADER>();
-            if u32::from(header.AceType) != SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+            if u32::from(header.AceType) != SYSTEM_MANDATORY_LABEL_ACE_TYPE
+                || u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0
+            {
                 continue;
             }
             let sid = (&raw mut (*ace.cast::<SYSTEM_MANDATORY_LABEL_ACE>()).SidStart).cast();
+            if IsValidSid(sid) == 0 {
+                return Err(io::Error::other("label entry holds an invalid SID"));
+            }
             let count = *GetSidSubAuthorityCount(sid);
             if count == 0 {
                 return Err(io::Error::other("label SID has no sub-authority"));
             }
-            return Ok(*GetSidSubAuthority(sid, u32::from(count) - 1));
+            let rid = *GetSidSubAuthority(sid, u32::from(count) - 1);
+            lowest = Some(lowest.map_or(rid, |seen| seen.min(rid)));
         }
     }
-    Ok(SECURITY_MANDATORY_MEDIUM_RID as u32)
+    Ok(lowest.unwrap_or(SECURITY_MANDATORY_MEDIUM_RID as u32))
 }
 
 /// The current process's TOKEN_USER, in a buffer for [`user_sid`].

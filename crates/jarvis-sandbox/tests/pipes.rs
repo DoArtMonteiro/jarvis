@@ -67,18 +67,23 @@ fn pipe_with(name: &str, sddl: &str) -> NamedPipeServer {
 #[tokio::test]
 async fn a_client_accepts_only_a_pipe_of_its_own_user_at_medium_integrity() {
     let sid = user_sid();
-    // Same owner and access; only the label differs.
-    for (label, accepted) in [("ME", true), ("LW", false)] {
-        let name = name(&format!("label-{label}"));
-        let _server = pipe_with(
-            &name,
-            &format!("O:{sid}D:P(A;;GA;;;WD)S:(ML;;NW;;;{label})"),
-        );
+    // Same owner and access; only the label differs. No label counts as
+    // medium, as Windows treats it.
+    for (index, (sacl, accepted)) in [
+        ("S:(ML;;NW;;;ME)", true),
+        ("", true),
+        ("S:(ML;;NW;;;LW)", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = name(&format!("label-{index}"));
+        let _server = pipe_with(&name, &format!("O:{sid}D:P(A;;GA;;;WD){sacl}"));
         let client = ClientOptions::new().open(&name).unwrap();
         assert_eq!(
             jarvis_sandbox::pipe_belongs_to_current_user(client.as_raw_handle()).unwrap(),
             accepted,
-            "label {label}"
+            "SACL {sacl:?}"
         );
     }
     // The Core's own pipe passes.
