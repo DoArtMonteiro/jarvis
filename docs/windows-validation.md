@@ -110,9 +110,9 @@ Every test must pass. They are read-only towards your files: the canaries they c
 runas /user:<other account> "cmd /c <folder>\jarvis-core.exe health --config <folder>\<config> > <folder>\other-health.txt 2>&1"
 ```
 
-Expected: `other-health.txt` reports access denied (os error 5). The pipe's DACL stops the other account before the Core sees it, so `jarvis audit` shows no new `rpc_client_rejected` event. This run proves the DACL, not the Core's own token check; the token check is covered by the tests named in the threat model.
+Expected: `other-health.txt` reports access denied (os error 5). The pipe's DACL stops the other account before the Core sees it, so `jarvis audit` shows no new `rpc_client_rejected` event. This run proves the DACL, not the Core's own token check. Over a real pipe, the tests exercise the token check only for a same-user token and for a token that cannot be read; the other classes are tested with constructed values (see the threat model).
 
-Then check that a client does not talk to a pipe another account created. As the other account, create a pipe that every account may open under a name of your choice (a short PowerShell script with `NamedPipeServerStream` and a `PipeSecurity` that allows `Everyone`), and record what it receives. As yourself, point a copy of the config's `[rpc] pipe` at that name and run `jarvis health`. Expected: the client says the pipe is owned by another user, and the other account's pipe records a connection that received nothing.
+Then check that a client does not talk to a pipe another account created. As the other account, create a pipe that every account may open under a name of your choice (a short PowerShell script with `NamedPipeServerStream` and a `PipeSecurity` that allows `Everyone`), and record what it receives. As yourself, point a copy of the config's `[rpc] pipe` at that name and run `jarvis health`. Expected: the client says the pipe belongs to another user or to a low-integrity process, and the other account's pipe records a connection that received nothing.
 
 ## 7. Lifecycle
 

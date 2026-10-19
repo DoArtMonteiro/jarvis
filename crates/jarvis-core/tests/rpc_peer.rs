@@ -176,8 +176,8 @@ async fn a_client_that_hides_its_token_is_refused_audited_and_does_not_block_oth
     core.server.await.unwrap();
 }
 
-/// The Core's pipe is owned by the user who started it, which is what the
-/// client checks before it sends anything.
+/// The Core's pipe is owned by the user who started it, at medium
+/// integrity, which is what the client checks before it sends anything.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_core_pipe_is_owned_by_its_user() {
@@ -188,7 +188,7 @@ async fn the_core_pipe_is_owned_by_its_user() {
     let core = start(rpc_state(dir.path(), &unique_pipe("owner")));
     let Endpoint::Pipe(name) = &core.endpoint;
     let raw = ClientOptions::new().open(name).unwrap();
-    assert!(jarvis_sandbox::pipe_owned_by_current_user(raw.as_raw_handle()).unwrap());
+    assert!(jarvis_sandbox::pipe_belongs_to_current_user(raw.as_raw_handle()).unwrap());
     drop(raw);
     core.stop.cancel();
     core.server.await.unwrap();

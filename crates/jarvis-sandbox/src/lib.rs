@@ -303,11 +303,12 @@ pub fn inspect_pipe_client(pipe: std::os::windows::io::RawHandle) -> io::Result<
 }
 
 /// Whether the named pipe behind a client handle is owned by the current
-/// user, so a client can tell its own Core's pipe from one another account
-/// created under the same name.
+/// user and labelled medium integrity or above, so a client can tell its own
+/// Core's pipe from one that another account, or a low-integrity process of
+/// the same user, created under the same name.
 #[cfg(windows)]
-pub fn pipe_owned_by_current_user(pipe: std::os::windows::io::RawHandle) -> io::Result<bool> {
-    windows::pipe_owned_by_current_user(pipe)
+pub fn pipe_belongs_to_current_user(pipe: std::os::windows::io::RawHandle) -> io::Result<bool> {
+    windows::pipe_belongs_to_current_user(pipe)
 }
 
 /// Whether the process `pid` runs with a restricted token: an AppContainer,

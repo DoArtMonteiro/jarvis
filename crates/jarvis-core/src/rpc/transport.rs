@@ -2,7 +2,8 @@
 //! an owner-only directory, or a Windows named pipe that only the current
 //! user can open, that refuses remote clients and that cannot be pre-created
 //! by another process. On Windows the client also checks that the pipe it
-//! opened is owned by its own user before sending anything.
+//! opened is owned by its own user at medium integrity or above before
+//! sending anything.
 
 use std::fmt;
 use std::io;
@@ -229,9 +230,10 @@ mod windows {
         }
     }
 
-    /// Open the Core's pipe, and refuse it unless it is owned by this user:
-    /// while the Core is stopped, another account could create a pipe under
-    /// the same name and collect what the client sends.
+    /// Open the Core's pipe, and refuse it unless it is owned by this user
+    /// at medium integrity or above: while the Core is stopped, another
+    /// account or a low-integrity process could create a pipe under the
+    /// same name and collect what the client sends.
     pub async fn connect(endpoint: &Endpoint) -> io::Result<NamedPipeClient> {
         let Endpoint::Pipe(name) = endpoint;
         let mut attempts = 0;
@@ -244,10 +246,12 @@ mod windows {
                 other => break other?,
             }
         };
-        if !jarvis_sandbox::pipe_owned_by_current_user(client.as_raw_handle())? {
+        if !jarvis_sandbox::pipe_belongs_to_current_user(client.as_raw_handle())? {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("{name} is owned by another user, so it is not this user's Core"),
+                format!(
+                    "{name} belongs to another user or to a low-integrity process, so it is not this user's Core"
+                ),
             ));
         }
         Ok(client)
