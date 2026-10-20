@@ -377,9 +377,10 @@ enum Direction {
 
 /// One stdio pipe: the Core's overlapped server end, registered with Tokio,
 /// and the worker's synchronous, inheritable client end. The server's DACL
-/// admits only the current user, so the worker (whose package SID it does
-/// not name) could not open another connection even if it learned the name;
-/// it holds the one end it is given, by inheritance.
+/// admits only the current user and its medium label refuses lower integrity
+/// levels, so the worker (whose package SID the DACL does not name, and which
+/// runs at low integrity) could not open another connection even if it
+/// learned the name; it holds the one end it is given, by inheritance.
 fn pipe(direction: Direction) -> io::Result<(NamedPipeServer, Handle)> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()

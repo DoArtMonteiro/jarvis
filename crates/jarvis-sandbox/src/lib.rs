@@ -281,6 +281,36 @@ pub fn named_pipe_client_pid(pipe: std::os::windows::io::RawHandle) -> io::Resul
     windows::named_pipe_client_pid(pipe)
 }
 
+/// What the token of a named pipe client says about it.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeClient {
+    /// The current user, at medium integrity or above, not an AppContainer.
+    SameUser,
+    /// Another account.
+    OtherUser,
+    /// The current user, but an AppContainer or below medium integrity.
+    Restricted,
+}
+
+/// Read the token of the client connected to a named pipe server handle, by
+/// impersonating the client for the duration of the call. Fails when the
+/// token cannot be read, for example when the client connected at anonymous
+/// impersonation level, so the caller can fail closed.
+#[cfg(windows)]
+pub fn inspect_pipe_client(pipe: std::os::windows::io::RawHandle) -> io::Result<PipeClient> {
+    windows::inspect_pipe_client(pipe)
+}
+
+/// Whether the named pipe behind a client handle is owned by the current
+/// user and labelled medium integrity or above, so a client can tell its own
+/// Core's pipe from one that another account, or a low-integrity process of
+/// the same user, created under the same name.
+#[cfg(windows)]
+pub fn pipe_belongs_to_current_user(pipe: std::os::windows::io::RawHandle) -> io::Result<bool> {
+    windows::pipe_belongs_to_current_user(pipe)
+}
+
 /// Whether the process `pid` runs with a restricted token: an AppContainer,
 /// or an integrity level below medium. Errors (for example, the process has
 /// already exited) are returned, so the caller can fail closed.

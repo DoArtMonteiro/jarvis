@@ -32,12 +32,15 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LUID, LocalFree, STILL_ACTIVE,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, EqualSid, GetSidSubAuthority, GetSidSubAuthorityCount,
-    GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PSECURITY_DESCRIPTOR, PSID,
-    SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_REMOVED, SECURITY_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES,
+    ACE_HEADER, ACL, AdjustTokenPrivileges, EqualSid, GetAce, GetSidSubAuthority,
+    GetSidSubAuthorityCount, GetTokenInformation, INHERIT_ONLY_ACE, IsValidSid,
+    LABEL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, RevertToSelf, SE_CHANGE_NOTIFY_NAME,
+    SE_PRIVILEGE_REMOVED, SECURITY_ATTRIBUTES, SYSTEM_MANDATORY_LABEL_ACE, TOKEN_ADJUST_PRIVILEGES,
     TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES,
     TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenIntegrityLevel,
     TokenIsAppContainer, TokenPrivileges, TokenUser,
@@ -49,16 +52,17 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
     JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
 use windows_sys::Win32::System::SystemServices::{
     JOB_OBJECT_UILIMIT_ALL, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
+    SYSTEM_MANDATORY_LABEL_ACE_TYPE,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetCurrentThread, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+    OpenThreadToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::{Confinement, Report};
+use crate::{Confinement, PipeClient, Report};
 
 mod appcontainer;
 mod launch;
@@ -447,11 +451,160 @@ pub(crate) fn named_pipe_client_pid(pipe: RawHandle) -> io::Result<u32> {
     Ok(pid)
 }
 
+/// Read the token of the client connected to a named pipe server handle by
+/// impersonating it, and classify it. The token is the client's own, so a
+/// process ID that was reused after the client exited cannot be mistaken
+/// for it. A client that connected at anonymous impersonation level has no
+/// token to read, and that is an error.
+pub(crate) fn inspect_pipe_client(pipe: RawHandle) -> io::Result<PipeClient> {
+    let token = pipe_client_token(pipe)?;
+    let client = token_information(&token, TokenUser)?;
+    let own = current_user()?;
+    // SAFETY: both SIDs point into buffers that live until the end of this
+    // function.
+    if unsafe { EqualSid(user_sid(&client), user_sid(&own)) } == 0 {
+        return Ok(PipeClient::OtherUser);
+    }
+    if is_app_container(&token)? || integrity_rid(&token)? < SECURITY_MANDATORY_MEDIUM_RID as u32 {
+        return Ok(PipeClient::Restricted);
+    }
+    Ok(PipeClient::SameUser)
+}
+
+fn pipe_client_token(pipe: RawHandle) -> io::Result<Handle> {
+    // SAFETY: `pipe` is a connected named pipe server handle owned by the
+    // caller for the duration of the call.
+    let ok = unsafe { ImpersonateNamedPipeClient(pipe as HANDLE) };
+    check(ok, "ImpersonateNamedPipeClient")?;
+    let _revert = Revert;
+    let mut raw = null_mut();
+    // SAFETY: GetCurrentThread returns a pseudo-handle that needs no
+    // closing; the access check uses the Core's own token (OpenAsSelf), and
+    // the token handle is owned by `Handle`.
+    let ok = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut raw) };
+    check(ok, "OpenThreadToken(client)")?;
+    Handle::new(raw).ok_or_else(|| last_error("OpenThreadToken(client)"))
+}
+
+/// Ends the impersonation started in [`pipe_client_token`] on every path.
+/// A thread of the Core's runtime left running as the client would be worse
+/// than stopping, so a failure to revert aborts the process.
+struct Revert;
+
+impl Drop for Revert {
+    fn drop(&mut self) {
+        // SAFETY: ends impersonation on the calling thread.
+        if unsafe { RevertToSelf() } == 0 {
+            std::process::abort();
+        }
+    }
+}
+
+/// Whether the named pipe behind a client handle belongs to the current
+/// user at medium integrity or above: owned by that user's SID, with no
+/// mandatory label below medium. A pipe created by another account, or by a
+/// low-integrity process of the same user, under the Core's name does not.
+pub(crate) fn pipe_belongs_to_current_user(pipe: RawHandle) -> io::Result<bool> {
+    let mut owner: PSID = null_mut();
+    let mut label: *mut ACL = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: `pipe` is an open handle owned by the caller; `owner` and
+    // `label` point into `descriptor`, which the system allocates and is
+    // freed below.
+    let status = unsafe {
+        GetSecurityInfo(
+            pipe as HANDLE,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            &mut label,
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let belongs = current_user().and_then(|own| {
+        // SAFETY: `owner` points into `descriptor`, still allocated, and the
+        // user SID into `own`.
+        let owned = !owner.is_null() && unsafe { EqualSid(owner, user_sid(&own)) } != 0;
+        // SAFETY: `label` is null or points into `descriptor`.
+        Ok(owned && unsafe { label_rid(label) }? >= SECURITY_MANDATORY_MEDIUM_RID as u32)
+    });
+    // SAFETY: allocated by GetSecurityInfo.
+    unsafe { LocalFree(descriptor) };
+    belongs
+}
+
+/// The integrity level in a label SACL. An object without a mandatory label
+/// is treated by Windows as medium.
+///
+/// # Safety
+///
+/// `label` is null or points to a valid ACL.
+unsafe fn label_rid(label: *const ACL) -> io::Result<u32> {
+    if label.is_null() {
+        return Ok(SECURITY_MANDATORY_MEDIUM_RID as u32);
+    }
+    // SAFETY: the caller guarantees a valid ACL.
+    let count = unsafe { (*label).AceCount };
+    // The lowest label that applies to the object itself counts; an
+    // inherit-only entry labels only children.
+    let mut lowest: Option<u32> = None;
+    for index in 0..u32::from(count) {
+        let mut ace = null_mut();
+        // SAFETY: `index` is below the ACL's entry count.
+        let ok = unsafe { GetAce(label, index, &mut ace) };
+        check(ok, "GetAce")?;
+        // SAFETY: GetAce returned a pointer to an entry inside the ACL; a
+        // mandatory label entry is a SYSTEM_MANDATORY_LABEL_ACE whose SID
+        // starts at `SidStart`.
+        unsafe {
+            let header = &*ace.cast::<ACE_HEADER>();
+            if u32::from(header.AceType) != SYSTEM_MANDATORY_LABEL_ACE_TYPE
+                || u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0
+            {
+                continue;
+            }
+            let sid = (&raw mut (*ace.cast::<SYSTEM_MANDATORY_LABEL_ACE>()).SidStart).cast();
+            if IsValidSid(sid) == 0 {
+                return Err(io::Error::other("label entry holds an invalid SID"));
+            }
+            let count = *GetSidSubAuthorityCount(sid);
+            if count == 0 {
+                return Err(io::Error::other("label SID has no sub-authority"));
+            }
+            let rid = *GetSidSubAuthority(sid, u32::from(count) - 1);
+            lowest = Some(lowest.map_or(rid, |seen| seen.min(rid)));
+        }
+    }
+    Ok(lowest.unwrap_or(SECURITY_MANDATORY_MEDIUM_RID as u32))
+}
+
+/// The current process's TOKEN_USER, in a buffer for [`user_sid`].
+fn current_user() -> io::Result<Vec<u64>> {
+    let mut raw = null_mut();
+    // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no
+    // closing; the token handle is owned by `Handle`.
+    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) };
+    check(ok, "OpenProcessToken(self)")?;
+    let token = Handle::new(raw).ok_or_else(|| last_error("OpenProcessToken(self)"))?;
+    token_information(&token, TokenUser)
+}
+
+/// The user SID inside a TOKEN_USER buffer. The SID points into `buffer`
+/// and is valid only while it lives.
+fn user_sid(buffer: &[u64]) -> PSID {
+    // SAFETY: the buffer holds a TOKEN_USER filled by GetTokenInformation.
+    unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+}
+
 /// Create a named pipe instance whose DACL grants access to the current user
 /// only. Without an explicit descriptor Windows applies a default one that
 /// also lets every account open the pipe for reading. The worker, which runs
-/// as the same user at low integrity, is still kept out by the pipe's default
-/// medium integrity label.
+/// as the same user at low integrity, is kept out by the medium label.
 pub(crate) fn create_owner_only_pipe(
     options: &ServerOptions,
     name: &str,
@@ -469,25 +622,22 @@ pub(crate) fn create_owner_only_pipe(
     }
 }
 
-/// A self-relative security descriptor with a protected DACL holding one
-/// entry: full access for the current user. Freed on drop.
+/// A self-relative security descriptor owned by the current user, with a
+/// protected DACL holding one entry, full access for that user, and a medium
+/// mandatory label that refuses lower integrity levels. Freed on drop.
 struct OwnerOnlyDescriptor(PSECURITY_DESCRIPTOR);
 
 impl OwnerOnlyDescriptor {
     fn new() -> io::Result<Self> {
-        let mut raw = null_mut();
-        // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no
-        // closing; the token handle is owned by `Handle`.
-        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) };
-        check(ok, "OpenProcessToken(self)")?;
-        let token = Handle::new(raw).ok_or_else(|| last_error("OpenProcessToken(self)"))?;
-        let buffer = token_information(&token, TokenUser)?;
-        // SAFETY: the buffer holds a TOKEN_USER whose SID points into the
-        // same buffer, which lives until the end of this function.
-        let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-        let sid_text = sid_to_string(sid)?;
+        let buffer = current_user()?;
+        let sid_text = sid_to_string(user_sid(&buffer))?;
 
-        let sddl: Vec<u16> = format!("D:P(A;;GA;;;{sid_text})")
+        // The owner is set explicitly: from an elevated token the default
+        // owner would be the Administrators group, and clients check that
+        // the pipe they open is owned by their own user. The medium label
+        // with no-read-up, no-write-up and no-execute-up keeps every
+        // process below medium integrity from opening the pipe at all.
+        let sddl: Vec<u16> = format!("O:{sid_text}D:P(A;;GA;;;{sid_text})S:(ML;;NWNRNX;;;ME)")
             .encode_utf16()
             .chain(Some(0))
             .collect();

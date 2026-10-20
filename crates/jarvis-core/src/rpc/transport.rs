@@ -1,7 +1,9 @@
 //! Platform transports for the local RPC interface: a Unix domain socket in
 //! an owner-only directory, or a Windows named pipe that only the current
 //! user can open, that refuses remote clients and that cannot be pre-created
-//! by another process.
+//! by another process. On Windows the client also checks that the pipe it
+//! opened is owned by its own user at medium integrity or above before
+//! sending anything.
 
 use std::fmt;
 use std::io;
@@ -49,7 +51,13 @@ impl fmt::Display for Endpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Peer {
     pub pid: Option<u32>,
+    /// The peer's user ID, from `SO_PEERCRED`.
+    #[cfg(unix)]
     pub uid: Option<u32>,
+    /// What the client's own token says, read by impersonating it once it
+    /// connected. `None` if it could not be read.
+    #[cfg(windows)]
+    pub token: Option<jarvis_sandbox::PipeClient>,
 }
 
 impl Peer {
@@ -215,21 +223,38 @@ mod windows {
             let fresh = jarvis_sandbox::create_owner_only_pipe(&options, &self.name)?;
             let connected = std::mem::replace(&mut self.next, fresh);
             let pid = jarvis_sandbox::named_pipe_client_pid(connected.as_raw_handle()).ok();
-            Ok((connected, Peer { pid, uid: None }))
+            let token = jarvis_sandbox::inspect_pipe_client(connected.as_raw_handle())
+                .inspect_err(|error| tracing::warn!(%error, "cannot read the RPC client's token"))
+                .ok();
+            Ok((connected, Peer { pid, token }))
         }
     }
 
+    /// Open the Core's pipe, and refuse it unless it is owned by this user
+    /// at medium integrity or above: while the Core is stopped, another
+    /// account or a low-integrity process could create a pipe under the
+    /// same name and collect what the client sends.
     pub async fn connect(endpoint: &Endpoint) -> io::Result<NamedPipeClient> {
         let Endpoint::Pipe(name) = endpoint;
-        for _ in 0..50 {
+        let mut attempts = 0;
+        let client = loop {
             match ClientOptions::new().open(name) {
-                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempts < 50 => {
+                    attempts += 1;
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                other => return other,
+                other => break other?,
             }
+        };
+        if !jarvis_sandbox::pipe_belongs_to_current_user(client.as_raw_handle())? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{name} belongs to another user or to a low-integrity process, so it is not this user's Core"
+                ),
+            ));
         }
-        ClientOptions::new().open(name)
+        Ok(client)
     }
 }
 

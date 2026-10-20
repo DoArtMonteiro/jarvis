@@ -2,10 +2,10 @@
 //!
 //! One JSON request per line, one response per line, over a local transport
 //! (see [`transport`]). Every connection is identified by the OS before any
-//! request is read: connections from the worker process (or anything in its
-//! job or process group), from a restricted token on Windows (AppContainer
-//! or below medium integrity), and connections that cannot be identified are
-//! refused and audited. Requests are size-limited, connections time out when
+//! request is read: connections from another user, from the worker process
+//! (or anything in its job or process group), from a restricted token on
+//! Windows (AppContainer or below medium integrity), and connections that
+//! cannot be identified are refused and audited. Requests are size-limited, connections time out when
 //! idle, and the number of concurrent connections is capped.
 
 pub mod client;
@@ -168,9 +168,22 @@ fn refusal(state: &RpcState, peer: &Peer) -> Option<&'static str> {
     if peer.uid != Some(jarvis_sandbox::current_uid()) {
         return Some("the client runs as a different user");
     }
-    // The pipe's DACL already keeps AppContainer processes out; this also
-    // refuses a same-user client at low integrity, and fails closed if the
-    // client cannot be inspected.
+    // The pipe's DACL already keeps other users and AppContainer processes
+    // out. This is the Core's own check of the token the client connected
+    // with, the counterpart of the user ID check on Unix.
+    #[cfg(windows)]
+    match peer.token {
+        Some(jarvis_sandbox::PipeClient::SameUser) => {}
+        Some(jarvis_sandbox::PipeClient::OtherUser) => {
+            return Some("the client runs as a different user");
+        }
+        Some(jarvis_sandbox::PipeClient::Restricted) => {
+            return Some("the client runs with a restricted token");
+        }
+        None => return Some("the client's token could not be read"),
+    }
+    // Checked through the process as well, for every request: this also
+    // fails closed if the client process cannot be inspected.
     #[cfg(windows)]
     if !matches!(jarvis_sandbox::is_restricted_process(pid), Ok(false)) {
         return Some("the client runs with a restricted token, or could not be inspected");
@@ -449,8 +462,8 @@ mod tests {
             pid: Some(std::process::id()),
             #[cfg(unix)]
             uid: Some(jarvis_sandbox::current_uid()),
-            #[cfg(not(unix))]
-            uid: None,
+            #[cfg(windows)]
+            token: Some(jarvis_sandbox::PipeClient::SameUser),
         }
     }
 
@@ -461,7 +474,7 @@ mod tests {
         assert_eq!(refusal(&state, &this_process()), None);
         let unknown = Peer {
             pid: None,
-            uid: None,
+            ..this_process()
         };
         assert!(refusal(&state, &unknown).is_some());
         #[cfg(unix)]
@@ -471,6 +484,24 @@ mod tests {
                 ..this_process()
             };
             assert!(refusal(&state, &other).is_some());
+        }
+        #[cfg(windows)]
+        for (token, reason) in [
+            (
+                Some(jarvis_sandbox::PipeClient::OtherUser),
+                "the client runs as a different user",
+            ),
+            (
+                Some(jarvis_sandbox::PipeClient::Restricted),
+                "the client runs with a restricted token",
+            ),
+            (None, "the client's token could not be read"),
+        ] {
+            let peer = Peer {
+                token,
+                ..this_process()
+            };
+            assert_eq!(refusal(&state, &peer), Some(reason));
         }
     }
 
