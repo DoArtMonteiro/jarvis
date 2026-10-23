@@ -24,7 +24,7 @@ use jarvis_protocol::{
     AuditEventKind, CONTEXT_SIZES, ChatDelta, ChatLanguage, ChatRole, ChatText, ChatTurn,
     ClipboardProposal, ConversationId, ConversationSummary, ConversationView, GovernorPhase,
     GovernorReason, InferenceState, InferenceView, MessageId, MessageStatus, ModelProfile,
-    SearchQuery, TurnStats,
+    RETENTION_DAYS, SearchQuery, TurnStats,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
@@ -99,6 +99,7 @@ struct Inner {
     last_error: Option<String>,
     load_ms: Option<u64>,
     last_stats: Option<TurnStats>,
+    warmup_x10: Option<u32>,
     turn: Option<Turn>,
     game: bool,
     /// Load again when the game ends.
@@ -160,12 +161,23 @@ pub struct Inference {
     changes: watch::Sender<u64>,
     /// The running server; held while loading or unloading.
     server: tokio::sync::Mutex<Option<server::Server>>,
+    /// Days after which conversations are deleted (0: kept). A person's
+    /// choice is stored in the chat database; the configuration is the
+    /// default.
+    retention: watch::Sender<u32>,
 }
+
+const RETENTION_KEY: &str = "retention_days";
 
 impl Inference {
     pub fn open(config: InferenceConfig, audit: Store) -> Result<Arc<Self>, InferenceError> {
         let persona = read_persona(&config)?;
         let chats = ChatStore::open(&config.chat_database)?;
+        let stored = chats.with(|conn| chat_store::setting(conn, RETENTION_KEY))?;
+        let retention_days = stored
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|days| RETENTION_DAYS.contains(days))
+            .unwrap_or(config.retention_days);
         let inner = Inner {
             phase: InferenceState::Unloaded,
             profile: ModelProfile::Primary,
@@ -178,6 +190,7 @@ impl Inference {
             last_error: None,
             load_ms: None,
             last_stats: None,
+            warmup_x10: None,
             turn: None,
             game: false,
             reload_after_game: false,
@@ -190,6 +203,7 @@ impl Inference {
             inner: Mutex::new(inner),
             changes: watch::Sender::new(0),
             server: tokio::sync::Mutex::new(None),
+            retention: watch::Sender::new(retention_days),
         }))
     }
 
@@ -227,6 +241,13 @@ impl Inference {
             last_error: inner.last_error.clone(),
             load_ms: inner.load_ms,
             last_stats: inner.last_stats.clone(),
+            retention_days: *self.retention.borrow(),
+            warmup_tokens_per_second_x10: inner.warmup_x10,
+            slow: inner.warmup_x10.is_some_and(|x10| {
+                model.gpu_layers > 0
+                    && self.config.slow_below_tokens_per_second > 0
+                    && x10 < self.config.slow_below_tokens_per_second * 10
+            }),
         }
     }
 
@@ -255,6 +276,7 @@ impl Inference {
                 inner.loaded = false;
                 inner.server_pid = None;
                 inner.server_runs = None;
+                inner.warmup_x10 = None;
             }
             let reason = if current {
                 "the model server stopped answering"
@@ -315,6 +337,12 @@ impl Inference {
                 guard.armed = false;
                 let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let endpoint = (running.port, running.key.clone());
+                // A pause or unload must not wait for the speed check.
+                let warmup_x10 = tokio::select! {
+                    measured = warm_up(endpoint.0, &endpoint.1) => measured,
+                    () = cancel.cancelled() => None,
+                };
+                self.inner().warmup_x10 = warmup_x10;
                 *slot = Some(running);
                 {
                     let mut inner = self.inner();
@@ -346,6 +374,7 @@ impl Inference {
                     let mut inner = self.inner();
                     inner.phase = InferenceState::Failed;
                     inner.server_pid = None;
+                    inner.warmup_x10 = None;
                     inner.last_error = Some(one_line(&error.to_string(), 400));
                 }
                 self.record(AuditEventKind::InferenceStopped {
@@ -412,6 +441,7 @@ impl Inference {
             inner.loaded = false;
             inner.server_pid = None;
             inner.server_runs = None;
+            inner.warmup_x10 = None;
             inner.phase = next;
         }
         if was_running {
@@ -993,26 +1023,45 @@ impl Inference {
     /// Delete conversations older than the retention period, now and then
     /// every few hours. Does nothing when retention is 0.
     pub async fn enforce_retention(self: Arc<Self>, stop: CancellationToken) {
-        let days = self.config.retention_days;
-        if days == 0 {
-            return;
-        }
+        let mut retention = self.retention.subscribe();
         loop {
-            let cutoff = now_ms() - i64::from(days) * 86_400_000;
-            match self
-                .chats
-                .call(move |conn| chat_store::delete_older_than(conn, cutoff))
-                .await
-            {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(deleted = n, days, "old conversations deleted"),
-                Err(error) => tracing::warn!(%error, "retention sweep failed"),
+            let days = *retention.borrow_and_update();
+            if days > 0 {
+                let cutoff = now_ms() - i64::from(days) * 86_400_000;
+                match self
+                    .chats
+                    .call(move |conn| chat_store::delete_older_than(conn, cutoff))
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!(deleted = n, days, "old conversations deleted");
+                        self.changed();
+                    }
+                    Err(error) => tracing::warn!(%error, "retention sweep failed"),
+                }
             }
             tokio::select! {
                 () = stop.cancelled() => return,
+                changed = retention.changed() => if changed.is_err() { return },
                 () = tokio::time::sleep(RETENTION_SWEEP) => {}
             }
         }
+    }
+
+    /// Change the retention period, remember it, and apply it at once.
+    pub async fn set_retention(&self, days: u32) -> Result<InferenceView, InferenceError> {
+        if !RETENTION_DAYS.contains(&days) {
+            return Err(InferenceError::Invalid(format!(
+                "retention must be one of {RETENTION_DAYS:?} days"
+            )));
+        }
+        self.chats
+            .call(move |conn| chat_store::set_setting(conn, RETENTION_KEY, &days.to_string()))
+            .await?;
+        self.retention.send_replace(days);
+        self.changed();
+        Ok(self.status())
     }
 
     async fn record(&self, event: AuditEventKind) {
@@ -1022,6 +1071,46 @@ impl Inference {
             .await
         {
             tracing::error!(%error, "audit write failed");
+        }
+    }
+}
+
+/// Generate a few tokens and return the speed the server reports, in tenths
+/// of a token per second. A slow result usually means part of the model is
+/// not in video memory, which the server's own checks do not see.
+async fn warm_up(port: u16, key: &str) -> Option<u32> {
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "Conta de 1 a 30, separado por vírgulas."}],
+        "max_tokens": 32,
+        "temperature": 0.0,
+        "stream": false,
+        "cache_prompt": false,
+    });
+    let body = serde_json::to_vec(&body).ok()?;
+    let request = http::Request {
+        method: "POST",
+        path: "/v1/chat/completions",
+        key,
+        body: Some(&body),
+    };
+    let measured = async {
+        let response = http::send(port, &request).await.ok()?.ok().await.ok()?;
+        let text = response.text(64 * 1024).await.ok()?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        value
+            .get("timings")?
+            .get("predicted_per_second")?
+            .as_f64()
+            .filter(|n| n.is_finite() && *n > 0.0)
+    };
+    match tokio::time::timeout(Duration::from_secs(30), measured).await {
+        Ok(Some(speed)) => {
+            tracing::info!(tokens_per_second = speed, "warm-up measured");
+            Some(tenths(speed))
+        }
+        _ => {
+            tracing::warn!("warm-up measurement failed");
+            None
         }
     }
 }

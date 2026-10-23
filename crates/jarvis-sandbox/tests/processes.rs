@@ -134,3 +134,14 @@ fn a_linux_name_is_compared_as_the_kernel_keeps_it() {
     );
     assert_eq!(shorter, None, "14 bytes is not the 15 the kernel kept");
 }
+
+#[test]
+fn a_watched_process_is_seen_to_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut child, _) = start_copy(dir.path(), &exe_name(&unique_stem()));
+    let watched = jarvis_sandbox::WatchedProcess::new(child.id()).unwrap();
+    assert!(!watched.has_exited());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(wait_until(|| watched.has_exited()));
+}
