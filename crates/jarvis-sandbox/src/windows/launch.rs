@@ -71,18 +71,19 @@ const CHILD_PROCESS_RESTRICTED: u32 = 0x01;
 /// Process mitigations, as `PROCESS_CREATION_MITIGATION_POLICY_*_ALWAYS_ON`
 /// bits. Chosen so that a stock CPython still starts. Not set:
 /// `BLOCK_NON_MICROSOFT_BINARIES` (CPython is not Microsoft-signed),
-/// `PROHIBIT_DYNAMIC_CODE` (ctypes callbacks need it), `WIN32K_SYSTEM_CALL_
-/// DISABLE` and `STRICT_HANDLE_CHECKS` (not yet validated with CPython).
+/// `PROHIBIT_DYNAMIC_CODE` (ctypes callbacks need it) and
+/// `STRICT_HANDLE_CHECKS` (not yet validated with CPython).
 const MITIGATIONS: u64 = (1 << 12) // HEAP_TERMINATE
     | (1 << 16) // BOTTOM_UP_ASLR
     | (1 << 20) // HIGH_ENTROPY_ASLR
+    | (1 << 28) // WIN32K_SYSTEM_CALL_DISABLE (no window, GDI or input system calls)
     | (1 << 32) // EXTENSION_POINT_DISABLE (AppInit DLLs, legacy hooks)
     | (1 << 48) // FONT_DISABLE (no non-system fonts)
     | (1 << 52) // IMAGE_LOAD_NO_REMOTE (no DLLs from network shares)
     | (1 << 56); // IMAGE_LOAD_NO_LOW_LABEL (no DLLs written at low integrity)
 
-pub(crate) const MITIGATION_NAMES: &str = "heap terminate, ASLR, no extension points, no \
-     non-system fonts, no remote or low-label images";
+pub(crate) const MITIGATION_NAMES: &str = "heap terminate, ASLR, no win32k system calls, no \
+     extension points, no non-system fonts, no remote or low-label images";
 
 /// The longest a launch waits for another Core's launch to finish.
 const LAUNCH_LOCK_TIMEOUT_MS: u32 = 60_000;
@@ -246,6 +247,7 @@ pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::R
     // its privileges, then let it run. Any failure kills it.
     let started = super::verify_worker_token(process.0, &sid)
         .and_then(|()| super::require_in_job(process.0, &job))
+        .and_then(|()| super::require_win32k_disabled(process.0))
         .and_then(|()| resume(&thread))
         .and_then(|()| Waiter::start(Arc::clone(&process)));
     let exit = match started {

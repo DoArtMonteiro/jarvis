@@ -995,3 +995,36 @@ fn approval_rows_are_protected_by_triggers() {
         .unwrap_err();
     assert!(error.to_string().contains("never deleted"), "{error}");
 }
+
+#[test]
+fn consuming_an_approval_hands_out_its_proof_once() {
+    use crate::session_agent::{Consent, DesktopRequest, Refusal, TargetId};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let Pending { task, approval } = pending(&store, SessionId::new(), "r1", HOUR_MS);
+    let (id, fingerprint) = (approval.approval_id, approval.fingerprint);
+    store
+        .grant_approval(id, &fingerprint, "client", now_ms())
+        .unwrap();
+    let consumed = store
+        .consume_approval(id, &fingerprint, now_ms(), &[started()])
+        .unwrap();
+    assert_eq!(consumed.approval_id(), id);
+    assert_eq!(consumed.task_id(), task.task_id);
+    assert_eq!(consumed.fingerprint(), &fingerprint);
+    // There is no second proof for the same approval.
+    assert!(matches!(
+        store.consume_approval(id, &fingerprint, now_ms(), &[started()]),
+        Err(ApprovalError::NotGranted(ApprovalStatus::Consumed))
+    ));
+    // The proof is for the tool call that was approved; it is not consent
+    // to a desktop operation.
+    let desktop = DesktopRequest::CaptureWindow {
+        target: TargetId(1),
+    };
+    assert_eq!(
+        Consent::bind(consumed, desktop).err(),
+        Some(Refusal::NotApproved)
+    );
+}

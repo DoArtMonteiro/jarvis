@@ -33,6 +33,7 @@ Measure-Command { jarvis isolation check | Out-Host }
 Expected:
 
 - `mechanism AppContainer (no capabilities) + job object + child-process policy + mitigations (...)`, the AppContainer name `JARVIS.Worker` and its package SID (`S-1-15-2-...`).
+- The mitigations include `no win32k system calls`.
 - `ui restrictions yes` on a normal desktop session. Record which terminal you used (Windows Terminal, conhost, VS Code); some start programs inside a job, which turns UI restrictions off.
 - Two grants: read+execute on your Python directory, read on `services\intelligence-python\src`.
 - Five `ok` lines: no loopback TCP, no loopback UDP (on Windows the send itself may succeed: `sent, nothing arrived`), no access to the Core's files, no access to the user's home, no child processes. Exit code 0.

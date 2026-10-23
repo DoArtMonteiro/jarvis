@@ -56,6 +56,62 @@ pub struct ApprovalRecord {
     pub reason: Option<String>,
 }
 
+/// Proof that one approval was consumed: returned by
+/// [`Store::consume_approval`] only after its transaction committed. Only the
+/// store creates one, and it cannot be cloned, so each consumed approval
+/// yields exactly one value that a later step (such as a desktop grant) can
+/// take by move.
+#[derive(Debug)]
+pub struct ConsumedApproval {
+    approval_id: ApprovalId,
+    task_id: TaskId,
+    request_id: RequestId,
+    fingerprint: Fingerprint,
+    consumed_at_ms: i64,
+}
+
+impl ConsumedApproval {
+    pub fn approval_id(&self) -> ApprovalId {
+        self.approval_id
+    }
+
+    pub fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn fingerprint(&self) -> &Fingerprint {
+        &self.fingerprint
+    }
+
+    /// The time the consumption committed, on the clock the caller passed.
+    pub fn consumed_at_ms(&self) -> i64 {
+        self.consumed_at_ms
+    }
+
+    /// For unit tests of code that takes a consumed approval, without a
+    /// database. Not compiled outside tests.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        approval_id: ApprovalId,
+        task_id: TaskId,
+        request_id: RequestId,
+        fingerprint: Fingerprint,
+        consumed_at_ms: i64,
+    ) -> Self {
+        Self {
+            approval_id,
+            task_id,
+            request_id,
+            fingerprint,
+            consumed_at_ms,
+        }
+    }
+}
+
 /// Why a decision or a consumption was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum ApprovalError {
@@ -417,14 +473,15 @@ impl Store {
     /// the call it is about to run), mark it consumed, move the task from
     /// `awaiting_confirmation` to `executing`, and record
     /// `approval_consumed` followed by `events`. Only one call can ever
-    /// succeed for a given approval.
+    /// succeed for a given approval, and only that call gets the
+    /// [`ConsumedApproval`].
     pub fn consume_approval(
         &self,
         approval_id: ApprovalId,
         fingerprint: &Fingerprint,
         now_ms: i64,
         events: &[AuditEventKind],
-    ) -> Result<(), ApprovalError> {
+    ) -> Result<ConsumedApproval, ApprovalError> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let record = load(&tx, approval_id)?.ok_or(ApprovalError::NotFound(approval_id))?;
@@ -465,7 +522,13 @@ impl Store {
             insert_event(&tx, Some(record.session_id), Some(record.task_id), event)?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(ConsumedApproval {
+            approval_id,
+            task_id: record.task_id,
+            request_id: record.request_id,
+            fingerprint: record.fingerprint,
+            consumed_at_ms: now_ms,
+        })
     }
 
     /// Expire one approval (pending or granted) and its waiting task.

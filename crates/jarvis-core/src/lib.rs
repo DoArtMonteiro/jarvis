@@ -18,5 +18,6 @@ pub mod isolation;
 pub mod policy;
 pub mod rpc;
 pub mod session;
+pub mod session_agent;
 pub mod store;
 pub mod supervisor;

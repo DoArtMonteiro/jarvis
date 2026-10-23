@@ -20,3 +20,5 @@ Short records of decisions that shape the codebase. Each one states the context,
 | [0014](0014-linux-landlock-seccomp.md) | Isolate the Linux worker with Landlock and seccomp |
 | [0015](0015-durable-jobs.md) | Durable jobs: resume what is safe, quarantine what is not (amends 0009) |
 | [0016](0016-gaming-governor.md) | A gaming governor that defers starting jobs while a configured game runs |
+| [0017](0017-session-agent-boundary.md) | Desktop access belongs to a trusted Session Agent, never to the worker (proposed; contract only) |
+| [0018](0018-windows-win32k-lockdown.md) | The Windows worker cannot make win32k system calls (amends 0013) |

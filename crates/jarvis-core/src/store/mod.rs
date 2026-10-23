@@ -47,7 +47,7 @@ const MIGRATIONS: &[Migration] = &[
 mod approvals;
 mod jobs;
 
-pub use approvals::{ApprovalError, ApprovalRecord, NewApproval};
+pub use approvals::{ApprovalError, ApprovalRecord, ConsumedApproval, NewApproval};
 pub use jobs::JobRecord;
 
 const OPEN_STATES: [TaskStatus; 3] = [

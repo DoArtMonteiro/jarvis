@@ -169,3 +169,4 @@ The Core runs on Tokio. A session handles one request at a time: a worker can ne
 - Model-backed planning, speech, retrieval and memory.
 - Network access for a model, which will be a capability the Core brokers; the worker itself stays without network.
 - More than one worker, and tools beyond the three above.
+- The Session Agent for desktop operations. Only its contract exists: typed operations, class B capabilities and single-use grants in `session_agent.rs` (ADR 0017).

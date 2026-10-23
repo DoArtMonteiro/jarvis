@@ -50,7 +50,7 @@ Do not weaken these without an ADR in `docs/decisions/` and an update to the thr
 7. State changes and their audit events commit in one transaction. Audit events are append-only; terminal tasks, decided approvals and finished jobs are immutable.
 8. Decoding is strict on every interface: unknown fields, unknown types and other protocol versions are rejected.
 9. Everything the worker or a client can influence is bounded: frame and request sizes, request and error counts, tool, job and approval time, result size, buffered frames, connections, long polls, worker memory and restarts.
-10. The worker starts with a cleared environment, is never started through a shell, runs inside its OS isolation (ADRs 0013, 0014) from its first instruction with no network, no child processes and no user files beyond its runtime and source (on Windows it can also write its own AppContainer folder and read system files; ADR 0013 lists the registry and screen gaps), and is refused by the RPC server. The Core checks the isolation with a probe at start-up and does not run a worker if a check fails.
+10. The worker starts with a cleared environment, is never started through a shell, runs inside its OS isolation (ADRs 0013, 0014) from its first instruction with no network, no child processes and no user files beyond its runtime and source (on Windows it can also write its own AppContainer folder and read system files, and can make no win32k system calls; ADRs 0013 and 0018 list the registry and screen gaps), and is refused by the RPC server. The Core checks the isolation with a probe at start-up and does not run a worker if a check fails.
 11. The worker package never performs privileged operations itself (`tests/test_boundaries.py` guards this).
 
 ## Adding a tool

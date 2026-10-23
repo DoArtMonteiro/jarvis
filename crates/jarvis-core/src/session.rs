@@ -667,7 +667,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             .await?;
         self.ctx.hub.changed();
         match consumed {
-            Ok(()) => {
+            Ok(_consumed) => {
                 tracing::info!(session = %self.id, task = %task_id, approval = %approval_id, "approval consumed");
                 self.execute(task_id, call, shutdown)
                     .await
