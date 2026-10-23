@@ -1,5 +1,5 @@
 {
-  "rpc": 2,
+  "rpc": 3,
   "type": "error",
   "code": "fingerprint_mismatch",
   "message": "the approval does not match the reviewed request"

@@ -14,6 +14,7 @@ pub mod framing;
 pub mod gateway;
 pub mod governor;
 pub mod hub;
+pub mod inference;
 pub mod isolation;
 pub mod policy;
 pub mod rpc;

@@ -1,0 +1,75 @@
+# Donna: the JARVIS Core with the local model enabled (ADR 0021).
+# Copy this file (for example to %LOCALAPPDATA%\Donna\donna.toml), replace the
+# paths marked CHANGE ME with absolute paths on your machine, and start the
+# Core with `jarvis-core serve --config <that file>` or open the Donna app.
+# Relative paths are resolved against the directory that contains this file.
+
+database = "var/jarvis.db"
+
+[worker]
+# The real interpreter, not the "py" launcher or a virtual environment.
+program = "python"                                      # CHANGE ME if needed
+args = ["-m", "jarvis_worker"]
+cwd = "CHANGE ME: <repository>/services/intelligence-python/src"
+handshake_timeout_ms = 5000
+memory_limit_mb = 512
+
+[fixtures]
+root = "CHANGE ME: <repository>/tests/fixtures/files"
+
+[workspace]
+root = "var/workspace"
+
+[rpc]
+pipe = "donna"
+allow_shutdown = true
+
+[governor]
+# While one of these runs, the model server is stopped so the game has the
+# GPU, and queued jobs wait (ADR 0016).
+enabled = true
+processes = ["cs2.exe"]
+poll_ms = 2000
+resume_delay_ms = 15000
+
+[inference]
+# llama.cpp's llama-server (a Vulkan build for AMD GPUs).
+server = "CHANGE ME: <llama.cpp>/llama-server.exe"
+persona = "CHANGE ME: <repository>/config/donna/persona.md"
+chat_database = "var/donna-chat.db"
+# One of 4096, 8192, 16384, 32768.
+context_size = 16384
+max_reply_tokens = 1024
+# Penalty on words the reply already used (0.0 to 2.0). Higher values made a
+# 9B model wander and invent; 0.3 keeps replies varied without that.
+presence_penalty = 0.3
+threads = 8
+# "unload" stops the model while a game runs; "fallback" switches to the
+# [inference.fallback] model.
+on_game = "unload"
+# Delete conversations not updated for this many days; 0 keeps them until
+# you delete them.
+retention_days = 0
+load_on_start = true
+
+[inference.primary]
+name = "Huihui Qwen3.5 9B abliterated · Q5_K_M"
+path = "CHANGE ME: <models>/Huihui-Qwen3.5-9B-abliterated.Q5_K_M.gguf"
+# mradermacher/Huihui-Qwen3.5-9B-abliterated-GGUF at revision
+# 9f646d7eda193ddf2348134f3bff3d49eed7a2c6.
+sha256 = "946072b16f5d672e60357410f900888f6522b3ae49f241b5bf2142cb89637fb6"
+gpu_layers = 999
+
+[inference.fallback]
+name = "Huihui Qwen3.5 9B abliterated · Q4_K_M (CPU)"
+path = "CHANGE ME: <models>/Huihui-Qwen3.5-9B-abliterated.Q4_K_M.gguf"
+sha256 = "ea1858ef4dc4b648b8dbb44612962a0333e945060dd0545ac0f28d7c4416e4b3"
+gpu_layers = 0
+
+[policy]
+"system.info" = "allow"
+"filesystem.read.fixture" = "allow"
+"workspace.write" = "require_confirmation"
+"session_agent.healthcheck" = "require_confirmation"
+# Opted in: every clipboard write is shown in full and needs its own approval.
+"desktop.clipboard.write" = "require_confirmation"

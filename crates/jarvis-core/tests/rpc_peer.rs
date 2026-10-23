@@ -37,6 +37,7 @@ fn rpc_state(dir: &std::path::Path, pipe: &str) -> RpcState {
         shutdown: CancellationToken::new(),
         started: Instant::now(),
         core_version: "test",
+        inference: None,
     }
 }
 

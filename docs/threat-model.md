@@ -1,6 +1,6 @@
 # Threat model
 
-This document defines what JARVIS protects, where the trust boundaries are, and which controls exist today. It covers the Phase 3 system: a long-lived Rust Core that supervises one Python worker isolated by the operating system, executes typed tools under a capability policy, asks a person before any class B action, and serves local clients over RPC. It was written before any model integration, and it is the reference for every new tool.
+This document defines what JARVIS protects, where the trust boundaries are, and which controls exist today. It covers a long-lived Rust Core that supervises one Python worker isolated by the operating system, executes typed tools under a capability policy, asks a person before any class B action, serves local clients over RPC, and brokers a local language model that can converse but has no tools (ADR 0021). It is the reference for every new tool.
 
 Each threat lists its current mitigation and the test that proves it, or states plainly that the mitigation is planned.
 
@@ -18,10 +18,13 @@ Each threat lists its current mitigation and the test that proves it, or states 
 |  -> policy -> [approval] -> Tool Gateway          |
 |  SQLite: jobs, tasks, approvals, audit_events     |
 |  supervisor: spawn, contain, restart, kill        |
+|  inference: conversations, model-server broker    |
 +--------------------------------------------------+
-        ^  stdio pipe, line-delimited JSON
-        |  (the worker's only channel to the Core)
-        v
+   |  loopback HTTP, key made per start   ^  stdio pipe, line-delimited
+   |  (text in, text out, no tools)       |  JSON (the worker's only
+   v                                      v  channel to the Core)
+ model server (llama.cpp): trusted helper with the
+ user's token, kill-on-close job, cleared environment
 +==================================================+
 | OS isolation boundary, checked at Core start-up   |
 |  Windows: AppContainer (no capabilities), job,    |
@@ -32,7 +35,7 @@ Each threat lists its current mitigation and the test that proves it, or states 
 | |  reads its runtime and source (+ known gaps) | |
 | |  no user files, no processes                 | |
 | |  no network (by design)                      | |
-| |  deterministic planner today; models later   | |
+| |  deterministic planner; no model             | |
 | +----------------------------------------------+ |
 +==================================================+
 ```
@@ -50,6 +53,8 @@ Each threat lists its current mitigation and the test that proves it, or states 
 | The approval channel | Whoever can approve can trigger class B actions | Local RPC, same user only, worker refused |
 | User identity | Hostname, username, account names | `system.info` deliberately omits them |
 | The Core's own state | Policy, config, audit log, task and approval history | Not reachable through the worker protocol or the RPC interface |
+| Conversations | What the person said to the assistant and what it answered: personal text, possibly pasted e-mails or documents | Stored in their own database file, separate from the audit log so that they can be deleted. Readable through the RPC interface by any same-user client; sent to the model server and nowhere else. Never written to the audit log (ADR 0021) |
+| The model files | Weights the person chose to trust | Pinned by SHA-256 in the configuration; the Core refuses a file that does not match |
 
 ## Actors and trust levels
 
@@ -57,7 +62,8 @@ Each threat lists its current mitigation and the test that proves it, or states 
 | --- | --- | --- |
 | Person at the machine | Trusted | Owns the machine, writes the config and policy, decides on approvals |
 | Local client (CLI) | Trusted as the person | Any process of the same user that can open the RPC endpoint, except the worker |
-| Model (future) | Untrusted | Its output is data. It may be steered by content it reads (prompt injection) |
+| Model output | Untrusted | Its output is data. It can be steered by anything in its context, including text a person pastes (prompt injection). It is stored and shown as text and never parsed for instructions, apart from one optional suggestion a person must accept (see "The local model") |
+| Model server (llama.cpp) | Trusted, bounded | A large C++ program the Core starts from a configured path, with a cleared environment, no child processes and a memory limit, under a kill-on-close job. It runs with the user's token and is not isolated from the user, because it needs the GPU. It listens on loopback with a key made for that start. The Core treats what it returns as untrusted (ADR 0021) |
 | Python worker | Untrusted | Its requests are validated as if hostile, and the OS isolates it from the user's files, the Core's data, the network and other processes. It keeps its runtime, its source and its stdio; on Windows it can also read what Windows opens to every AppContainer (see known gaps) |
 | Rust Core | Trusted | The only component that decides and executes |
 | Session Agent | Trusted, bounded | A process of the user at medium integrity that the Core starts and talks to over pipes only the Core holds. It performs an operation only under a single-use grant the Core issued after a person approved that exact request, and has two operations: a synthetic health check and writing approved text to the clipboard (ADRs 0017, 0019, 0020) |
@@ -67,12 +73,13 @@ Each threat lists its current mitigation and the test that proves it, or states 
 
 ## Trust boundaries
 
-1. **Model → worker.** Model output never becomes code. This boundary does not exist yet in code because no model is integrated.
+1. **Model → anything that acts.** Model output never becomes code, a tool call or a policy input. The worker never sees the model, and the model never sees the worker. The only structure the Core extracts from a reply is one clipboard suggestion, which does nothing until a person submits it as an ordinary job and approves it (ADR 0021).
 2. **Worker → Core (stdio protocol).** Every frame is size-bounded, decoded strictly, version-checked, tied to the current job and validated before it can create a task.
-3. **Client → Core (local RPC).** The OS identifies every peer before a request is read. Requests are size-bounded and decoded strictly; there are nine typed operations and none runs a tool directly.
+3. **Client → Core (local RPC).** The OS identifies every peer before a request is read. Requests are size-bounded and decoded strictly; the operations are typed and none runs a tool directly. The conversation operations never reach the policy or the worker.
 4. **Core → tools.** The Gateway calls a tool only with a typed, validated call that policy has allowed and, for class B, whose approval was consumed in the same transaction that started execution.
 5. **Worker → OS.** The worker runs inside an OS isolation boundary (ADRs 0013, 0014): it can read its interpreter and its own source and, on Windows, what Windows opens to every AppContainer (system directories, registry keys that grant "ALL APPLICATION PACKAGES", including parts of `HKEY_CURRENT_USER`; its access to the screen and keyboard state is not proven blocked). It reads no user file and no Core data. By design it has no network, cannot start or signal processes, and cannot reach the Core's RPC endpoint. At every Core start, before the first worker runs, the Core checks that the boundary holds for a loopback listener (TCP and UDP), a file next to the database, the user's home and starting a process, and refuses to run a worker if any check fails.
 6. **Core → Session Agent.** The channel is the agent's stdio, created by the Core for that child: no named endpoint, no RPC operation and no worker handle reaches it. An operation is sent only for a grant made from a consumed approval of that exact call and used up before sending; every outcome is recorded with the task's final state (ADR 0019).
+7. **Core → model server.** The Core starts the server, holds its key and talks to it over loopback HTTP. The server receives conversation text and the persona and nothing else, sends back text, and is refused at the RPC interface. Its responses are bounded and read leniently, never as commands (ADR 0021).
 
 ## Security invariants
 
@@ -129,7 +136,7 @@ Status: **Implemented** means the mitigation exists in code and a test covers it
 
 | Threat | Mitigation | Status | Evidence |
 | --- | --- | --- | --- |
-| Prompt injection | Model output can only become typed requests. Policy is evaluated on derived capabilities. Class B needs a person who sees the exact arguments; class C does not exist. Residual risk: an injected model can call any class A tool, and can ask for class B actions a person might approve without reading | Partial (no model yet) | Architecture; rogue worker test |
+| Prompt injection | Model output can only become typed requests. Policy is evaluated on derived capabilities. Class B needs a person who sees the exact arguments; class C does not exist. Residual risk: an injected model can call any class A tool, and can ask for class B actions a person might approve without reading | Partial (the worker has no model; the local model has its own section below) | Architecture; rogue worker test |
 | Tool injection (invented tools such as `shell.exec`) | Closed tool set. An unknown tool creates a `rejected` task and nothing runs | Implemented | `unknown_tool_is_rejected_and_recorded` |
 | Malformed arguments | Typed argument structs that reject unknown fields and wrong types, then semantic checks | Implemented | `invalid_arguments_are_rejected_before_policy` |
 | Path traversal, absolute paths | Paths must be relative with plain components (no `..`, root, drive, device names, streams). Reads check the canonical target stays under the fixture root. Writes resolve every component beneath an open directory handle (`cap-std`), which refuses to leave the root | Implemented | `path_traversal_is_rejected_for_reads_and_writes`; `RelativePath` tests |
@@ -209,8 +216,30 @@ What a compromised worker can do when it ignores the protocol and calls the oper
 | Two Cores on one database | Exclusive lock file | Implemented | `second_core_cannot_open_same_database`; `a_second_core_cannot_use_the_same_database` |
 | Audit tampering by Core bugs | Append-only triggers with `recursive_triggers` on; immutable terminal rows | Implemented | `audit_log_is_append_only`; trigger tests |
 | Audit tampering with file access | Not addressed. Anyone with write access to the database file can rewrite it | Planned | — |
-| Log or terminal injection | Worker and client text is escaped before it reaches the wire, the audit log, the logs or the CLI | Implemented | `worker_text_in_errors_is_escaped`; `error_messages_are_sanitised` |
+| Log or terminal injection | Worker and client text is escaped before it reaches the wire, the audit log, the logs or the CLI; control and invisible characters are removed from model text as it arrives (`strip_hidden`) | Implemented | `worker_text_in_errors_is_escaped`; `error_messages_are_sanitised`; `hidden_characters_are_stripped_from_model_text` |
 | Credential leakage to the worker | Cleared environment with no config option to add variables; no inherited descriptors or handles; no readable credential files | Implemented | `the_worker_environment_is_cleared`; `only_the_given_environment_reaches_the_worker`; the descriptor and handle probes |
+
+### The local model (ADR 0021)
+
+Only present when `[inference]` is configured. The model has no tools: no tool definition is sent to it, no tool call is parsed from it, and nothing it writes reaches the policy, the approval store, the worker or the Session Agent.
+
+| Threat | Mitigation | Status | Evidence |
+| --- | --- | --- | --- |
+| Prompt injection: text the person pastes (an e-mail, a web page) tells the model to act | The model cannot act. At most a reply may carry one clipboard suggestion (`proposal`). The Core reads it only if the person's own last message, outside quoted or pasted text, asks for a copy (`asks_for_copy`), and only if the line passes the clipboard allowlist (ADR 0020). The client shows it with a button; pressing it submits an ordinary job, which policy holds for confirmation (`desktop.clipboard.write` must be opted in) and a person approves by fingerprint with the exact text shown. So an injection can at most produce a suggestion that a person sees in full and must accept twice. In the recorded evaluation the model did write a clipboard block when a pasted e-mail asked it to, and the gate suppressed it | Implemented | `only_the_persons_own_words_can_ask_for_a_copy`; `only_a_clean_clipboard_block_is_a_proposal`; the clipboard approval path (ADR 0020) |
+| Model output treated as markup or code by a client | Replies are stored and returned as plain text and the protocol has no field for markup. A client must render them as text; the desktop client renders them without HTML and never parses them for actions | Implemented in the Core; rendering is the client's duty | Protocol types |
+| Another machine or user reaches the model server | It listens on `127.0.0.1` only, on a port chosen at each start, and refuses requests without a key made for that start. Its web interface, built-in agent tools, slot endpoint and downloads are switched off | Implemented | `the_server_is_local_keyed_and_has_no_extras`; `keys_are_long_and_fresh` |
+| The key is on the server's command line | A same-user process can read it. Such a process can already use the RPC interface, so this adds no authority over the Core | Accepted | ADR 0021 |
+| The server is used to reach the Core | The Core refuses RPC connections from the server's process, as it does for the worker | Implemented | Code path (`rpc::refusal` and `Inference::is_server_process`, set from the moment the server is spawned); no automated test |
+| Environment variables switch on server features (`LLAMA_ARG_*`) | The server starts with a cleared environment holding only what Windows and the GPU driver need, and a test asserts that no `LLAMA` variable is passed | Implemented | `the_server_is_local_keyed_and_has_no_extras` |
+| A swapped or corrupted model file | The configuration pins the file's SHA-256. The Core hashes the file before its first load and refuses a mismatch; a match is remembered for that path, size and modification time. The load is recorded with the hash. A file replaced between the check and the server opening it is not detected | Partial | `inference_loaded` audit event |
+| The server consumes unbounded resources or starts programs | A job object with a commit limit, no child processes and kill-on-close; replies bounded in tokens, bytes and time; one reply at a time. The job limits are validated on Windows hardware (`windows-validation.md`) | Implemented, with that validation pending | Configuration range checks; ADR 0021 |
+| A hostile or broken server response | Responses are decoded leniently but boundedly: header, chunk, line and body sizes are capped, only the fields read are type-checked, and anything unreadable fails the reply. The text is only stored and shown as text. This is a deliberate exception to the strict-decoding invariant, because the schema is not ours | Implemented | `chunked_bodies_are_decoded_into_lines`; `malformed_chunks_are_refused`; `events_are_read_leniently_but_typed` |
+| Conversations cannot be removed | They live in their own SQLite file, not in the append-only audit database. Deleting one or all removes the rows with `secure_delete` on and truncates the write-ahead log; a test checks the files' bytes | Implemented | `deleted_text_does_not_remain_in_the_files`; `deletion_removes_messages_and_retention_removes_old_conversations` |
+| Conversations kept longer than wanted | Optional retention: conversations not updated for `retention_days` are deleted. The default keeps them until a person deletes them. Nothing is remembered between conversations | Implemented | `deletion_removes_messages_and_retention_removes_old_conversations` |
+| Conversation content in the audit log | The audit log records that the model loaded (profile, SHA-256, context size, GPU layers, load time) and why it stopped, never what anyone said | Implemented | `inference_loaded` and `inference_stopped` carry no text fields |
+| The worker reads or overwrites the conversation database or the persona | Both are protected paths in the worker's isolation: no grant may contain them | Implemented | `conversations_and_the_persona_are_protected` |
+| A game loses the GPU to the model | With the governor enabled, the Core stops the server while a configured game runs and loads it again after the resume delay. A reply being written is cancelled and kept as far as it got; new messages are refused with a reason | Implemented; GPU release is validated on Windows hardware | `windows-validation.md` |
+| Oversized or hostile client input | `ChatText` is 1 to 6000 characters with no control or invisible formatting characters; a search is one line of at most 200; every request still fits the 16 KiB frame; the cursor and the context size are range-checked | Implemented | `chat_text_allows_layout_but_not_control_or_invisible_characters`; `chat_send_with_invisible_text.json` |
 
 ### The gaming governor
 
@@ -253,6 +282,14 @@ Resuming a job keeps to the same rule. It never repeats a step whose completion 
 - **Clipboard writes are visible to every program of the user.** Once the agent writes approved text, any same-user program can read it or replace it, and clipboard managers that ignore the history and cloud exclusion formats may keep a copy. The agent never reads the clipboard, so nothing on it reaches the Core, the worker or a model. A clipboard held open by another program makes the write fail as busy, never wait (ADR 0020).
 
 - **The agent's executable is recorded, not verified.** The Core starts the configured program, or `jarvis-session-agent` next to its own executable, and records the SHA-256 of what it started in `session_agent_started`. It resolves links and junctions in the path first, then on Windows holds the file open without write or delete sharing from the hash until the process exists, so the file cannot change in between; renaming a directory on the resolved path could still redirect the start. On Linux the file can change between the hash and the start. A same-user process can still replace the file before the Core opens it, and the Core has no trusted value to compare against: the record supports checking after the fact, not prevention. Writing the clipboard adds nothing such a process could not already do.
+- **The model server is a large, unsandboxed C++ program that runs with the user's token.** It parses model files and model output and drives a GPU driver. The Core starts it from a configured path with fixed flags, a cleared environment and a job, and gives it no input but the conversation, but a vulnerability in it would give an attacker whatever the user's account can do. It is not isolated like the worker (ADR 0021).
+- **A same-user process can read the model server's key** from its command line and talk to the server directly. That process can already use the RPC interface, so this adds no authority over the Core, but it can read or generate model text without the Core seeing it.
+- **Reply quality and accuracy are not checked.** Wrong facts, wrong spelling, wrong summaries of pasted text and misleading advice are the model's. The persona instructs it; the Core does not verify the result.
+- **Pasted text can open the request gate.** The Core removes text inside quotation marks, guillemets, angle brackets and code fences before looking for a copy request, but cannot tell unquoted pasted text from the person's own words, and earlier injected turns stay in the history. An injected proposal then appears as a suggestion; the person still has to submit it and approve its exact text.
+- **The request gate is a heuristic.** `asks_for_copy` looks for words in the person's last message that ask for a copy. A person's own phrasing can slip past it (the suggestion is then simply not offered), and text that is not recognised as quoted can fool it. The gate is a first filter; the approval, which shows the exact text, is the real control.
+- **Crisis handling is a heuristic too.** `crisis_signals` matches Portuguese and English phrases for self-harm and medical emergencies; for a match the Core writes the reply's first sentence and adds serious instructions. A crisis described in other words gets only the persona's instructions, which a small model follows less reliably. Donna is not an emergency service.
+- **Text submitted for the clipboard outlives the conversation.** It becomes a job goal and an approval argument in the audit database, which is append-only; deleting the conversation does not remove it.
+- **A Core the desktop app started keeps running if the app is killed** (for example from Task Manager). Closing the window stops it; a killed app leaves it serving until the next app start reuses it or a person stops it.
 - **CPU time is not limited.** A worker that spins wastes CPU until the job or handshake timeout ends its session.
 - **A local attacker running as the same user** can edit the config, the policy and the database, and can approve requests. JARVIS does not defend against that account. Neither does it defend against an administrator.
 - **On Unix the client does not check who owns the socket it connects to.** The socket directory must be the user's own with mode `0700`, which keeps other users from placing a socket there, but the client itself does not verify it. On Windows the client checks the pipe's owner.
@@ -264,5 +301,5 @@ Resuming a job keeps to the same rule. It never repeats a step whose completion 
 ## When to revisit this document
 
 - Before adding any tool or capability.
-- Before integrating a model, a speech pipeline or any remote access.
-- Before adding a second worker, a dashboard or any other client of the RPC interface.
+- Before giving the model tools, moving it into the worker, or integrating a speech pipeline or any remote access.
+- Before adding a second worker or any other client of the RPC interface.

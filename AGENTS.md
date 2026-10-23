@@ -35,7 +35,9 @@ cargo run -p jarvis-core -- approvals list --config config/jarvis.example.toml
 cargo run -p jarvis-core -- audit --config config/jarvis.example.toml
 ```
 
-CI runs all of the above on every pull request. Rust tests also run on Windows. Windows behaviour that CI cannot prove is listed in `docs/windows-validation.md`. On Linux the tests need a kernel with Landlock enabled; on Windows, a real `python.exe` (not the `py` launcher or a virtual environment).
+With `[inference]` configured (`config/donna.example.toml`, which needs a local model server and model file), `cargo run -p jarvis-core -- chat "hello" --config <that file>` talks to the local model. CI does not run it.
+
+CI runs the checks above on every pull request. Rust tests also run on Windows. Windows behaviour that CI cannot prove is listed in `docs/windows-validation.md`. On Linux the tests need a kernel with Landlock enabled; on Windows, a real `python.exe` (not the `py` launcher or a virtual environment).
 
 ## Invariants
 
@@ -84,4 +86,4 @@ This repository is public. Write for an engineer reading it for the first time.
 
 ## Out of scope for now
 
-Model routing, voice, remote access, wake-on-LAN, browser automation, personal application integrations, memory, a WASM plugin runtime, shell execution and deployment. See `docs/decisions/0006-defer-ui-voice-integrations.md`.
+Model routing, model-backed planning or tools for the model, voice, remote access, wake-on-LAN, browser automation, personal application integrations, memory, a WASM plugin runtime, shell execution and deployment. See `docs/decisions/0006-defer-ui-voice-integrations.md`; ADR 0021 amends it for the model-backed conversation and the desktop client only.

@@ -6,6 +6,9 @@ members = [
     "crates/jarvis-sandbox",
     "crates/jarvis-core",
 ]
+# The desktop app builds on its own (Tauri and WebView2 are not needed to
+# build or test the Core).
+exclude = ["apps/donna/src-tauri"]
 
 [workspace.package]
 version = "0.2.0"
@@ -36,7 +39,7 @@ tokio-util = "0.7"
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-uuid = { version = "1", features = ["v7", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 windows-sys = "0.61"
 
 [workspace.lints.rust]

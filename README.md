@@ -2,7 +2,7 @@
 
 A local-first agent runtime with a Rust execution core, typed capabilities and Python intelligence workers.
 
-**Status:** Phase 3. A long-lived Rust Core supervises a Python worker that the operating system isolates (an AppContainer on Windows, Landlock and seccomp on Linux), executes typed tools under a capability policy, asks a person before any action with side effects, and records every decision in SQLite. Local clients use a small typed RPC interface. Tested on Linux and Windows. There is no language model, UI, voice or personal integration yet.
+**Status:** Phase 3. A long-lived Rust Core supervises a Python worker that the operating system isolates (an AppContainer on Windows, Landlock and seccomp on Linux), executes typed tools under a capability policy, asks a person before any action with side effects, and records every decision in SQLite. Local clients use a small typed RPC interface. Tested on Linux and Windows. A local language model can converse through the Core, with no tools and no authority, and a desktop app is an RPC client for it (ADR 0021). There is no model-backed planning, voice or personal integration yet.
 
 ## Why it exists
 
@@ -41,11 +41,12 @@ JARVIS starts from the opposite end: the model never gets operating system acces
 
 | Component | Language | Role |
 | --- | --- | --- |
-| `crates/jarvis-protocol` | Rust | Worker protocol v2 and local RPC v1: closed tool and capability sets, strict decoding |
-| `crates/jarvis-core` | Rust | Daemon, RPC server, policy, approvals, Tool Gateway, session, SQLite store, supervision, CLI |
+| `crates/jarvis-protocol` | Rust | Worker protocol v2 and local RPC v3: closed tool and capability sets, conversation types, strict decoding |
+| `crates/jarvis-core` | Rust | Daemon, RPC server, policy, approvals, Tool Gateway, session, SQLite store, supervision, local model broker and conversation store, CLI |
 | `crates/jarvis-tools` | Rust | First-party tools behind a `ToolExecutor` trait |
 | `crates/jarvis-sandbox` | Rust | Starts the worker inside its OS isolation; the only crate with `unsafe` code |
 | `services/intelligence-python` | Python | Worker: protocol client, job loop and a deterministic planner (standard library only) |
+| `apps/donna` | Tauri 2 | Desktop client for conversations: an RPC client with no policy or state of its own |
 
 Details: [architecture](docs/architecture.md), [protocols](docs/protocol.md), [threat model](docs/threat-model.md), [decisions](docs/decisions/README.md), [Windows validation](docs/windows-validation.md).
 
@@ -71,12 +72,12 @@ The limits are stated plainly in the [threat model](docs/threat-model.md). The w
 - SQLite store with migrations, jobs, tasks, approvals, an append-only audit log, replay protection and crash recovery. A job whose worker or Core stopped is resumed without repeating a recorded step, or quarantined when a step's outcome is unknown (ADR 0015).
 - Optional gaming governor (off by default): while a configured process runs, the Core does not start queued jobs; running jobs are not touched. It reads only the process list, holds when it cannot tell, never releases because of time, and shows its state in `health` and the audit log (ADR 0016).
 - Python worker with a job loop and a deterministic planner.
+- Optional local model (ADR 0021): the Core starts a llama.cpp server as a trusted helper (loopback only, per-start key, cleared environment, job-bounded, model pinned by SHA-256) and streams replies to RPC clients (`jarvis-core chat`, or the desktop app). The model has no tools and its output is never parsed for actions; the one exception is a clipboard suggestion that appears only when the person asked for a copy, and that still needs the person to submit it and approve the exact text. Conversations are stored in their own database, deletable, never in the audit log. With the governor on, the model is unloaded while a game runs. CI cannot run a model or a GPU; that part is validated on Windows hardware, and reply quality is the model's, not the Core's.
 
 ## Planned
 
-- A TypeScript dashboard on the RPC interface.
-- Model-backed planning in the Python worker, then speech and retrieval.
-- Network access for models only through the Core, as a brokered capability; the worker itself stays without network.
+- Model-backed planning, then speech and retrieval. The worker keeps no network and no model.
+- A dashboard for jobs and approvals on the RPC interface.
 - More tools, each added through the threat model first.
 
 ## Stack
@@ -112,6 +113,8 @@ jarvis jobs
 jarvis audit
 jarvis shutdown
 ```
+
+To talk to a local model, copy the `[inference]` sections of `config/donna.example.toml`, set the server, model, persona and SHA-256 for your files, and run `jarvis chat "hello"` against a running Core.
 
 The write waits for a person. `approvals list` shows exactly what would run:
 
@@ -160,6 +163,7 @@ The Rust suite covers the request pipeline and every refusal path, approvals (gr
 
 ```
 crates/            jarvis-protocol, jarvis-core, jarvis-tools, jarvis-sandbox
+apps/              donna (desktop client)
 services/          intelligence-python (the worker)
 config/            example configuration
 docs/              architecture, protocols, threat model, decisions, Windows validation

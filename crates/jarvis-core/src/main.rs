@@ -11,9 +11,9 @@ use jarvis_core::rpc::client::Client;
 use jarvis_core::store::Store;
 use jarvis_core::{daemon, isolation};
 use jarvis_protocol::{
-    ApprovalId, ApprovalStatus, ApprovalView, Fingerprint, Goal, GovernorPhase, GovernorReason,
-    GovernorView, HealthReport, JobId, JobStatus, JobView, RpcError, RpcRequest, RpcResponse,
-    Summary, TaskId,
+    ApprovalId, ApprovalStatus, ApprovalView, ChatLanguage, ChatText, ConversationId, Fingerprint,
+    Goal, GovernorPhase, GovernorReason, GovernorView, HealthReport, JobId, JobStatus, JobView,
+    MessageStatus, RpcError, RpcRequest, RpcResponse, Summary, TaskId,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -97,6 +97,21 @@ enum Command {
         config: ConfigArg,
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send one message to the local model and print the reply as it is
+    /// written (ADR 0021).
+    Chat {
+        #[command(flatten)]
+        config: ConfigArg,
+        message: String,
+        /// Continue this conversation instead of starting one.
+        #[arg(long)]
+        conversation: Option<ConversationId>,
+        #[arg(long, value_enum, default_value_t = Language::PtPt)]
+        language: Language,
+        /// Print the final reply and its measurements as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -414,6 +429,13 @@ fn client_command(command: Command) -> anyhow::Result<bool> {
                 timeout,
                 json,
             } => submit(&config.config, goal, wait.then_some(*timeout), json).await,
+            Command::Chat {
+                config,
+                message,
+                conversation,
+                language,
+                json,
+            } => chat(&config.config, &message, conversation, language, json).await,
             Command::Job {
                 config,
                 job_id,
@@ -475,6 +497,103 @@ fn client_command(command: Command) -> anyhow::Result<bool> {
             }
         }
     })
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Language {
+    PtPt,
+    En,
+    Auto,
+}
+
+async fn chat(
+    config_path: &Path,
+    message: &str,
+    conversation: Option<ConversationId>,
+    language: Language,
+    json: bool,
+) -> anyhow::Result<bool> {
+    let text = ChatText::try_from(message.to_owned()).map_err(anyhow::Error::msg)?;
+    let language = match language {
+        Language::PtPt => ChatLanguage::PtPt,
+        Language::En => ChatLanguage::En,
+        Language::Auto => ChatLanguage::Auto,
+    };
+    let mut client = connect(config_path).await?;
+    let turn = match client
+        .call(&RpcRequest::ChatSend {
+            conversation_id: conversation,
+            text,
+            language,
+        })
+        .await?
+    {
+        RpcResponse::ChatTurn(turn) => turn,
+        other => return Err(unexpected(other)),
+    };
+    let mut cursor = 0;
+    let mut stdout = std::io::stdout();
+    loop {
+        let delta = match client
+            .call(&RpcRequest::ChatPoll {
+                turn_id: turn.turn_id,
+                cursor,
+                wait_ms: 30_000,
+            })
+            .await?
+        {
+            RpcResponse::ChatDelta(delta) => delta,
+            other => return Err(unexpected(other)),
+        };
+        cursor = delta.next_cursor;
+        if !json {
+            write!(stdout, "{}", delta.text)?;
+            stdout.flush()?;
+        }
+        if delta.status.is_final() {
+            if json {
+                let view = match client
+                    .call(&RpcRequest::GetConversation {
+                        conversation_id: turn.conversation_id,
+                    })
+                    .await?
+                {
+                    RpcResponse::Conversation(view) => view,
+                    other => return Err(unexpected(other)),
+                };
+                let reply = view.messages.iter().find(|m| m.message_id == turn.turn_id);
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "conversation_id": turn.conversation_id,
+                        "turn_id": turn.turn_id,
+                        "status": delta.status,
+                        "error": delta.error,
+                        "reply": reply,
+                    })
+                );
+            } else {
+                writeln!(stdout)?;
+                if let Some(error) = &delta.error {
+                    eprintln!("error: {error}");
+                }
+                if let Some(stats) = &delta.stats {
+                    eprintln!(
+                        "[{} prompt tokens, {} reply tokens, first token {} ms, {:.1} tokens/s; conversation {}]",
+                        stats.prompt_tokens,
+                        stats.completion_tokens,
+                        stats.first_token_ms,
+                        f64::from(stats.tokens_per_second_x10) / 10.0,
+                        turn.conversation_id
+                    );
+                }
+                if let Some(proposal) = &delta.proposal {
+                    eprintln!("[clipboard proposal: {:?}]", proposal.as_str());
+                }
+            }
+            return Ok(delta.status == MessageStatus::Complete);
+        }
+    }
 }
 
 async fn connect(config_path: &Path) -> anyhow::Result<Client> {

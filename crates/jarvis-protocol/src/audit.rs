@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::message::Label;
 use crate::{
     AgentReport, ApprovalId, Capability, Fingerprint, GovernorReason, JobId, JobStatus,
-    PolicyDecision, ProtocolVersion, RequestId, SessionId, TaskId, TaskStatus, ToolName, WireError,
+    ModelProfile, PolicyDecision, ProtocolVersion, RequestId, SessionId, TaskId, TaskStatus,
+    ToolName, WireError,
 };
 
 /// One entry of the append-only audit log.
@@ -152,6 +153,20 @@ pub enum AuditEventKind {
     ApprovalConsumed {
         approval_id: ApprovalId,
     },
+    /// The local model server started and answers (ADR 0021). Metadata
+    /// only: conversations are never recorded in the audit log.
+    InferenceLoaded {
+        profile: ModelProfile,
+        model_sha256: String,
+        context_size: u32,
+        gpu_layers: u32,
+        load_ms: u64,
+    },
+    /// The local model server stopped: on request, for a game, at shutdown,
+    /// or because it failed.
+    InferenceStopped {
+        reason: String,
+    },
     /// The gaming governor stopped queued jobs from starting. `process` is
     /// the configured name that matched when `reason` is `game`; nothing
     /// else about the process list is recorded. Jobs already running are
@@ -249,6 +264,8 @@ impl AuditEventKind {
             Self::ApprovalDenied { .. } => "approval_denied",
             Self::ApprovalExpired { .. } => "approval_expired",
             Self::ApprovalConsumed { .. } => "approval_consumed",
+            Self::InferenceLoaded { .. } => "inference_loaded",
+            Self::InferenceStopped { .. } => "inference_stopped",
             Self::GovernorHold { .. } => "governor_hold",
             Self::GovernorReleased { .. } => "governor_released",
             Self::GovernorHoldOverdue { .. } => "governor_hold_overdue",

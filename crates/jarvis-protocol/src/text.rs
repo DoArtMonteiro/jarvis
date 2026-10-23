@@ -107,21 +107,44 @@ impl Summary {
 }
 
 /// Characters that change how text displays without being seen: bidi
-/// overrides and isolates, zero-width characters, the soft hyphen and the
-/// byte-order mark. With them, the text a person approves could read
-/// differently from the text that is used.
+/// overrides and isolates, zero-width characters, the soft hyphen, the
+/// byte-order mark, the combining grapheme joiner, line and paragraph
+/// separators, variation selectors, tag characters (which can carry hidden
+/// instructions for a model), and the letters and symbols that render as
+/// blank (the Hangul fillers and the blank Braille pattern). With them, the
+/// text a person approves could read differently from the text that is
+/// used.
 pub(crate) fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'
+            | '\u{034F}'
             | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
             | '\u{180E}'
             | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
+            | '\u{2028}'..='\u{202E}'
             | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
+            | '\u{2800}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{E0000}'..='\u{E007F}'
+            | '\u{E0100}'..='\u{E01EF}'
     )
+}
+
+/// `text` without control characters (other than newline and tab) and
+/// without the invisible characters of [`is_invisible`]. For text shown to
+/// people that comes from somewhere that cannot be made strict, such as a
+/// model's reply: it can then neither drive a terminal nor hide content.
+pub fn strip_hidden(text: &str) -> String {
+    text.chars()
+        .filter(|&c| (!c.is_control() || c == '\n' || c == '\t') && !is_invisible(c))
+        .collect()
 }
 
 /// Whether clipboard text may contain `c`: an allowlist, so that what a

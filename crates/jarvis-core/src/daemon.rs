@@ -24,6 +24,7 @@ use crate::config::{Config, SupervisorConfig};
 use crate::gateway::Gateway;
 use crate::governor::{Governor, ProcessActivity};
 use crate::hub::Hub;
+use crate::inference::{Inference, InferenceError};
 use crate::isolation::{self, IsolationError, WorkerLaunch};
 use crate::rpc::{self, Endpoint, Listener, RpcState};
 use crate::session::{SessionContext, SessionEnd, SessionError, run_session};
@@ -52,6 +53,8 @@ pub enum CoreError {
     },
     #[error(transparent)]
     Isolation(#[from] IsolationError),
+    #[error("cannot start the local model support: {0}")]
+    Inference(#[from] InferenceError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +221,28 @@ pub async fn serve_with_executor(
         let governor = Governor::new(&config.governor, store.clone(), Arc::clone(&hub), source);
         tokio::spawn(governor.run(governor_stop.clone()))
     });
+    let inference = match &config.inference {
+        None => None,
+        Some(inference_config) => match Inference::open(inference_config.clone(), store.clone()) {
+            Ok(inference) => Some(inference),
+            Err(error) => {
+                governor_stop.cancel();
+                let reason = format!("cannot start the local model support: {error}");
+                record(&store, AuditEventKind::CoreStopped { reason }).await?;
+                return Err(CoreError::Inference(error));
+            }
+        },
+    };
+    let inference_stop = shutdown.child_token();
+    let inference_tasks = inference.as_ref().map(|inference| {
+        (
+            tokio::spawn(
+                Arc::clone(inference)
+                    .follow_governor(hub.subscribe_governor(), inference_stop.clone()),
+            ),
+            tokio::spawn(Arc::clone(inference).enforce_retention(inference_stop.clone())),
+        )
+    });
     let rpc_state = Arc::new(RpcState {
         store: store.clone(),
         hub: Arc::clone(&hub),
@@ -225,6 +250,7 @@ pub async fn serve_with_executor(
         shutdown: shutdown.clone(),
         started: Instant::now(),
         core_version: CORE_VERSION,
+        inference: inference.clone(),
     });
     let rpc_stop = CancellationToken::new();
     let rpc_task = tokio::spawn(rpc::serve(rpc_state, listener, rpc_stop.clone()));
@@ -254,6 +280,15 @@ pub async fn serve_with_executor(
                 tracing::error!(%error, "could not record session_agent_stopped");
             }
         }
+    }
+
+    inference_stop.cancel();
+    if let Some((follower, retention)) = inference_tasks {
+        let _ = follower.await;
+        let _ = retention.await;
+    }
+    if let Some(inference) = &inference {
+        inference.shutdown().await;
     }
 
     governor_stop.cancel();

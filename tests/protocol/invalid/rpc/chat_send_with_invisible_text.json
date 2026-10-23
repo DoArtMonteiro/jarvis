@@ -1,0 +1,4 @@
+{
+  "frame": "{\"rpc\":3,\"type\":\"chat_send\",\"conversation_id\":null,\"text\":\"ok\u202e\",\"language\":\"pt_pt\"}",
+  "error": "malformed_frame"
+}

@@ -135,6 +135,14 @@ pub fn protected_paths(config: &Config) -> Vec<PathBuf> {
     {
         paths.push(dir.to_path_buf());
     }
+    // Conversations and the persona are the person's data (ADR 0021).
+    if let Some(inference) = &config.inference {
+        for path in [&inference.chat_database, &inference.persona] {
+            if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+                paths.push(dir.to_path_buf());
+            }
+        }
+    }
     paths
 }
 
@@ -592,6 +600,58 @@ mod tests {
             Err(IsolationError::GrantTooBroad { .. })
         ));
         assert!(launch(&config, &[]).is_ok());
+    }
+
+    #[test]
+    fn conversations_and_the_persona_are_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = r#"
+            database = "state/jarvis.db"
+            [worker]
+            program = "python3"
+            [fixtures]
+            root = "fixtures"
+            [workspace]
+            root = "workspace"
+            [inference]
+            server = "llama/llama-server"
+            persona = "persona/persona.md"
+            chat_database = "chats/donna-chat.db"
+            [inference.primary]
+            name = "model"
+            path = "models/model.gguf"
+            sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+            [policy]
+            "system.info" = "allow"
+        "#;
+        let config = crate::config::Config::from_toml(text, dir.path()).unwrap();
+        let protected = protected_paths(&config);
+        for sub in ["state", "chats", "persona"] {
+            assert!(
+                protected.contains(&dir.path().join(sub)),
+                "{sub} not protected"
+            );
+        }
+        // An interpreter kept next to the conversations would grant them.
+        let bin = dir.path().join("chats").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let program = bin.join(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python3"
+        });
+        std::fs::write(&program, b"").unwrap();
+        let worker = WorkerConfig {
+            program: program.display().to_string(),
+            args: Vec::new(),
+            cwd: Some(dir.path().join("chats")),
+            handshake_timeout: Duration::from_secs(1),
+            memory_limit_bytes: 1 << 28,
+        };
+        assert!(matches!(
+            launch(&worker, &protected),
+            Err(IsolationError::GrantTooBroad { .. })
+        ));
     }
 
     #[test]
