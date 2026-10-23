@@ -24,8 +24,9 @@ describe("safe markdown renderer", () => {
     expect(host.querySelector("b")).toBeNull();
     expect(host.textContent).toBe(source);
     // The markup is escaped in the serialised DOM, never parsed as tags.
-    expect(host.innerHTML).not.toMatch(/<img|<iframe|<b /);
-    expect(host.innerHTML).toContain("&lt;img");
+    const serialised = new XMLSerializer().serializeToString(host);
+    expect(serialised).not.toMatch(/<img|<iframe|<b /);
+    expect(serialised).toContain("&lt;img");
   });
 
   it("keeps HTML inside code spans and fences as text", () => {
