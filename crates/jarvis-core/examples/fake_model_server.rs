@@ -10,6 +10,7 @@
 //! - `SCENARIO:error` sends an error event with a multi-line message.
 //! - `SCENARIO:huge` streams more text than a reply may hold.
 //! - `SCENARIO:die` exits in the middle of the reply.
+//! - `SCENARIO:cut` closes the connection cleanly before the end marker.
 //! - anything else streams a short greeting.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -132,6 +133,10 @@ fn serve(stream: TcpStream, key: &str) {
                     return;
                 }
             }
+        }
+        "cut" => {
+            token(&mut stream, "half");
+            return;
         }
         "die" => {
             token(&mut stream, "about to");

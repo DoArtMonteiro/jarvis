@@ -272,6 +272,18 @@ fn model_output_is_untrusted_and_bounded() {
     assert!(error.contains("boom"), "{error:?}");
     assert!(!error.chars().any(char::is_control), "{error:?}");
 
+    // A stream that ends without its end marker is cut, not complete.
+    let (text, done) = chat.finish(&chat.send("SCENARIO:cut"));
+    assert_eq!(done["status"], "failed", "{done}");
+    assert!(
+        done["error"]
+            .as_str()
+            .unwrap()
+            .contains("before the reply was finished"),
+        "{done}"
+    );
+    assert_eq!(text, "half");
+
     // A reply that grows past the limit is cut and fails.
     let (text, done) = chat.finish(&chat.send("SCENARIO:huge"));
     assert_eq!(done["status"], "failed", "{done}");
