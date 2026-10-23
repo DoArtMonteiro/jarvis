@@ -200,3 +200,14 @@ def test_write_needs_a_path_and_a_colon(goal: str) -> None:
 
 def test_a_dangerous_write_path_is_passed_through_for_the_core_to_judge() -> None:
     assert plan("write ../../etc/passwd: x") == [write("../../etc/passwd", "x")]
+
+
+def test_healthcheck_asks_the_session_agent_to_echo_a_label() -> None:
+    assert plan("healthcheck ping.") == [
+        PlannedCall("session_agent.healthcheck", {"label": "ping"})
+    ]
+    assert plan("system, then HealthCheck demo") == [
+        SYSTEM_INFO,
+        PlannedCall("session_agent.healthcheck", {"label": "demo"}),
+    ]
+    assert plan("healthcheck ,") == []

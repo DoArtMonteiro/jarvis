@@ -43,26 +43,70 @@ pub fn fingerprint(
 }
 
 /// What a person needs to see to decide on a call, with every value made
-/// safe to print: control characters escaped and long text shortened.
+/// safe to print: control characters escaped and long text shortened. Every
+/// Session Agent operation states its action in words, so a person never
+/// decides on a fingerprint alone; text that may be cut in the preview also
+/// carries its size and SHA-256, which the fingerprint binds.
 pub fn describe(call: &ToolCall) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     match call {
+        ToolCall::SessionAgentHealthcheck(args) => {
+            out.insert(
+                "action".into(),
+                "Run the Session Agent's health check. It reads nothing from the desktop.".into(),
+            );
+            out.insert("label".into(), display_safe(args.label.as_str(), 64));
+        }
+        ToolCall::CaptureWindow(args) => {
+            out.insert(
+                "action".into(),
+                "Capture one image of one window (not available yet).".into(),
+            );
+            out.insert("target".into(), args.target.to_string());
+        }
+        ToolCall::ReadClipboardText(_) => {
+            out.insert(
+                "action".into(),
+                "Read the text on the clipboard (not available yet).".into(),
+            );
+        }
+        ToolCall::WriteClipboardText(args) => {
+            out.insert(
+                "action".into(),
+                "Replace the clipboard's text (not available yet).".into(),
+            );
+            describe_text(&mut out, args.text.as_str());
+        }
+        ToolCall::TypeText(args) => {
+            out.insert(
+                "action".into(),
+                "Type text into one window (not available yet).".into(),
+            );
+            out.insert("target".into(), args.target.to_string());
+            describe_text(&mut out, args.text.as_str());
+        }
         ToolCall::SystemInfo(_) => {}
         ToolCall::ReadFixture(args) => {
             out.insert("path".into(), display_safe(args.path.as_str(), 255));
         }
         ToolCall::WriteFile(args) => {
             out.insert("path".into(), display_safe(args.path.as_str(), 255));
-            out.insert("bytes".into(), args.content.len().to_string());
-            let digest: [u8; 32] = Sha256::digest(args.content.as_bytes()).into();
-            out.insert(
-                "sha256".into(),
-                Fingerprint::from_digest(&digest).as_str().to_owned(),
-            );
-            out.insert("preview".into(), display_safe(&args.content, 160));
+            describe_text(&mut out, &args.content);
         }
     }
     out
+}
+
+/// Size, SHA-256 and a display-safe preview of text a call would write or
+/// type.
+fn describe_text(out: &mut BTreeMap<String, String>, text: &str) {
+    out.insert("bytes".into(), text.len().to_string());
+    let digest: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+    out.insert(
+        "sha256".into(),
+        Fingerprint::from_digest(&digest).as_str().to_owned(),
+    );
+    out.insert("preview".into(), display_safe(text, 160));
 }
 
 /// Escape control characters and cut to `max_chars`, marking the cut.
@@ -211,6 +255,32 @@ mod tests {
         let long = describe(&write("a.txt", &"x".repeat(500)));
         assert!(long["preview"].ends_with('…'));
         assert_eq!(long["preview"].chars().count(), 161);
+    }
+
+    #[test]
+    fn a_person_never_decides_on_a_hash_alone() {
+        for call in crate::policy::tests::one_of_each() {
+            let described = describe(&call);
+            if call.is_agent_operation() {
+                let action = described.get("action").expect("an action in words");
+                assert!(!action.is_empty());
+            }
+            for value in described.values() {
+                assert!(!value.chars().any(char::is_control), "{value}");
+            }
+            match &call {
+                ToolCall::CaptureWindow(_) | ToolCall::TypeText(_) => {
+                    assert_eq!(described["target"], "window #7");
+                }
+                ToolCall::SessionAgentHealthcheck(_) => assert_eq!(described["label"], "ping"),
+                _ => {}
+            }
+            if let ToolCall::TypeText(_) | ToolCall::WriteClipboardText(_) = call {
+                assert_eq!(described["preview"], "hello");
+                assert_eq!(described["bytes"], "5");
+                assert_eq!(described["sha256"].len(), 64);
+            }
+        }
     }
 
     #[tokio::test]

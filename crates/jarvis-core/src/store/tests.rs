@@ -998,7 +998,9 @@ fn approval_rows_are_protected_by_triggers() {
 
 #[test]
 fn consuming_an_approval_hands_out_its_proof_once() {
-    use crate::session_agent::{Consent, DesktopRequest, Refusal, TargetId};
+    use jarvis_protocol::{AgentLabel, HealthcheckArgs, ToolCall};
+
+    use crate::session_agent::{Grants, Refusal};
 
     let dir = tempfile::tempdir().unwrap();
     let store = open(&dir);
@@ -1018,13 +1020,13 @@ fn consuming_an_approval_hands_out_its_proof_once() {
         store.consume_approval(id, &fingerprint, now_ms(), &[started()]),
         Err(ApprovalError::NotGranted(ApprovalStatus::Consumed))
     ));
-    // The proof is for the tool call that was approved; it is not consent
-    // to a desktop operation.
-    let desktop = DesktopRequest::CaptureWindow {
-        target: TargetId(1),
-    };
+    // The proof is for the tool call that was approved; it backs no grant
+    // for a Session Agent operation.
+    let check = ToolCall::SessionAgentHealthcheck(HealthcheckArgs {
+        label: AgentLabel::try_from("ping".to_owned()).unwrap(),
+    });
     assert_eq!(
-        Consent::bind(consumed, desktop).err(),
-        Some(Refusal::NotApproved)
+        Grants::default().issue(consumed, &check, 0, 5_000),
+        Err(Refusal::NotApproved)
     );
 }

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from jarvis_worker.protocol import (
+    AgentReceipt,
     Capability,
     Completed,
     CoreMessage,
@@ -81,6 +82,11 @@ EXPECTED_CORE: dict[str, CoreMessage] = {
         task_id="01928f5e-7c3d-7c40-ad5e-6f7a8b9cadbe",
         outcome=Completed(WriteOutcome(path="notes/today.md", bytes=9, created=True)),
     ),
+    "tool_response_completed_agent_receipt.json": ToolResponse(
+        request_id="req-0007",
+        task_id="01928f5e-7c42-7b90-a2b3-becfd0e1f2a3",
+        outcome=Completed(AgentReceipt(agent_operation="session_agent.healthcheck")),
+    ),
     "tool_response_denied.json": ToolResponse(
         request_id="req-0004",
         task_id="01928f5e-7c3e-7d50-be6f-7a8b9cadbecf",
@@ -142,6 +148,12 @@ EXPECTED_WORKER: dict[str, WorkerMessage] = {
         job_id=JOB_ID,
         tool="workspace.write_file",
         args={"path": "notes/today.md", "content": "buy milk\n"},
+    ),
+    "tool_request_session_agent_healthcheck.json": ToolRequest(
+        request_id="req-0007",
+        job_id=JOB_ID,
+        tool="session_agent.healthcheck",
+        args={"label": "ping"},
     ),
     "job_result_completed.json": JobResult(
         job_id=JOB_ID, outcome=JobOutcome.COMPLETED, summary="2 call(s): completed=2"

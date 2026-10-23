@@ -10,6 +10,10 @@ repository.workspace = true
 name = "jarvis-core"
 path = "src/main.rs"
 
+[[bin]]
+name = "jarvis-session-agent"
+path = "src/bin/session_agent.rs"
+
 [dependencies]
 jarvis-protocol.workspace = true
 jarvis-tools.workspace = true

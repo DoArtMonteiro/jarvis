@@ -71,6 +71,87 @@ pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::R
     })
 }
 
+/// Start a trusted helper (see [`crate::spawn_helper`]): the Core's own
+/// user and privileges, but a cleared environment, stdio only, its own
+/// process group, no core dumps, `no_new_privs`, and death with the Core.
+pub(crate) fn spawn_helper(command: &WorkerCommand, memory_bytes: u64) -> io::Result<Spawned> {
+    let mut cmd = tokio::process::Command::new(&command.program);
+    cmd.args(&command.args)
+        .env_clear()
+        .envs(command.env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    if let Some(cwd) = &command.cwd {
+        cmd.current_dir(cwd);
+    }
+    let parent = std::process::id();
+    let max_fd = open_file_limit();
+    // SAFETY: runs between fork and exec; only plain system calls over
+    // values prepared in the parent (prctl, getppid, setrlimit, close_range
+    // or fcntl, _exit). Nothing is allocated and no lock is taken.
+    unsafe {
+        cmd.pre_exec(move || {
+            mark_close_on_exec_from(3, max_fd);
+            #[cfg(target_os = "linux")]
+            {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != parent as libc::pid_t {
+                    libc::_exit(1);
+                }
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = parent;
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::setrlimit(libc::RLIMIT_CORE, &no_core) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let address_space = libc::rlimit {
+                rlim_cur: memory_bytes as libc::rlim_t,
+                rlim_max: memory_bytes as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &address_space) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn()?;
+    let pid = child
+        .id()
+        .ok_or_else(|| io::Error::other("helper exited before it started"))?;
+    let contained = Contained {
+        inner: Guard { pgid: pid },
+        description: "trusted helper: the user's own privileges, own process group, stdio \
+                      only, no core dumps, no_new_privs, dies with the Core"
+            .to_owned(),
+    };
+    let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    let (Some(stdin), Some(stdout), Some(stderr)) = pipes else {
+        let _ = contained.kill_all();
+        return Err(io::Error::other("helper pipes were not created"));
+    };
+    Ok(Spawned {
+        process: crate::Process {
+            inner: Process { child, pid },
+        },
+        contained,
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
 #[derive(Debug)]
 pub(crate) struct Process {
     child: tokio::process::Child,

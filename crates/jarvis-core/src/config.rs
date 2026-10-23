@@ -39,7 +39,34 @@ pub struct Config {
     pub supervisor: SupervisorConfig,
     pub rpc: RpcConfig,
     pub governor: GovernorConfig,
+    pub session_agent: SessionAgentConfig,
     pub policy: Policy,
+}
+
+/// The Session Agent (ADR 0019): a trusted helper the Core starts on first
+/// use and talks to over pipes only it holds.
+#[derive(Debug, Clone)]
+pub struct SessionAgentConfig {
+    /// The agent executable. `None` means `jarvis-session-agent` next to the
+    /// Core's own executable.
+    pub program: Option<PathBuf>,
+    /// How long the agent has to start or to answer one operation.
+    pub timeout: Duration,
+    /// Lifetime of a grant from its issue to its use.
+    pub grant_ttl: Duration,
+    /// Agent starts allowed per Core run, the first included.
+    pub max_starts: u32,
+}
+
+impl Default for SessionAgentConfig {
+    fn default() -> Self {
+        Self {
+            program: None,
+            timeout: Duration::from_secs(5),
+            grant_ttl: Duration::from_secs(10),
+            max_starts: 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -199,7 +226,18 @@ struct RawConfig {
     rpc: RawRpc,
     #[serde(default)]
     governor: RawGovernor,
+    #[serde(default)]
+    session_agent: RawSessionAgent,
     policy: BTreeMap<Capability, PolicyDecision>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSessionAgent {
+    program: Option<PathBuf>,
+    timeout_ms: Option<u64>,
+    grant_ttl_ms: Option<u64>,
+    max_starts: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -523,7 +561,39 @@ impl Config {
             )?,
         };
 
+        let agent_defaults = SessionAgentConfig::default();
+        let session_agent = SessionAgentConfig {
+            program: raw.session_agent.program.map(resolve),
+            timeout: ms(
+                "session_agent.timeout_ms",
+                raw.session_agent.timeout_ms,
+                agent_defaults.timeout,
+                100,
+                60_000,
+            )?,
+            grant_ttl: ms(
+                "session_agent.grant_ttl_ms",
+                raw.session_agent.grant_ttl_ms,
+                agent_defaults.grant_ttl,
+                100,
+                jarvis_protocol::MAX_GRANT_TTL_MS,
+            )?,
+            max_starts: within(
+                "session_agent.max_starts",
+                raw.session_agent
+                    .max_starts
+                    .unwrap_or(agent_defaults.max_starts),
+                1,
+                100,
+            )?,
+        };
+
         for (&capability, &decision) in &raw.policy {
+            if capability.is_desktop() && decision != PolicyDecision::Deny {
+                return Err(ConfigError::Invalid(format!(
+                    "policy cannot set `{capability}` to `{decision}`: desktop operations                      are not available yet, so a desktop capability can only be `deny`"
+                )));
+            }
             let ceiling = capability.class().ceiling();
             if decision < ceiling {
                 return Err(ConfigError::Invalid(format!(
@@ -544,6 +614,7 @@ impl Config {
             supervisor,
             rpc,
             governor,
+            session_agent,
             policy: Policy::new(raw.policy),
         })
     }
@@ -659,6 +730,72 @@ mod tests {
             "\"workspace.write\" = \"deny\"",
         );
         assert!(Config::from_toml(&text, Path::new(".")).is_ok());
+    }
+
+    #[test]
+    fn desktop_capabilities_can_only_be_denied() {
+        for capability in Capability::ALL.iter().filter(|c| c.is_desktop()) {
+            for decision in ["allow", "require_confirmation"] {
+                let text = format!(
+                    "{MINIMAL}\"{capability}\" = \"{decision}\"
+"
+                );
+                let error = Config::from_toml(&text, Path::new(".")).unwrap_err();
+                assert!(error.to_string().contains("desktop"), "{error}");
+            }
+            let text = format!(
+                "{MINIMAL}\"{capability}\" = \"deny\"
+"
+            );
+            assert!(Config::from_toml(&text, Path::new(".")).is_ok());
+        }
+        let text = format!(
+            "{MINIMAL}\"session_agent.healthcheck\" = \"allow\"
+"
+        );
+        assert!(Config::from_toml(&text, Path::new(".")).is_err(), "class B");
+        let text = format!(
+            "{MINIMAL}\"session_agent.healthcheck\" = \"require_confirmation\"
+"
+        );
+        assert!(Config::from_toml(&text, Path::new(".")).is_ok());
+    }
+
+    #[test]
+    fn session_agent_settings_are_bounded() {
+        let config = Config::from_toml(MINIMAL, Path::new("/etc/jarvis")).unwrap();
+        assert!(config.session_agent.program.is_none());
+        let text = MINIMAL.replace(
+            "[policy]",
+            "[session_agent]
+program = \"bin/agent\"
+grant_ttl_ms = 2000
+
+[policy]",
+        );
+        let config = Config::from_toml(&text, Path::new("/etc/jarvis")).unwrap();
+        assert_eq!(
+            config.session_agent.program.as_deref(),
+            Some(Path::new("/etc/jarvis/bin/agent"))
+        );
+        assert_eq!(config.session_agent.grant_ttl, Duration::from_secs(2));
+        for bad in [
+            "grant_ttl_ms = 60001",
+            "timeout_ms = 0",
+            "max_starts = 0",
+            "shell = true",
+        ] {
+            let text = MINIMAL.replace(
+                "[policy]",
+                &format!(
+                    "[session_agent]
+{bad}
+
+[policy]"
+                ),
+            );
+            assert!(Config::from_toml(&text, Path::new(".")).is_err(), "{bad}");
+        }
     }
 
     #[test]

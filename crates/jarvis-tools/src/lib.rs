@@ -34,6 +34,9 @@ pub enum ToolErrorKind {
     TooLarge,
     NotText,
     Io,
+    /// The call is not one of this tool set's: the Core sends Session Agent
+    /// operations to the agent, never here.
+    Unsupported,
 }
 
 impl fmt::Display for ToolErrorKind {
@@ -44,6 +47,7 @@ impl fmt::Display for ToolErrorKind {
             Self::TooLarge => "too large",
             Self::NotText => "not UTF-8 text",
             Self::Io => "I/O error",
+            Self::Unsupported => "not a first-party tool",
         })
     }
 }
@@ -108,6 +112,15 @@ impl ToolExecutor for Toolbox {
                     .write(&args.path, &args.content)
                     .await
                     .map(ToolResult::Written),
+                // Nothing is done, so the error is a true "no change".
+                ToolCall::SessionAgentHealthcheck(_)
+                | ToolCall::CaptureWindow(_)
+                | ToolCall::ReadClipboardText(_)
+                | ToolCall::WriteClipboardText(_)
+                | ToolCall::TypeText(_) => Err(ToolError::new(
+                    ToolErrorKind::Unsupported,
+                    "Session Agent operations do not run in the Core",
+                )),
             }
         })
     }

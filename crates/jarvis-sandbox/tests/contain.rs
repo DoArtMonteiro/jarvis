@@ -1040,3 +1040,207 @@ fn resident_kib(pid: u32) -> u64 {
 fn resident_kib(_pid: u32) -> u64 {
     0
 }
+
+// --- Trusted helpers (the Session Agent) ------------------------------------------------------
+
+/// A helper that waits for its input to close, as the Session Agent does.
+fn start_helper() -> Spawned {
+    jarvis_sandbox::spawn_helper(&command("import sys\nsys.stdin.read()"), MEMORY)
+        .expect("the helper did not start")
+}
+
+/// Whether process `pid` holds a handle to the same object as `handle` at the
+/// same value: duplicated out of that process and compared by the kernel.
+#[cfg(windows)]
+fn holds_handle(pid: u32, handle: std::os::windows::io::RawHandle) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
+    };
+
+    // SAFETY: plain Win32 calls on handles this function opens and closes;
+    // `handle` is a value, never dereferenced in this process.
+    unsafe {
+        let process = OpenProcess(PROCESS_DUP_HANDLE, 0, pid);
+        assert!(!process.is_null(), "OpenProcess(helper) failed");
+        let mut copy = std::ptr::null_mut();
+        let duplicated = DuplicateHandle(
+            process,
+            handle,
+            GetCurrentProcess(),
+            &mut copy,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        ) != 0;
+        let same = duplicated && CompareObjectHandles(copy, handle) != 0;
+        if duplicated {
+            CloseHandle(copy);
+        }
+        CloseHandle(process);
+        same
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_helper_inherits_only_its_stdio_handles() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    let canary = Canary::new();
+    let file = std::fs::File::open(&canary.path).unwrap();
+    let handle = file.as_raw_handle();
+    // SAFETY: marking a handle this test owns as inheritable.
+    let ok = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+    assert_ne!(ok, 0);
+
+    // Control: a child started the ordinary way inherits it.
+    let mut ordinary = std::process::Command::new(which_python())
+        .args(["-I", "-S", "-B", "-c", "import sys\nsys.stdin.read()"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(
+        holds_handle(ordinary.id(), handle),
+        "control: an ordinary child did not inherit the handle"
+    );
+    let _ = ordinary.kill();
+    let _ = ordinary.wait();
+
+    let helper = start_helper();
+    assert!(
+        !holds_handle(helper.process.id(), handle),
+        "the helper inherited a handle outside its handle list"
+    );
+}
+
+/// The helper's pipes are single-instance, already connected and owner-only:
+/// no other client can open one, whoever it runs as, and the confined worker
+/// cannot either.
+#[cfg(windows)]
+#[tokio::test]
+async fn no_one_can_join_a_helpers_channel() {
+    let _helper = start_helper();
+    let prefix = format!("jarvis-worker-{}-", std::process::id());
+    // Every pipe of this test process: the helper's and those of any worker
+    // a parallel test started. None may accept another client.
+    let attempt = format!(
+        "import os
+names = [n for n in os.listdir('//./pipe/') if n.startswith({prefix:?})]
+if len(names) < 3:
+    raise SystemExit(3)
+for name in names:
+    try:
+        open('//./pipe/' + name, 'r+b').close()
+    except OSError:
+        continue
+    raise SystemExit(0)
+raise PermissionError('every pipe refused the client')"
+    );
+    assert_eq!(
+        run_unconfined(&denial_probe(&attempt)),
+        Some(DENIED),
+        "a same-user process outside the sandbox joined a helper pipe, or none was found"
+    );
+    assert_refused(
+        "joining the helper's channel",
+        &attempt,
+        &["PermissionError", "FileNotFoundError"],
+    )
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_helper_inherits_only_its_stdio_descriptors() {
+    use std::os::fd::AsRawFd;
+
+    let canary = Canary::new();
+    let file = std::fs::File::open(&canary.path).unwrap();
+    // SAFETY: clears close-on-exec on a descriptor this test owns.
+    let cleared = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) };
+    assert_eq!(cleared, 0);
+    let holds = |pid: u32| {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .any(|target| target == canary.path)
+    };
+
+    let mut ordinary = std::process::Command::new(which_python())
+        .args(["-I", "-S", "-B", "-c", "import sys\nsys.stdin.read()"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        holds(ordinary.id()),
+        "control: an ordinary child did not inherit the descriptor"
+    );
+    let _ = ordinary.kill();
+    let _ = ordinary.wait();
+
+    let helper = start_helper();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !holds(helper.process.id()),
+        "the helper inherited a descriptor beyond its stdio"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_worker_cannot_write_to_a_helpers_input() {
+    let helper = start_helper();
+    let pid = helper.process.id();
+    assert_denied(
+        "writing to the helper's input",
+        &format!("open('/proc/{pid}/fd/0', 'wb')"),
+    )
+    .await;
+}
+
+/// Dropping the helper, as the Core does when it stops it, ends the
+/// process. (Death with the Core itself rests on the job object and
+/// `PR_SET_PDEATHSIG`, which this does not exercise.)
+#[tokio::test]
+async fn a_helper_ends_when_the_core_lets_go_of_it() {
+    let helper = start_helper();
+    let pid = helper.process.id();
+    assert!(process_exists(pid));
+    drop(helper);
+    for _ in 0..500 {
+        if !process_exists(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the helper outlived its handles");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_helper_cannot_start_a_child_process() {
+    let code = "import subprocess, sys\ntry:\n    subprocess.run([sys.executable, '-c', 'pass'], check=True)\nexcept OSError:\n    sys.exit(44)\nsys.exit(0)";
+    let mut helper = jarvis_sandbox::spawn_helper(&command(code), MEMORY).unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(60), helper.process.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(DENIED));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_worker_cannot_forge_a_helpers_replies() {
+    let helper = start_helper();
+    let pid = helper.process.id();
+    assert_denied(
+        "writing to the helper's output",
+        &format!("open('/proc/{pid}/fd/1', 'wb')"),
+    )
+    .await;
+}

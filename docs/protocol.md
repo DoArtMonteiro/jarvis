@@ -155,12 +155,31 @@ A job can be handed out again after its worker or the Core stopped. Requests are
 | `system.info` | `system.info` | A | `{}` | `os`, `os_family`, `arch`, `logical_cpus`, `core_version`, `protocol_version`, `core_uptime_ms` |
 | `filesystem.read_fixture` | `filesystem.read.fixture` | A | `{"path"}` | `path`, `bytes`, `content` |
 | `workspace.write_file` | `workspace.write` | B | `{"path", "content"}` | `path`, `bytes`, `created` |
+| `session_agent.healthcheck` | `session_agent.healthcheck` | B | `{"label"}` | `agent_operation` (a receipt) |
+| `desktop.capture_window` | `desktop.screen.observe` | B, `deny` only | `{"target"}` | none: not performable |
+| `desktop.read_clipboard_text` | `desktop.clipboard.read` | B, `deny` only | `{}` | none: not performable |
+| `desktop.write_clipboard_text` | `desktop.clipboard.write` | B, `deny` only | `{"text"}` | none: not performable |
+| `desktop.type_text` | `desktop.input.send` | B, `deny` only | `{"target", "text"}` | none: not performable |
 
 `system.info` never returns hostname, username, environment variables or paths.
 
 `path` is relative to the tool's root directory: the fixture directory for reads, the workspace for writes. It uses `/` as separator and at most 16 components of `[A-Za-z0-9._-]`, each starting with a letter or digit and not ending with `.`. Windows device names are refused. The Core resolves the path beneath a handle to the root directory, so symlinks and junctions cannot lead outside it.
 
 `workspace.write_file` creates or replaces one UTF-8 text file up to the configured size. The parent directory must already exist inside the workspace. The file is written to a temporary name and renamed into place, so a reader sees either the old or the new content, and an existing symlink or hard link at the target is replaced rather than written through. Because the capability is class B, every call needs a person's approval.
+
+`session_agent.healthcheck` is performed by the Session Agent, a separate process the Core starts (ADR 0019). `label` is 1 to 64 visible characters. The Core keeps the agent's report and answers the worker with a receipt, `{"agent_operation": "session_agent.healthcheck"}`, whatever an agent operation returns.
+
+The `desktop.*` tools are typed so that a person can be shown exactly what one would do, but none can run: the configuration may only `deny` their capabilities. `target` is a window number; `text` is at most 4096 visible characters with no invisible formatting characters, and for `desktop.type_text` no control characters at all.
+
+## Session Agent channel, version 1
+
+Between the Core and the Session Agent only, over the agent's standard input and output, which the Core creates for that one child. One JSON object per line, at most 16 KiB, every object carrying `"v": 1`; unknown fields, operations and versions are rejected.
+
+- Agent to Core, once at start: `{"type": "ready", "v": 1, "agent_version": "0.2.0"}`.
+- Core to agent: `{"type": "perform", "v": 1, "grant_id": "<approval id>", "operation": {"op": "healthcheck", "label": "ping"}, "ttl_ms": 9800}`. `healthcheck` is the only operation.
+- Agent to Core, once per `perform`: `{"type": "result", "v": 1, "grant_id": "<the same id>", "outcome": {"status": "done", "report": {"label": "ping", "performed": 1}}}`, or an outcome of `{"status": "refused", "reason": "replayed_grant" | "expired"}`.
+
+Anything else from the agent, or no answer within the configured time, ends the agent; see ADR 0019 for how each outcome is recorded.
 
 ## Local RPC, version 2
 

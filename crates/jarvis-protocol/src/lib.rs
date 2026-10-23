@@ -9,6 +9,7 @@
 //! tool and its arguments; it never names capabilities. Capabilities are
 //! derived by the Core from the typed [`ToolCall`].
 
+mod agent;
 mod audit;
 mod capability;
 mod error;
@@ -19,6 +20,13 @@ mod task;
 mod text;
 mod tools;
 
+pub use agent::{
+    AgentDecodeError, AgentHealth, AgentLabel, AgentOperation, AgentOutcome, AgentReceipt,
+    AgentRefusal, AgentToCore, AgentVersion, CaptureWindowArgs, ClipboardText, CoreToAgent,
+    HealthcheckArgs, MAX_AGENT_FRAME_BYTES, MAX_GRANT_TTL_MS, ReadClipboardTextArgs, TypeTextArgs,
+    TypedText, WindowTarget, WriteClipboardTextArgs, decode_agent_to_core, decode_core_to_agent,
+    encode_agent_frame,
+};
 pub use audit::{AuditEvent, AuditEventKind};
 pub use capability::{ActionClass, Capability, UnknownCapability};
 pub use error::{ErrorCode, WireError};

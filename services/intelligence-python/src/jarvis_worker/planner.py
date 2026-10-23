@@ -10,7 +10,13 @@ import re
 from dataclasses import dataclass
 from typing import Protocol
 
-from jarvis_worker.protocol import TOOL_READ_FIXTURE, TOOL_SYSTEM_INFO, TOOL_WRITE_FILE, JsonValue
+from jarvis_worker.protocol import (
+    TOOL_READ_FIXTURE,
+    TOOL_SESSION_AGENT_HEALTHCHECK,
+    TOOL_SYSTEM_INFO,
+    TOOL_WRITE_FILE,
+    JsonValue,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +41,7 @@ class Planner(Protocol):
 _SCAN = re.compile(
     r"\bwrite\s+(?P<write_path>[^\s:]+):\s?(?P<content>.*)"
     r"|\bread\s+(?P<target>\S+)"
+    r"|\bhealthcheck\s+(?P<check_label>\S+)"
     r"|\b(?P<topic>system|runtime|machine|environment)\b",
     re.IGNORECASE,
 )
@@ -54,6 +61,9 @@ class StubPlanner:
       (everything after the colon and one optional space, to the end of the goal) to
       ``<path>``. Because it takes the rest of the goal, a write is always the last call. Policy
       decides whether a person must approve it; the planner does not know or care.
+    - ``healthcheck <label>`` yields one ``session_agent.healthcheck`` call asking the Session
+      Agent to echo ``<label>`` (the next word, without trailing ``,.;:!?``). It touches no
+      desktop data; it exercises the approval and Session Agent path end to end.
     - A goal that matches nothing yields an empty plan.
     """
 
@@ -67,6 +77,10 @@ class StubPlanner:
                 calls.append(
                     PlannedCall(TOOL_WRITE_FILE, {"path": write_path, "content": match["content"]})
                 )
+            elif (check_label := match.group("check_label")) is not None:
+                label = check_label.rstrip(_TRAILING_PUNCTUATION)
+                if label:
+                    calls.append(PlannedCall(TOOL_SESSION_AGENT_HEALTHCHECK, {"label": label}))
             elif target is not None:
                 path = target.rstrip(_TRAILING_PUNCTUATION)
                 if path:

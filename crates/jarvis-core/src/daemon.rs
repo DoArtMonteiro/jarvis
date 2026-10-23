@@ -27,6 +27,7 @@ use crate::hub::Hub;
 use crate::isolation::{self, IsolationError, WorkerLaunch};
 use crate::rpc::{self, Endpoint, Listener, RpcState};
 use crate::session::{SessionContext, SessionEnd, SessionError, run_session};
+use crate::session_agent::{ProcessLauncher, SessionAgent};
 use crate::store::{Store, StoreError};
 use crate::supervisor;
 
@@ -244,8 +245,16 @@ pub async fn serve_with_executor(
         job_timeout: config.supervisor.job_timeout,
         core_version: CORE_VERSION,
         hub: Arc::clone(&hub),
+        session_agent: session_agent(config),
     };
     let supervised = supervise(config, &launch, &ctx, &shutdown).await;
+    if let Some(agent) = &ctx.session_agent {
+        for event in agent.stop("Core shutdown").await {
+            if let Err(error) = record(&store, event).await {
+                tracing::error!(%error, "could not record session_agent_stopped");
+            }
+        }
+    }
 
     governor_stop.cancel();
     if let Some(task) = governor {
@@ -270,6 +279,26 @@ pub async fn serve_with_executor(
     record(&store, AuditEventKind::CoreStopped { reason }).await?;
     tracing::info!("core stopped");
     Ok(report)
+}
+
+/// The Session Agent the Core starts on first use (ADR 0019). Without a
+/// program it can locate, every Session Agent operation is refused before
+/// its approval is used.
+fn session_agent(config: &Config) -> Option<Arc<SessionAgent>> {
+    let launcher = match &config.session_agent.program {
+        Some(program) => ProcessLauncher::new(program.clone()),
+        None => match ProcessLauncher::beside_current_exe() {
+            Ok(launcher) => launcher,
+            Err(error) => {
+                tracing::warn!(%error, "no Session Agent: its operations will be refused");
+                return None;
+            }
+        },
+    };
+    Some(Arc::new(SessionAgent::new(
+        Arc::new(launcher),
+        &config.session_agent,
+    )))
 }
 
 /// Build the worker's launch and run the isolation probe under it. The

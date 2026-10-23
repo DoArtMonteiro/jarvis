@@ -162,11 +162,12 @@ The Core runs on Tokio. A session handles one request at a time: a worker can ne
 | Gaming governor | The state machine as a pure function; the loop against a scripted source on a paused clock (exact release time, one alert, errors, failing audit writes); the gate in a real session (held jobs are not claimed, no attempt, no timer, wake on release, start-up); the real binary with a stand-in process started and killed | `crates/jarvis-core/src/governor/machine.rs`, `tests/governor.rs`, `tests/process.rs` |
 | Process detection | The production function finds the test binary's own name, a stand-in copied to a unique name while it runs and not after it exits | `crates/jarvis-sandbox/tests/processes.rs` |
 | Worker | Protocol client, job loop, planner, contract fixtures, a guard that the package performs no privileged operations | `services/intelligence-python/tests` |
+| Session Agent | Grants as pure functions (exact binding, single use, expiry, revocation, clock, bounds, concurrency); the agent loop; the full path in a real session with the real agent binary; fault injection after dispatch (exit, hang, wrong grant, garbage, refusal, no start, shutdown) and job quarantine; the helper inherits no stray handle or descriptor and its pipes accept no other client | `crates/jarvis-core/src/session_agent.rs`, `src/session_agent/serve.rs`, `tests/session.rs`, `crates/jarvis-sandbox/tests/contain.rs` |
 
 ## Not built yet
 
 - Dashboard and any client other than the CLI.
 - Model-backed planning, speech, retrieval and memory.
 - Network access for a model, which will be a capability the Core brokers; the worker itself stays without network.
-- More than one worker, and tools beyond the three above.
-- The Session Agent for desktop operations. Only its contract exists: typed operations, class B capabilities and single-use grants in `session_agent.rs` (ADR 0017).
+- More than one worker.
+- Any desktop operation in the Session Agent. The agent, its channel, single-use grants and their audit exist for one synthetic health check (ADR 0019); desktop operations are typed, describable and always denied.

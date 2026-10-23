@@ -177,6 +177,25 @@ pub fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::Result<S
     platform::spawn(command, confinement)
 }
 
+/// Start a trusted helper of the Core, such as the Session Agent (ADR 0019).
+///
+/// A helper is not isolated from the user: it runs with the Core's own
+/// token. What this adds is control over what reaches it and how long it
+/// lives. It gets a cleared environment apart from `command.env`, inherits
+/// only the three stdio pipes the Core holds the other ends of (an explicit
+/// handle list on Windows; every other descriptor close-on-exec on Unix),
+/// cannot start child processes (Windows) and dies with the Core (a
+/// kill-on-close job on Windows, `PR_SET_PDEATHSIG` on Linux).
+pub fn spawn_helper(command: &WorkerCommand, memory_bytes: u64) -> io::Result<Spawned> {
+    if !command.program.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a helper program must be an absolute path",
+        ));
+    }
+    platform::spawn_helper(command, memory_bytes)
+}
+
 /// A running worker process. Dropping it kills the process if it is still
 /// running.
 #[derive(Debug)]

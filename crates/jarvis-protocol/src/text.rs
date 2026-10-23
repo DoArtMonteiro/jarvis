@@ -106,6 +106,51 @@ impl Summary {
     }
 }
 
+/// Characters that change how text displays without being seen: bidi
+/// overrides and isolates, zero-width characters, the soft hyphen and the
+/// byte-order mark. With them, the text a person approves could read
+/// differently from the text that is used.
+pub(crate) fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Check text a person will approve: `min..=max` characters, no invisible
+/// formatting characters, and no control characters except newline and tab
+/// when `allow_layout` is set.
+pub(crate) fn check_visible(
+    kind: &str,
+    value: &str,
+    min: usize,
+    max: usize,
+    allow_layout: bool,
+) -> Result<(), String> {
+    let chars = value.chars().count();
+    if !(min..=max).contains(&chars) {
+        return Err(format!("{kind} must be {min} to {max} characters"));
+    }
+    for c in value.chars() {
+        if c.is_control() && !(allow_layout && (c == '\n' || c == '\t')) {
+            return Err(format!("{kind} must not contain control characters"));
+        }
+        if is_invisible(c) {
+            return Err(format!(
+                "{kind} must not contain invisible formatting characters"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

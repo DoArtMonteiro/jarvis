@@ -301,6 +301,111 @@ pub(crate) fn spawn(command: &WorkerCommand, confinement: &Confinement) -> io::R
     })
 }
 
+/// The worker's mitigations without the win32k lockdown: a helper such as
+/// the Session Agent is the component that will one day need the desktop.
+const HELPER_MITIGATIONS: u64 = MITIGATIONS & !(1 << 28);
+
+/// Start a trusted helper (see [`crate::spawn_helper`]): the Core's own token,
+/// no AppContainer, but in a kill-on-close job that admits one process,
+/// with only its three stdio pipe ends inherited. Created suspended and
+/// resumed only once it is confirmed to be in the job.
+pub(crate) fn spawn_helper(command: &WorkerCommand, memory_bytes: u64) -> io::Result<Spawned> {
+    let limits = Confinement::locked_down(memory_bytes);
+    let job = super::create_job(&limits, false)?;
+
+    let (stdin, child_stdin) = pipe(Direction::ToChild)?;
+    let (stdout, child_stdout) = pipe(Direction::FromChild)?;
+    let (stderr, child_stderr) = pipe(Direction::FromChild)?;
+
+    let child_policy = CHILD_PROCESS_RESTRICTED;
+    let mitigations = HELPER_MITIGATIONS;
+    let jobs = [job.0];
+    let inherited = [child_stdin.0, child_stdout.0, child_stderr.0];
+    let mut attributes = AttributeList::new(4)?;
+    attributes.set(PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, &child_policy)?;
+    attributes.set(PROC_THREAD_ATTRIBUTE_JOB_LIST, &jobs)?;
+    attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherited)?;
+    attributes.set(PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigations)?;
+
+    // SAFETY: an all-zero STARTUPINFOEXW is valid; the fields that matter
+    // are set below.
+    let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
+    startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = child_stdin.0;
+    startup.StartupInfo.hStdOutput = child_stdout.0;
+    startup.StartupInfo.hStdError = child_stderr.0;
+    startup.lpAttributeList = attributes.as_ptr();
+
+    let application = wide(command.program.as_os_str());
+    let mut command_line = command_line(&command.program, &command.args)?;
+    let environment = environment_block(&command.env)?;
+    let cwd = command.cwd.as_ref().map(|dir| wide(dir.as_os_str()));
+    let flags = CREATE_SUSPENDED
+        | DETACHED_PROCESS
+        | EXTENDED_STARTUPINFO_PRESENT
+        | CREATE_UNICODE_ENVIRONMENT;
+
+    // SAFETY: an all-zero PROCESS_INFORMATION is valid; CreateProcessW fills it.
+    let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
+    // SAFETY: as in `spawn`: NUL-terminated strings, a mutable command line,
+    // a valid environment block, and an initialised attribute list whose
+    // values outlive the call. The handle list limits inheritance to the
+    // three child pipe ends.
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            null(),
+            null(),
+            1,
+            flags,
+            environment.as_ptr().cast(),
+            cwd.as_ref().map_or(null(), |dir| dir.as_ptr()),
+            (&raw const startup).cast::<STARTUPINFOW>(),
+            &mut info,
+        )
+    };
+    let created = check(created, "CreateProcessW(helper)");
+    // The child holds its own copies now; ours must close.
+    drop(attributes);
+    drop((child_stdin, child_stdout, child_stderr));
+    created?;
+
+    let process = Arc::new(Handle(info.hProcess));
+    let thread = Handle(info.hThread);
+    let pid = info.dwProcessId;
+    let started = super::require_in_job(process.0, &job)
+        .and_then(|()| resume(&thread))
+        .and_then(|()| Waiter::start(Arc::clone(&process)));
+    let exit = match started {
+        Ok(exit) => exit,
+        Err(error) => {
+            // SAFETY: a valid process handle with terminate access.
+            unsafe { TerminateProcess(process.0, 1) };
+            return Err(error);
+        }
+    };
+    Ok(Spawned {
+        process: crate::Process {
+            inner: Process {
+                handle: process,
+                pid,
+                exit,
+            },
+        },
+        contained: Contained {
+            inner: Guard { job, pid },
+            description: "trusted helper: the user's own token, job object (killed with the \
+                          Core, one process), stdio-only handle list, no child processes"
+                .to_owned(),
+        },
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
 fn resume(thread: &Handle) -> io::Result<()> {
     // SAFETY: the primary thread handle returned by CreateProcessW.
     if unsafe { ResumeThread(thread.0) } == u32::MAX {
