@@ -22,8 +22,9 @@
 //!   revokes every grant whenever the agent stops.
 //! - Time is the link's monotonic clock in milliseconds. A clock reading
 //!   earlier than one already seen is refused anyway.
-//! - Desktop calls are typed and approvable but have no agent operation:
-//!   they are refused before a grant is issued.
+//! - Of the desktop calls, only `desktop.write_clipboard_text` has an agent
+//!   operation (ADR 0020). The others are typed and approvable but are
+//!   refused before a grant is issued.
 
 pub mod link;
 pub mod serve;
@@ -98,7 +99,7 @@ impl Authorization {
 pub enum Refusal {
     #[error("the call is not a Session Agent operation")]
     NotAnAgentOperation,
-    #[error("desktop operations are not available")]
+    #[error("this desktop operation is not available")]
     NotAvailable,
     #[error("the approval is not for this call")]
     NotApproved,
@@ -151,10 +152,12 @@ pub fn operation_for(call: &ToolCall) -> Result<AgentOperation, Refusal> {
         ToolCall::SessionAgentHealthcheck(args) => Ok(AgentOperation::Healthcheck {
             label: args.label.clone(),
         }),
-        ToolCall::CaptureWindow(_)
-        | ToolCall::ReadClipboardText(_)
-        | ToolCall::WriteClipboardText(_)
-        | ToolCall::TypeText(_) => Err(Refusal::NotAvailable),
+        ToolCall::WriteClipboardText(args) => Ok(AgentOperation::WriteClipboardText {
+            text: args.text.clone(),
+        }),
+        ToolCall::CaptureWindow(_) | ToolCall::ReadClipboardText(_) | ToolCall::TypeText(_) => {
+            Err(Refusal::NotAvailable)
+        }
         ToolCall::SystemInfo(_) | ToolCall::ReadFixture(_) | ToolCall::WriteFile(_) => {
             Err(Refusal::NotAnAgentOperation)
         }
@@ -315,8 +318,9 @@ impl Grants {
 #[cfg(test)]
 mod tests {
     use jarvis_protocol::{
-        AgentLabel, Capability, CaptureWindowArgs, HealthcheckArgs, RelativePath, RequestId,
-        TaskId, WindowTarget, WriteFileArgs,
+        AgentLabel, Capability, CaptureWindowArgs, ClipboardText, HealthcheckArgs,
+        ReadClipboardTextArgs, RelativePath, RequestId, TaskId, TypeTextArgs, TypedText,
+        WindowTarget, WriteClipboardTextArgs, WriteFileArgs,
     };
 
     use super::*;
@@ -380,11 +384,39 @@ mod tests {
         let capture = ToolCall::CaptureWindow(CaptureWindowArgs {
             target: WindowTarget(1),
         });
+        let read = ToolCall::ReadClipboardText(ReadClipboardTextArgs {});
+        let typing = ToolCall::TypeText(TypeTextArgs {
+            target: WindowTarget(1),
+            text: TypedText::try_from("hi".to_owned()).unwrap(),
+        });
         let mut grants = Grants::default();
-        assert_eq!(grants.check(&capture, 0), Err(Refusal::NotAvailable));
+        for call in [&capture, &read, &typing] {
+            assert_eq!(grants.check(call, 0), Err(Refusal::NotAvailable));
+            assert_eq!(
+                grants.issue(consumed_for(call), call, 0, 5_000),
+                Err(Refusal::NotAvailable)
+            );
+        }
+        // Writing the clipboard has an operation, carrying the exact text.
+        let clipboard = ToolCall::WriteClipboardText(WriteClipboardTextArgs {
+            text: ClipboardText::try_from("hello\nworld".to_owned()).unwrap(),
+        });
+        assert_eq!(grants.check(&clipboard, 0), Ok(()));
+        let id = issue(&mut grants, &clipboard, 0);
+        let authorization = grants.authorize(id, &clipboard, 1).unwrap();
         assert_eq!(
-            grants.issue(consumed_for(&capture), &capture, 0, 5_000),
-            Err(Refusal::NotAvailable)
+            authorization.operation(),
+            &AgentOperation::WriteClipboardText {
+                text: ClipboardText::try_from("hello\nworld".to_owned()).unwrap()
+            }
+        );
+        let other = ToolCall::WriteClipboardText(WriteClipboardTextArgs {
+            text: ClipboardText::try_from("hello world".to_owned()).unwrap(),
+        });
+        let id = issue(&mut grants, &clipboard, 2);
+        assert_eq!(
+            grants.authorize(id, &other, 3).map(|_| ()),
+            Err(Refusal::ScopeMismatch)
         );
         let write = ToolCall::WriteFile(WriteFileArgs {
             path: RelativePath::try_from("a.txt".to_owned()).unwrap(),

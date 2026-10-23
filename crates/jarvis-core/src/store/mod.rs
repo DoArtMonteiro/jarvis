@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use jarvis_protocol::{
-    AuditEvent, AuditEventKind, Capability, ErrorCode, JobId, PolicyDecision, RequestId, SessionId,
-    TaskId, TaskStatus, ToolName, WireError,
+    ApprovalId, AuditEvent, AuditEventKind, Capability, ErrorCode, JobId, PolicyDecision,
+    RequestId, SessionId, TaskId, TaskStatus, ToolName, WireError,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
@@ -433,6 +433,22 @@ impl Store {
                 Some(task_id),
                 &AuditEventKind::TaskRecovered { from, to },
             )?;
+            // A Session Agent operation that was sent and never answered may
+            // have taken effect: say so, as a live Core would have.
+            if from == TaskStatus::Executing
+                && let Some(grant_id) = unanswered_dispatch(&tx, task_id)?
+            {
+                insert_event(
+                    &tx,
+                    Some(session_id),
+                    Some(task_id),
+                    &AuditEventKind::SessionAgentOutcomeUnknown {
+                        grant_id,
+                        reason: "the Core stopped after the operation was dispatched; it may have been sent"
+                            .to_owned(),
+                    },
+                )?;
+            }
         }
         tx.commit()?;
         Ok(Recovery {
@@ -601,6 +617,38 @@ fn migrate(conn: &mut Connection, path: &Path) -> Result<(), StoreError> {
         );
     }
     Ok(())
+}
+
+/// The grant of a Session Agent operation that `task_id` dispatched and for
+/// which no outcome was recorded.
+fn unanswered_dispatch(
+    tx: &Transaction<'_>,
+    task_id: TaskId,
+) -> Result<Option<ApprovalId>, StoreError> {
+    let detail: Option<String> = tx
+        .query_row(
+            "SELECT detail FROM audit_events
+             WHERE task_id = ?1 AND kind = 'session_agent_dispatched'
+               AND NOT EXISTS (
+                 SELECT 1 FROM audit_events
+                 WHERE task_id = ?1 AND kind IN ('session_agent_completed',
+                   'session_agent_refused', 'session_agent_outcome_unknown'))
+             ORDER BY seq DESC LIMIT 1",
+            params![task_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(detail) = detail else {
+        return Ok(None);
+    };
+    // The detail holds the event's fields; its kind is in its own column.
+    serde_json::from_str::<serde_json::Value>(&detail)
+        .ok()
+        .and_then(|value| serde_json::from_value(value.get("grant_id")?.clone()).ok())
+        .map(Some)
+        .ok_or_else(|| {
+            StoreError::Corrupt("a session_agent_dispatched event has no grant".to_owned())
+        })
 }
 
 fn insert_event(

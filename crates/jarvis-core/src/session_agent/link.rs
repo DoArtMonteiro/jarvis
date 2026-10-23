@@ -12,7 +12,8 @@
 //! Every operation goes through [`SessionAgent::perform`], which needs a
 //! grant from [`Grants`] and uses it up before anything is sent. Whatever
 //! goes wrong after a `perform` was sent (a timeout, a malformed or wrong
-//! reply, the agent exiting, the Core shutting down) ends the agent: it is
+//! reply, the agent reporting a fault, the agent exiting, the Core shutting
+//! down) ends the agent: it is
 //! killed, every grant is revoked and the outcome is reported as unknown,
 //! never retried. A late reply cannot be accepted because the channel it
 //! would arrive on no longer exists.
@@ -20,15 +21,18 @@
 use std::any::Any;
 use std::ffi::OsString;
 use std::fmt;
-use std::io;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use jarvis_protocol::{
-    AgentHealth, AgentOperation, AgentOutcome, AgentToCore, AgentVersion, AuditEventKind,
-    CoreToAgent, MAX_AGENT_FRAME_BYTES, ToolCall, decode_agent_to_core, encode_agent_frame,
+    AgentOperation, AgentOutcome, AgentReport, AgentToCore, AgentVersion, AuditEventKind,
+    CoreToAgent, Fingerprint, MAX_AGENT_FRAME_BYTES, ToolCall, decode_agent_to_core,
+    encode_agent_frame,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -50,6 +54,8 @@ pub struct Launched {
     pub reader: AgentReader,
     pub writer: AgentWriter,
     pub pid: Option<u32>,
+    /// SHA-256 of the executable that was started, if known.
+    pub image_sha256: Option<Fingerprint>,
     pub keep: Box<dyn Any + Send>,
 }
 
@@ -92,20 +98,61 @@ impl ProcessLauncher {
     }
 }
 
+/// Resolve the agent's executable, open it so that it cannot be changed
+/// while it is hashed and started, and return its resolved path, the handle
+/// and the file's SHA-256.
+///
+/// On Windows the handle shares only reading, so no process can write,
+/// rename or delete the file until it is dropped after the agent has
+/// started. Links and junctions are resolved before the file is opened, so
+/// changing one afterwards does not redirect the start; renaming a directory
+/// on the resolved path still could. Elsewhere the hash is a record only: the
+/// file can change between the hash and the start. In every case a same-user
+/// process can replace the file before it is opened.
+fn open_image(program: &Path) -> io::Result<(PathBuf, File, Fingerprint)> {
+    // Resolve links and junctions first, then open, hash and start that one
+    // path, so a link changed afterwards cannot point the start elsewhere.
+    let program = std::fs::canonicalize(program)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        /// `FILE_SHARE_READ`.
+        const SHARE_READ: u32 = 0x1;
+        options.share_mode(SHARE_READ);
+    }
+    let mut file = options.open(&program)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok((program, file, Fingerprint::from_digest(&digest)))
+}
+
 impl Launcher for ProcessLauncher {
     fn launch(&self) -> io::Result<Launched> {
+        let (program, image, image_sha256) = open_image(&self.program)?;
         // The agent gets no environment beyond what the OS needs to load it.
         let env: Vec<(OsString, OsString)> = ["SYSTEMROOT"]
             .into_iter()
             .filter_map(|name| std::env::var_os(name).map(|value| (name.into(), value)))
             .collect();
         let command = jarvis_sandbox::WorkerCommand {
-            program: self.program.clone(),
+            program,
             args: Vec::new(),
             env,
             cwd: None,
         };
         let spawned = jarvis_sandbox::spawn_helper(&command, AGENT_MEMORY_BYTES)?;
+        // The image is mapped now; the lock is no longer needed.
+        drop(image);
         let pid = Some(spawned.process.id());
         // The agent writes nothing to standard error; closing it means a
         // stray write fails instead of filling a pipe nobody reads.
@@ -114,6 +161,7 @@ impl Launcher for ProcessLauncher {
             reader: Box::new(spawned.stdout),
             writer: Box::new(spawned.stdin),
             pid,
+            image_sha256: Some(image_sha256),
             keep: Box::new((spawned.process, spawned.contained)),
         })
     }
@@ -136,7 +184,7 @@ struct State {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Performed {
     /// The agent performed it and reported this.
-    Done(AgentHealth),
+    Done(AgentReport),
     /// It was not performed: the Core refused before sending, or the agent
     /// refused. Nothing happened.
     Refused(String),
@@ -236,8 +284,8 @@ impl SessionAgent {
         }
         state.starts += 1;
         match self.start().await {
-            Ok((connection, pid)) => {
-                events.push(AuditEventKind::SessionAgentStarted { pid });
+            Ok((connection, pid, image_sha256)) => {
+                events.push(AuditEventKind::SessionAgentStarted { pid, image_sha256 });
                 state.connection = Some(connection);
                 Ok(())
             }
@@ -326,6 +374,12 @@ impl SessionAgent {
                     let reason = format!("the agent refused: {}", reason.as_str());
                     return refused(&reason, events);
                 }
+                AgentOutcome::Faulted { reason } => {
+                    format!(
+                        "the agent could not confirm the outcome: {}",
+                        reason.as_str()
+                    )
+                }
             },
             Ok(AgentToCore::Result { .. }) => {
                 "the Session Agent answered for another grant".to_owned()
@@ -360,12 +414,13 @@ impl SessionAgent {
         }
     }
 
-    async fn start(&self) -> Result<(Connection, Option<u32>), String> {
+    async fn start(&self) -> Result<(Connection, Option<u32>, Option<Fingerprint>), String> {
         let launched = self
             .launcher
             .launch()
             .map_err(|error| format!("the Session Agent could not start: {error}"))?;
         let pid = launched.pid;
+        let image_sha256 = launched.image_sha256.clone();
         let mut connection = Connection {
             reader: FrameReader::new(launched.reader, MAX_AGENT_FRAME_BYTES),
             writer: launched.writer,
@@ -374,7 +429,7 @@ impl SessionAgent {
         let ready = tokio::time::timeout(self.timeout, connection.reader.next_frame()).await;
         match ready {
             Ok(Ok(Some(Frame::Line(bytes)))) => match decode_agent_to_core(&bytes) {
-                Ok(AgentToCore::Ready { .. }) => Ok((connection, pid)),
+                Ok(AgentToCore::Ready { .. }) => Ok((connection, pid, image_sha256)),
                 _ => Err("the Session Agent did not announce itself".to_owned()),
             },
             _ => Err("the Session Agent did not announce itself in time".to_owned()),
@@ -397,9 +452,16 @@ fn refused(reason: &str, events: Vec<AuditEventKind>) -> Report {
 }
 
 /// Whether `report` is the report of `operation`.
-fn answers(operation: &AgentOperation, report: &AgentHealth) -> bool {
-    match operation {
-        AgentOperation::Healthcheck { label } => *label == report.label,
+fn answers(operation: &AgentOperation, report: &AgentReport) -> bool {
+    match (operation, report) {
+        (AgentOperation::Healthcheck { label }, AgentReport::Healthcheck(health)) => {
+            *label == health.label
+        }
+        (AgentOperation::WriteClipboardText { text }, AgentReport::WriteClipboardText(written)) => {
+            usize::try_from(written.utf16_units)
+                .is_ok_and(|units| units == text.as_str().encode_utf16().count())
+        }
+        _ => false,
     }
 }
 

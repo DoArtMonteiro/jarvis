@@ -8,19 +8,24 @@
 //! crosses the agent channel is a single-use grant for one exact operation.
 //!
 //! Desktop operations are defined here so that a person can be shown exactly
-//! what one would do, but none can be performed yet: the Core refuses them
-//! before they reach the agent, and the agent's operation set has no variant
-//! for them.
+//! what one would do. Only `desktop.write_clipboard_text` can be performed
+//! (ADR 0020). The Core refuses the others before they reach the agent, and
+//! the agent's operation set has no variant for them.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::text::check_visible;
+use crate::text::{check_plain, check_visible};
+
+/// Visible text on one line: no control characters at all.
+fn visible_line(kind: &str, value: &str, min: usize, max: usize) -> Result<(), String> {
+    check_visible(kind, value, min, max, false)
+}
 use crate::{ApprovalId, Label};
 
 macro_rules! visible_text {
-    ($(#[$doc:meta])* $name:ident, $kind:literal, min = $min:expr, max = $max:expr, layout = $layout:expr) => {
+    ($(#[$doc:meta])* $name:ident, $kind:literal, min = $min:expr, max = $max:expr, check = $check:expr) => {
         $(#[$doc])*
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[serde(try_from = "String", into = "String")]
@@ -39,7 +44,7 @@ macro_rules! visible_text {
             type Error = String;
 
             fn try_from(value: String) -> Result<Self, Self::Error> {
-                check_visible($kind, &value, $min, $max, $layout)?;
+                $check($kind, &value, $min, $max)?;
                 Ok(Self(value))
             }
         }
@@ -65,17 +70,20 @@ visible_text!(
     "label",
     min = 1,
     max = 64,
-    layout = false
+    check = visible_line
 );
 
 visible_text!(
-    /// Clipboard text: bounded, visible, and no control characters other than
-    /// tab and newline.
+    /// Clipboard text: bounded, and made only of characters that read the
+    /// same to the person approving it as to the program it is pasted into
+    /// (`text::is_plain`): letters, digits, common punctuation, spaces, tabs
+    /// and newlines. Short enough to be shown to a person in full before
+    /// they approve it, and for the largest value to fit in one agent frame.
     ClipboardText,
     "clipboard text",
-    min = 0,
-    max = 4096,
-    layout = true
+    min = 1,
+    max = 1024,
+    check = check_plain
 );
 
 visible_text!(
@@ -87,7 +95,7 @@ visible_text!(
     "typed text",
     min = 1,
     max = 4096,
-    layout = false
+    check = visible_line
 );
 
 /// A window the person would pick through the Session Agent's own picker.
@@ -123,7 +131,8 @@ pub struct CaptureWindowArgs {
 #[serde(deny_unknown_fields)]
 pub struct ReadClipboardTextArgs {}
 
-/// Arguments of `desktop.write_clipboard_text`. Not performable yet.
+/// Arguments of `desktop.write_clipboard_text`: replace the clipboard's
+/// content with this text, exactly as given: a line end stays `\n`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WriteClipboardTextArgs {
@@ -166,13 +175,14 @@ pub const MAX_GRANT_TTL_MS: u64 = 60_000;
 /// The largest frame either side of the agent channel accepts, in bytes.
 pub const MAX_AGENT_FRAME_BYTES: usize = 16 * 1024;
 
-/// An operation the Session Agent can perform. Only the synthetic health
-/// check exists: there is deliberately no variant for any desktop
-/// operation, so none can be sent.
+/// An operation the Session Agent can perform: the synthetic health check
+/// and writing the clipboard. There is deliberately no variant for any
+/// other desktop operation, so none can be sent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentOperation {
     Healthcheck { label: AgentLabel },
+    WriteClipboardText { text: ClipboardText },
 }
 
 /// The one message the Core sends: perform this operation once, under the
@@ -199,6 +209,23 @@ pub struct AgentHealth {
     pub performed: u64,
 }
 
+/// What the agent reports for a clipboard write. Never the text: the Core
+/// checks the length against the approved text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClipboardWritten {
+    /// UTF-16 code units placed on the clipboard, without the terminator.
+    pub utf16_units: u32,
+}
+
+/// The agent's report of a performed operation, one variant per operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum AgentReport {
+    Healthcheck(AgentHealth),
+    WriteClipboardText(ClipboardWritten),
+}
+
 /// Why the agent did not perform an operation. Each one means it did
 /// nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +235,11 @@ pub enum AgentRefusal {
     ReplayedGrant,
     /// The grant's remaining lifetime was zero or out of range.
     Expired,
+    /// Another program held the clipboard open. The agent tries once and
+    /// never waits or retries.
+    ClipboardBusy,
+    /// The clipboard could not be prepared, or this platform has none.
+    ClipboardUnavailable,
 }
 
 impl AgentRefusal {
@@ -215,15 +247,37 @@ impl AgentRefusal {
         match self {
             Self::ReplayedGrant => "replayed_grant",
             Self::Expired => "expired",
+            Self::ClipboardBusy => "clipboard_busy",
+            Self::ClipboardUnavailable => "clipboard_unavailable",
         }
     }
 }
 
+/// Why the agent cannot say whether an operation took effect. The Core
+/// records the outcome as unknown and never sends the operation again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentFault {
+    /// The clipboard was emptied, but setting or closing it failed.
+    ClipboardIncomplete,
+}
+
+impl AgentFault {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClipboardIncomplete => "clipboard_incomplete",
+        }
+    }
+}
+
+/// `done`: performed. `refused`: nothing was done. `faulted`: started and
+/// may or may not have taken effect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentOutcome {
-    Done { report: AgentHealth },
+    Done { report: AgentReport },
     Refused { reason: AgentRefusal },
+    Faulted { reason: AgentFault },
 }
 
 /// Messages the agent sends: `ready` once at start, then one `result` per
@@ -317,7 +371,37 @@ mod tests {
             assert!(TypedText::try_from(bad.to_owned()).is_err(), "{bad:?}");
         }
         assert!(ClipboardText::try_from("line\n\tindented".to_owned()).is_ok());
-        assert!(ClipboardText::try_from("\r".to_owned()).is_err());
+        for bad in [
+            "\r",
+            "",
+            "a\u{202E}b",
+            "\u{1b}[2J",
+            "line\u{2028}separator",
+            "para\u{2029}graph",
+            "tag\u{E0041}\u{E0042}",
+            "vs\u{FE0F}",
+            "\u{206A}deprecated",
+            "hangul\u{3164}filler",
+            "braille\u{2800}blank",
+            "cgj\u{034F}",
+            "object\u{FFFC}",
+            "nb\u{00A0}space",
+            "ideo\u{3000}space",
+            "private\u{E000}",
+            "unassigned\u{0378}",
+            "e\u{0301}",
+            "emoji \u{1F600}",
+        ] {
+            assert!(ClipboardText::try_from(bad.to_owned()).is_err(), "{bad:?}");
+        }
+        for good in [
+            "Ol\u{e1}, s\u{e3}o 10\u{20ac} \u{2014} \u{201c}ok\u{201d}\u{2026}",
+            "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442} \u{4e16}\u{754c} \u{645}\u{631}\u{62d}\u{628}\u{627}",
+            "a\\nb\ttab\nnext line",
+        ] {
+            assert!(ClipboardText::try_from(good.to_owned()).is_ok(), "{good:?}");
+        }
+        assert!(ClipboardText::try_from("x".repeat(1025)).is_err());
         assert!(TypedText::try_from("x".repeat(4097)).is_err());
     }
 
@@ -341,6 +425,14 @@ mod tests {
         extra["caller"] = json!("core");
         let mut desktop = base.clone();
         desktop["operation"] = json!({"op": "capture_window", "target": 1});
+        let mut typing = base.clone();
+        typing["operation"] = json!({"op": "type_text", "target": 1, "text": "x"});
+        let mut read = base.clone();
+        read["operation"] = json!({"op": "read_clipboard_text"});
+        let mut control = base.clone();
+        control["operation"] = json!({"op": "write_clipboard_text", "text": "a\rb"});
+        let mut empty = base.clone();
+        empty["operation"] = json!({"op": "write_clipboard_text", "text": ""});
         let mut smuggled = base.clone();
         smuggled["operation"]["command"] = json!("cmd.exe");
         let mut version = base.clone();
@@ -348,6 +440,10 @@ mod tests {
         for (frame, case) in [
             (extra, "unknown field"),
             (desktop, "desktop operation"),
+            (typing, "typing"),
+            (read, "clipboard read"),
+            (control, "control character in clipboard text"),
+            (empty, "empty clipboard text"),
             (smuggled, "field inside the operation"),
         ] {
             let bytes = serde_json::to_vec(&frame).unwrap();
@@ -375,10 +471,10 @@ mod tests {
             v: AgentVersion::CURRENT,
             grant_id,
             outcome: AgentOutcome::Done {
-                report: AgentHealth {
+                report: AgentReport::Healthcheck(AgentHealth {
                     label: AgentLabel::try_from("ping".to_owned()).unwrap(),
                     performed: 1,
-                },
+                }),
             },
         };
         let bytes = encode_agent_frame(&done).unwrap();
@@ -387,7 +483,46 @@ mod tests {
             "outcome": {"status": "refused", "reason": "replayed_grant"}});
         assert!(decode_agent_to_core(&serde_json::to_vec(&refused).unwrap()).is_ok());
         let screenshot = json!({"type": "result", "v": 1, "grant_id": grant_id,
-            "outcome": {"status": "done", "report": {"label": "x", "performed": 1, "image": "AAAA"}}});
+            "outcome": {"status": "done", "report": {"op": "healthcheck", "label": "x", "performed": 1, "image": "AAAA"}}});
         assert!(decode_agent_to_core(&serde_json::to_vec(&screenshot).unwrap()).is_err());
+        let written = json!({"type": "result", "v": 1, "grant_id": grant_id,
+            "outcome": {"status": "done", "report": {"op": "write_clipboard_text", "utf16_units": 5}}});
+        assert!(decode_agent_to_core(&serde_json::to_vec(&written).unwrap()).is_ok());
+        for leak in [
+            json!({"op": "write_clipboard_text", "utf16_units": 5, "text": "hello"}),
+            json!({"op": "read_clipboard_text", "text": "hello"}),
+            json!({"label": "x", "performed": 1}),
+        ] {
+            let frame = json!({"type": "result", "v": 1, "grant_id": grant_id,
+                "outcome": {"status": "done", "report": leak}});
+            assert!(
+                decode_agent_to_core(&serde_json::to_vec(&frame).unwrap()).is_err(),
+                "{frame}"
+            );
+        }
+        let faulted = json!({"type": "result", "v": 1, "grant_id": grant_id,
+            "outcome": {"status": "faulted", "reason": "clipboard_incomplete"}});
+        assert!(decode_agent_to_core(&serde_json::to_vec(&faulted).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn the_largest_clipboard_write_fits_in_one_frame() {
+        // Every character at its widest: four UTF-8 bytes, or one that JSON
+        // escapes to two.
+        // The widest allowed letter takes four UTF-8 bytes.
+        for widest in ["\u{20000}", "\n", "\"", "\\"] {
+            let text = widest.repeat(ClipboardText::MAX_CHARS);
+            let perform = CoreToAgent::Perform {
+                v: AgentVersion::CURRENT,
+                grant_id: ApprovalId::new(),
+                operation: AgentOperation::WriteClipboardText {
+                    text: ClipboardText::try_from(text).unwrap(),
+                },
+                ttl_ms: MAX_GRANT_TTL_MS,
+            };
+            let bytes = encode_agent_frame(&perform).unwrap();
+            assert!(bytes.len() <= MAX_AGENT_FRAME_BYTES, "{}", bytes.len());
+            assert_eq!(decode_core_to_agent(&bytes).unwrap(), perform);
+        }
     }
 }

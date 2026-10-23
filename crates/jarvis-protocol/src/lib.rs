@@ -21,11 +21,11 @@ mod text;
 mod tools;
 
 pub use agent::{
-    AgentDecodeError, AgentHealth, AgentLabel, AgentOperation, AgentOutcome, AgentReceipt,
-    AgentRefusal, AgentToCore, AgentVersion, CaptureWindowArgs, ClipboardText, CoreToAgent,
-    HealthcheckArgs, MAX_AGENT_FRAME_BYTES, MAX_GRANT_TTL_MS, ReadClipboardTextArgs, TypeTextArgs,
-    TypedText, WindowTarget, WriteClipboardTextArgs, decode_agent_to_core, decode_core_to_agent,
-    encode_agent_frame,
+    AgentDecodeError, AgentFault, AgentHealth, AgentLabel, AgentOperation, AgentOutcome,
+    AgentReceipt, AgentRefusal, AgentReport, AgentToCore, AgentVersion, CaptureWindowArgs,
+    ClipboardText, ClipboardWritten, CoreToAgent, HealthcheckArgs, MAX_AGENT_FRAME_BYTES,
+    MAX_GRANT_TTL_MS, ReadClipboardTextArgs, TypeTextArgs, TypedText, WindowTarget,
+    WriteClipboardTextArgs, decode_agent_to_core, decode_core_to_agent, encode_agent_frame,
 };
 pub use audit::{AuditEvent, AuditEventKind};
 pub use capability::{ActionClass, Capability, UnknownCapability};

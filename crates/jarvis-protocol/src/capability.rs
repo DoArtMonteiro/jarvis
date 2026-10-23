@@ -100,8 +100,9 @@ impl Capability {
         }
     }
 
-    /// Desktop capabilities can only be denied until a Session Agent
-    /// implements them: the configuration may not allow or confirm one.
+    /// Capabilities that reach the person's desktop. The configuration may
+    /// only deny them, except `desktop.clipboard.write`, which an owner may
+    /// set to `require_confirmation` (ADR 0020).
     pub fn is_desktop(self) -> bool {
         match self {
             Self::DesktopScreenObserve

@@ -124,6 +124,54 @@ pub(crate) fn is_invisible(c: char) -> bool {
     )
 }
 
+/// Whether clipboard text may contain `c`: an allowlist, so that what a
+/// person approves reads the same as what is pasted. Newline, tab, space,
+/// printable ASCII, letters and digits of any script (by their Unicode
+/// properties), and common typographic punctuation. Everything else is
+/// refused, including format, separator, private-use and unassigned
+/// characters, variation selectors, tag characters, combining marks that
+/// are not letters, spaces other than U+0020, and the letters that render as
+/// nothing (the Hangul fillers). Lookalike letters from other scripts remain
+/// possible; they are visible, and the SHA-256 tells two texts apart.
+pub(crate) fn is_plain(c: char) -> bool {
+    match c {
+        '\n' | '\t' | ' ' => true,
+        c if c.is_ascii_graphic() => true,
+        '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' => false,
+        c if c.is_alphanumeric() => true,
+        '\u{00A1}'..='\u{00AC}'
+        | '\u{00AE}'..='\u{00BF}'
+        | '\u{00D7}'
+        | '\u{00F7}'
+        | '\u{2010}'..='\u{2015}'
+        | '\u{2018}'..='\u{2022}'
+        | '\u{2026}'
+        | '\u{2030}'
+        | '\u{2039}'
+        | '\u{203A}'
+        | '\u{20AC}'
+        | '\u{2122}' => true,
+        _ => false,
+    }
+}
+
+/// Check clipboard text: `min..=max` characters, each one allowed by
+/// [`is_plain`].
+pub(crate) fn check_plain(kind: &str, value: &str, min: usize, max: usize) -> Result<(), String> {
+    let chars = value.chars().count();
+    if !(min..=max).contains(&chars) {
+        return Err(format!("{kind} must be {min} to {max} characters"));
+    }
+    match value.chars().find(|&c| !is_plain(c)) {
+        Some(c) => Err(format!(
+            "{kind} must not contain {}: only letters, digits, common punctuation, \
+             spaces, tabs and newlines are allowed",
+            c.escape_unicode()
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Check text a person will approve: `min..=max` characters, no invisible
 /// formatting characters, and no control characters except newline and tab
 /// when `allow_layout` is set.

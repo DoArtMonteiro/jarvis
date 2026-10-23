@@ -173,6 +173,18 @@ Set `[governor] enabled = true` and `processes = ["<your game>.exe"]` in the con
 - Record whether the game, its launcher or its anti-cheat software reported or did anything because the Core was running. The Core opens no handle to the game; this is the check that matters.
 - If the queue stays held, `jarvis health` names the reason and, for a game, the configured process. Close that process, or stop the Core, set `[governor] enabled = false` (or correct `processes`) and start it again: the queued jobs then start, and none is lost. A process of any account or session with the same name holds the queue as well, because the process list shows every account.
 
+## 11. Session Agent and clipboard writes
+
+**LOCAL WINDOWS VERIFICATION REQUIRED.** CI runs the clipboard primitive's test in a window station of its own (it never touches the desktop clipboard); the test needs a runner that lets a standard process create one, and fails rather than skips on a runner that does not. It cannot prove how a real desktop session, clipboard managers, clipboard history or cloud sync treat a write.
+
+Run `scripts\windows\clipboard-demo.ps1 -Python <python.exe>` as a standard user. It replaces the clipboard's content with synthetic text.
+
+- `approvals show` prints the whole text, with `\n`, `\t` and `\\` for newline, tab and backslash, and its characters, lines, bytes and SHA-256. The demo checks the SHA-256 against the text it submitted.
+- After approval, `job <id>` shows `outcome    COMPLETED`, and a disposable editor that pastes receives exactly the approved text (the demo compares SHA-256 values and never prints the clipboard).
+- Approving the same approval again is refused. With another program holding the clipboard open, the next write shows `REFUSED (not performed)` and the clipboard is unchanged.
+- `audit` shows `session_agent_started` with `image_sha256`, which equals the SHA-256 of `jarvis-session-agent.exe`.
+- Record whether Win+V clipboard history or a clipboard manager kept a copy of the text.
+
 ## Results
 
 | Item | Result | Notes |
@@ -198,3 +210,4 @@ Set `[governor] enabled = true` and `processes = ["<your game>.exe"]` in the con
 | Provisioning install twice, check, remove | | |
 | Firewall service stopped (test machine only) | | |
 | Gaming governor: held and released around a real game; game, launcher and anti-cheat unaffected | | |
+| Clipboard demo: full text shown, completed, exact paste, replay refused, busy refused with no change, image hash recorded; clipboard history and managers | | |

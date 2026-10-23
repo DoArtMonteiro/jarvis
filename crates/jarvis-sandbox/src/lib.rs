@@ -32,6 +32,7 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
+mod clipboard;
 pub mod processes;
 
 #[cfg(unix)]
@@ -43,6 +44,8 @@ mod windows;
 use unix as platform;
 #[cfg(windows)]
 use windows as platform;
+
+pub use clipboard::{ClipboardError, write_clipboard_text};
 
 /// Resource limits for the worker process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

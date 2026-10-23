@@ -66,6 +66,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::{Confinement, PipeClient, Report};
 
 mod appcontainer;
+pub(crate) mod clipboard;
 mod launch;
 mod processes;
 

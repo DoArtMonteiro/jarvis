@@ -17,12 +17,13 @@ use jarvis_core::session::{SessionContext, SessionEnd, SessionError, SessionRepo
 use jarvis_core::session_agent::{Launched, Launcher, ProcessLauncher, SessionAgent};
 use jarvis_core::store::{ApprovalError, ApprovalRecord, Store, now_ms};
 use jarvis_protocol::{
-    ApprovalStatus, AuditEventKind, Capability, CoreMessage, ErrorCode, Fingerprint, Goal, JobId,
-    JobStatus, PolicyDecision, Summary, TaskStatus, ToolCall, ToolOutcome, ToolResult,
-    decode_core_message,
+    AgentReport, ApprovalStatus, AuditEventKind, Capability, ClipboardWritten, CoreMessage,
+    ErrorCode, Fingerprint, Goal, JobId, JobStatus, PolicyDecision, Summary, TaskStatus, ToolCall,
+    ToolOutcome, ToolResult, decode_core_message,
 };
 use jarvis_tools::{FixtureRoot, ToolExecutor, ToolFuture, Toolbox, WorkspaceRoot};
 use serde_json::{Value, json};
+use sha2::Digest;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -1589,6 +1590,14 @@ enum Fake {
     Refuse,
     /// Performs one operation, then exits while idle.
     OnceThenExit,
+    /// Reports a clipboard write of the text it was sent.
+    Clipboard,
+    /// Refuses a clipboard write because the clipboard is in use.
+    ClipboardBusy,
+    /// Reports that a clipboard write may be incomplete.
+    ClipboardFault,
+    /// Reports a clipboard write of a different length.
+    ClipboardWrongLength,
 }
 
 /// Launches in-memory agents that misbehave as told, counting launches and
@@ -1628,19 +1637,34 @@ impl Launcher for FakeLauncher {
                 performs.fetch_add(1, Ordering::SeqCst);
                 let frame: Value = serde_json::from_str(&line).unwrap();
                 let grant = frame["grant_id"].clone();
+                let units = frame["operation"]["text"]
+                    .as_str()
+                    .map_or(0, |text| text.encode_utf16().count());
                 let reply = match behaviour {
                     Fake::Silent | Fake::ExitAfterPerform => return,
                     Fake::Hang => std::future::pending().await,
                     Fake::WrongGrant => json!({"type": "result", "v": 1,
                         "grant_id": jarvis_protocol::ApprovalId::new(),
-                        "outcome": {"status": "done", "report": {"label": "ping", "performed": 1}}}),
+                        "outcome": {"status": "done", "report": {"op": "healthcheck", "label": "ping", "performed": 1}}}),
                     Fake::Garbage => json!({"type": "result", "v": 1, "grant_id": grant,
-                        "outcome": {"status": "done", "report": {"label": "ping", "performed": 1,
+                        "outcome": {"status": "done", "report": {"op": "healthcheck", "label": "ping", "performed": 1,
                         "screen": "AAAA"}}}),
                     Fake::Refuse => json!({"type": "result", "v": 1, "grant_id": grant,
                         "outcome": {"status": "refused", "reason": "replayed_grant"}}),
                     Fake::OnceThenExit => json!({"type": "result", "v": 1, "grant_id": grant,
-                        "outcome": {"status": "done", "report": {"label": "ping", "performed": 1}}}),
+                        "outcome": {"status": "done", "report": {"op": "healthcheck", "label": "ping", "performed": 1}}}),
+                    Fake::Clipboard => json!({"type": "result", "v": 1, "grant_id": grant,
+                        "outcome": {"status": "done",
+                        "report": {"op": "write_clipboard_text", "utf16_units": units}}}),
+                    Fake::ClipboardBusy => json!({"type": "result", "v": 1, "grant_id": grant,
+                        "outcome": {"status": "refused", "reason": "clipboard_busy"}}),
+                    Fake::ClipboardFault => json!({"type": "result", "v": 1, "grant_id": grant,
+                        "outcome": {"status": "faulted", "reason": "clipboard_incomplete"}}),
+                    Fake::ClipboardWrongLength => {
+                        json!({"type": "result", "v": 1, "grant_id": grant,
+                        "outcome": {"status": "done",
+                        "report": {"op": "write_clipboard_text", "utf16_units": units + 1}}})
+                    }
                 };
                 let mut bytes = serde_json::to_vec(&reply).unwrap();
                 bytes.push(b'\n');
@@ -1654,6 +1678,7 @@ impl Launcher for FakeLauncher {
             reader: Box::new(core_reader),
             writer: Box::new(core_writer),
             pid: None,
+            image_sha256: None,
             keep: Box::new(AbortOnDrop(task)),
         })
     }
@@ -1687,8 +1712,173 @@ fn healthcheck(label: &str) -> Value {
     json!({ "label": label })
 }
 
+/// The agent policy, with clipboard writes enabled as an owner would: each
+/// one still needs a person's approval.
+fn clipboard_options(agent: Option<Arc<SessionAgent>>) -> Options {
+    let mut options = agent_options(agent);
+    for (capability, decision) in &mut options.policy {
+        if *capability == Capability::DesktopClipboardWrite {
+            *decision = PolicyDecision::RequireConfirmation;
+        }
+    }
+    options
+}
+
+/// Text with a line end, a tab, a backslash and a letter outside the BMP:
+/// what the person is shown must be all of it, with layout made visible.
+const CLIPBOARD_TEXT: &str = "Demo: hello\n\tfrom the Session Agent \\ caf\u{e9} \u{20000}";
+
+/// Request a clipboard write and approve it after checking what the person
+/// is shown.
+async fn approved_clipboard_write(h: &mut Harness, id: &str, text: &str) -> ToolOutcome {
+    h.send_request(id, "desktop.write_clipboard_text", json!({ "text": text }))
+        .await;
+    let approval = h.pending_approval().await;
+    assert_eq!(approval.capabilities, [Capability::DesktopClipboardWrite]);
+    let shown = jarvis_core::approval::view(&approval, now_ms());
+    assert!(shown.arguments["action"].contains("clipboard"), "{shown:?}");
+    assert_eq!(
+        shown.arguments["text"],
+        jarvis_core::approval::display_safe(text, usize::MAX)
+    );
+    assert_eq!(
+        shown.arguments["characters"],
+        text.chars().count().to_string()
+    );
+    h.grant(&approval, &approval.fingerprint).unwrap();
+    h.response(id).await
+}
+
+#[tokio::test]
+async fn an_approved_clipboard_write_is_shown_in_full_and_sent_once() {
+    let (agent, launches, performs) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.ready().await;
+    let outcome = approved_clipboard_write(&mut h, "c1", CLIPBOARD_TEXT).await;
+    let ToolOutcome::Completed {
+        result: ToolResult::AgentReceipt(receipt),
+    } = outcome
+    else {
+        panic!("expected a receipt, got {outcome:?}");
+    };
+    assert_eq!(receipt.agent_operation, "desktop.write_clipboard_text");
+    let (_, store, calls) = h.finish().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing ran in the Core");
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert_eq!(performs.load(Ordering::SeqCst), 1);
+    let task = &store.tasks(10).unwrap()[0];
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(
+        task.result.as_deref(),
+        Some(r#"{"agent_operation":"desktop.write_clipboard_text"}"#)
+    );
+    let (kinds, report) = agent_events(&store);
+    assert_eq!(
+        kinds,
+        [
+            "session_agent_started",
+            "session_agent_dispatched",
+            "session_agent_completed",
+        ]
+    );
+    assert_eq!(
+        report,
+        Some(AgentReport::WriteClipboardText(ClipboardWritten {
+            utf16_units: u32::try_from(CLIPBOARD_TEXT.encode_utf16().count()).unwrap(),
+        }))
+    );
+}
+
+#[tokio::test]
+async fn a_busy_clipboard_is_refused_and_never_retried() {
+    let (agent, _, performs) = fake_agent(Fake::ClipboardBusy, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.ready().await;
+    let outcome = approved_clipboard_write(&mut h, "c1", "hello").await;
+    let ToolOutcome::Failed { error } = outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::ToolFailed);
+    let (_, store, _) = h.finish().await;
+    assert_eq!(performs.load(Ordering::SeqCst), 1);
+    let events = store.audit_events(None, 1000).unwrap();
+    assert!(events.iter().any(|event| matches!(&event.event,
+        AuditEventKind::SessionAgentRefused { reason, .. } if reason.contains("clipboard_busy"))));
+}
+
+#[tokio::test]
+async fn an_unconfirmed_clipboard_write_fails_closed() {
+    for behaviour in [Fake::ClipboardFault, Fake::ClipboardWrongLength] {
+        let (agent, launches, performs) = fake_agent(behaviour, Duration::from_secs(5), 4);
+        let mut h = Harness::start(clipboard_options(Some(agent)));
+        h.ready().await;
+        let outcome = approved_clipboard_write(&mut h, "c1", "hello").await;
+        let ToolOutcome::Failed { error } = outcome else {
+            panic!("{behaviour:?}: expected a failure, got {outcome:?}");
+        };
+        assert_eq!(error.code, ErrorCode::Internal, "{behaviour:?}");
+        let (_, store, _) = h.finish().await;
+        assert_eq!(launches.load(Ordering::SeqCst), 1, "{behaviour:?}");
+        assert_eq!(
+            performs.load(Ordering::SeqCst),
+            1,
+            "{behaviour:?}: sent once"
+        );
+        assert_eq!(
+            agent_events(&store).0,
+            [
+                "session_agent_started",
+                "session_agent_dispatched",
+                "session_agent_stopped",
+                "session_agent_outcome_unknown",
+            ],
+            "{behaviour:?}"
+        );
+        let task = &store.tasks(10).unwrap()[0];
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.error.as_ref().unwrap().code, ErrorCode::Internal);
+    }
+}
+
+#[tokio::test]
+async fn other_desktop_operations_stay_closed_with_clipboard_writes_enabled() {
+    let (agent, launches, _) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.ready().await;
+    for (id, tool, args) in [
+        ("d1", "desktop.capture_window", json!({"target": 1})),
+        ("d2", "desktop.read_clipboard_text", json!({})),
+        (
+            "d3",
+            "desktop.type_text",
+            json!({"target": 1, "text": "hi"}),
+        ),
+    ] {
+        let outcome = h.request(id, tool, args).await;
+        assert!(matches!(outcome, ToolOutcome::Denied { .. }), "{outcome:?}");
+    }
+    for (id, args) in [
+        ("x1", json!({"text": ""})),
+        ("x2", json!({"text": "a\rb"})),
+        ("x3", json!({"text": "x".repeat(1025)})),
+        ("x4", json!({"text": "pay\u{202E}lap"})),
+        ("x6", json!({"text": "line\u{2028}break"})),
+        ("x7", json!({"text": "tag\u{E0041}"})),
+        ("x5", json!({"text": "hi", "target": 1})),
+    ] {
+        let outcome = h.request(id, "desktop.write_clipboard_text", args).await;
+        assert!(
+            matches!(outcome, ToolOutcome::Rejected { .. }),
+            "{outcome:?}"
+        );
+    }
+    let (_, store, _) = h.finish().await;
+    assert!(store.pending_approvals().unwrap().is_empty());
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+}
+
 /// The `session_agent_*` events and the report of the completion, if any.
-fn agent_events(store: &Store) -> (Vec<&'static str>, Option<jarvis_protocol::AgentHealth>) {
+fn agent_events(store: &Store) -> (Vec<&'static str>, Option<AgentReport>) {
     let events = store.audit_events(None, 1000).unwrap();
     let report = events.iter().find_map(|event| match &event.event {
         AuditEventKind::SessionAgentCompleted { report, .. } => Some(report.clone()),
@@ -1761,7 +1951,23 @@ async fn an_approved_healthcheck_runs_once_in_the_real_session_agent() {
             "session_agent_completed",
         ]
     );
-    assert_eq!(report.unwrap().label.as_str(), "ping");
+    let Some(AgentReport::Healthcheck(report)) = report else {
+        panic!("expected a health report, got {report:?}");
+    };
+    assert_eq!(report.label.as_str(), "ping");
+    // The executable that was started is recorded by its SHA-256.
+    let recorded = store
+        .audit_events(None, 1000)
+        .unwrap()
+        .into_iter()
+        .find_map(|event| match event.event {
+            AuditEventKind::SessionAgentStarted { image_sha256, .. } => image_sha256,
+            _ => None,
+        })
+        .expect("the agent's image hash was recorded");
+    let image = std::fs::read(env!("CARGO_BIN_EXE_jarvis-session-agent")).unwrap();
+    let digest: [u8; 32] = sha2::Sha256::digest(&image).into();
+    assert_eq!(recorded, Fingerprint::from_digest(&digest));
     let first_task = tasks.last().unwrap().task_id;
     let task_events: Vec<_> = store
         .audit_events(Some(first_task), 100)
@@ -2056,7 +2262,7 @@ async fn a_real_agent_killed_while_idle_is_replaced() {
         .unwrap()
         .into_iter()
         .find_map(|event| match event.event {
-            AuditEventKind::SessionAgentStarted { pid } => pid,
+            AuditEventKind::SessionAgentStarted { pid, .. } => pid,
             _ => None,
         })
         .expect("the agent's pid was recorded");

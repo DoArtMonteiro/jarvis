@@ -71,11 +71,21 @@ pub fn describe(call: &ToolCall) -> BTreeMap<String, String> {
             );
         }
         ToolCall::WriteClipboardText(args) => {
+            // Short enough to show in full: the person approves every
+            // character, with line ends and tabs made visible.
+            let text = args.text.as_str();
             out.insert(
                 "action".into(),
-                "Replace the clipboard's text (not available yet).".into(),
+                "Replace the clipboard's content with exactly this text. Nothing is read from \
+                 the clipboard; any program can paste it."
+                    .into(),
             );
-            describe_text(&mut out, args.text.as_str());
+            out.insert("destination".into(), "the clipboard".into());
+            out.insert("text".into(), display_safe(text, usize::MAX));
+            out.insert("characters".into(), text.chars().count().to_string());
+            out.insert("lines".into(), text.split('\n').count().to_string());
+            describe_text(&mut out, text);
+            out.remove("preview");
         }
         ToolCall::TypeText(args) => {
             out.insert(
@@ -109,7 +119,9 @@ fn describe_text(out: &mut BTreeMap<String, String>, text: &str) {
     out.insert("preview".into(), display_safe(text, 160));
 }
 
-/// Escape control characters and cut to `max_chars`, marking the cut.
+/// Escape control characters and backslashes and cut to `max_chars`,
+/// marking the cut. A backslash is shown as `\\`, so a newline (`\n`) and a
+/// backslash followed by `n` (`\\n`) never look the same.
 pub fn display_safe(text: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (count, c) in text.chars().enumerate() {
@@ -117,7 +129,7 @@ pub fn display_safe(text: &str, max_chars: usize) -> String {
             out.push('…');
             break;
         }
-        if c.is_control() {
+        if c.is_control() || c == '\\' {
             out.extend(c.escape_default());
         } else {
             out.push(c);
@@ -275,12 +287,39 @@ mod tests {
                 ToolCall::SessionAgentHealthcheck(_) => assert_eq!(described["label"], "ping"),
                 _ => {}
             }
-            if let ToolCall::TypeText(_) | ToolCall::WriteClipboardText(_) = call {
+            if let ToolCall::WriteClipboardText(_) = call {
+                assert_eq!(described["text"], "hello");
+                assert_eq!(described["characters"], "5");
+                assert_eq!(described["destination"], "the clipboard");
+                assert!(!described.contains_key("preview"));
+            }
+            if let ToolCall::TypeText(_) = call {
                 assert_eq!(described["preview"], "hello");
+            }
+            if let ToolCall::TypeText(_) | ToolCall::WriteClipboardText(_) = call {
                 assert_eq!(described["bytes"], "5");
                 assert_eq!(described["sha256"].len(), 64);
             }
         }
+    }
+
+    #[test]
+    fn different_texts_never_display_the_same() {
+        // A real newline and a backslash followed by `n`.
+        assert_eq!(display_safe("a\nb", 10), "a\\nb");
+        assert_eq!(display_safe("a\\nb", 10), "a\\\\nb");
+        assert_eq!(display_safe("a\tb", 10), "a\\tb");
+        assert_eq!(display_safe("a\\tb", 10), "a\\\\tb");
+        let call = |text: &str| {
+            ToolCall::WriteClipboardText(jarvis_protocol::WriteClipboardTextArgs {
+                text: jarvis_protocol::ClipboardText::try_from(text.to_owned()).unwrap(),
+            })
+        };
+        let newline = describe(&call("ls\nrm -rf ~"));
+        let literal = describe(&call("ls\\nrm -rf ~"));
+        assert_ne!(newline["text"], literal["text"]);
+        assert_eq!(newline["lines"], "2");
+        assert_eq!(literal["lines"], "1");
     }
 
     #[tokio::test]

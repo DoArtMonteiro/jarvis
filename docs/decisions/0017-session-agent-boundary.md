@@ -1,6 +1,6 @@
 # 0017. Desktop access belongs to a trusted Session Agent, never to the worker
 
-**Status:** Proposed. The Session Agent process, its channel, its grants and their audit are implemented for one synthetic operation by ADR 0019. No desktop operation is implemented, and the parts listed under "Not built" below remain so unless ADR 0019 says otherwise.
+**Status:** Proposed. The Session Agent process, its channel, its grants and their audit are implemented for one synthetic operation by ADR 0019. The one desktop operation implemented is writing approved text to the clipboard (ADR 0020), and the parts listed under "Not built" below remain so unless ADR 0019 or 0020 says otherwise.
 
 ## Context
 

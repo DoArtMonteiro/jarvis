@@ -327,8 +327,10 @@ impl ToolResult {
                 | (Self::Written(_), ToolCall::WriteFile(_))
         ) || matches!(
             (self, call),
-            (Self::AgentReceipt(receipt), ToolCall::SessionAgentHealthcheck(_))
-                if receipt.agent_operation == ToolCall::SESSION_AGENT_HEALTHCHECK
+            (
+                Self::AgentReceipt(receipt),
+                ToolCall::SessionAgentHealthcheck(_) | ToolCall::WriteClipboardText(_)
+            ) if receipt.agent_operation == call.tool_name()
         )
     }
 }

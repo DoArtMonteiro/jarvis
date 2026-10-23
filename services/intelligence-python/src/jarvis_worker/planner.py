@@ -7,10 +7,12 @@ request, derives the capabilities it needs and applies policy before anything ru
 """
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Protocol
 
 from jarvis_worker.protocol import (
+    TOOL_DESKTOP_WRITE_CLIPBOARD_TEXT,
     TOOL_READ_FIXTURE,
     TOOL_SESSION_AGENT_HEALTHCHECK,
     TOOL_SYSTEM_INFO,
@@ -42,10 +44,47 @@ _SCAN = re.compile(
     r"\bwrite\s+(?P<write_path>[^\s:]+):\s?(?P<content>.*)"
     r"|\bread\s+(?P<target>\S+)"
     r"|\bhealthcheck\s+(?P<check_label>\S+)"
+    r'|\bcopy\s+"(?P<copy_text>.*)"'
     r"|\b(?P<topic>system|runtime|machine|environment)\b",
     re.IGNORECASE,
 )
 _TRAILING_PUNCTUATION = ",.;:!?"
+
+# A conservative subset of what the Core accepts as clipboard text (it re-checks, and is
+# the authority): 1 to 1024 characters, each a newline, tab, space, printable ASCII, a letter
+# or digit of any script, or common typographic punctuation. Anything else, including format,
+# separator and private-use characters and the Hangul fillers, yields no call.
+_CLIPBOARD_TEXT_MAX_CHARS = 1024
+_HANGUL_FILLERS = frozenset("ᅟᅠㅤﾠ")
+_CLIPBOARD_PUNCTUATION_RANGES = (
+    (0x00A1, 0x00AC),
+    (0x00AE, 0x00BF),
+    (0x00D7, 0x00D7),
+    (0x00F7, 0x00F7),
+    (0x2010, 0x2015),
+    (0x2018, 0x2022),
+    (0x2026, 0x2026),
+    (0x2030, 0x2030),
+    (0x2039, 0x203A),
+    (0x20AC, 0x20AC),
+    (0x2122, 0x2122),
+)
+
+
+def _is_plain(char: str) -> bool:
+    if char in "\n\t " or "!" <= char <= "~":
+        return True
+    if char in _HANGUL_FILLERS:
+        return False
+    if unicodedata.category(char)[0] in "LN":
+        return True
+    return any(low <= ord(char) <= high for low, high in _CLIPBOARD_PUNCTUATION_RANGES)
+
+
+def _is_clipboard_text(text: str) -> bool:
+    if not 1 <= len(text) <= _CLIPBOARD_TEXT_MAX_CHARS:
+        return False
+    return all(_is_plain(char) for char in text)
 
 
 class StubPlanner:
@@ -64,6 +103,11 @@ class StubPlanner:
     - ``healthcheck <label>`` yields one ``session_agent.healthcheck`` call asking the Session
       Agent to echo ``<label>`` (the next word, without trailing ``,.;:!?``). It touches no
       desktop data; it exercises the approval and Session Agent path end to end.
+    - ``copy "<text>"`` yields one ``desktop.write_clipboard_text`` call for ``<text>``: everything
+      between the first double quote after ``copy`` and the last double quote of the goal, so
+      the text may itself contain quotes. Empty or over-long text, and text with any character
+      outside letters, digits, common punctuation, spaces and tabs, yields no call. The planner
+      never reads the clipboard.
     - A goal that matches nothing yields an empty plan.
     """
 
@@ -81,6 +125,11 @@ class StubPlanner:
                 label = check_label.rstrip(_TRAILING_PUNCTUATION)
                 if label:
                     calls.append(PlannedCall(TOOL_SESSION_AGENT_HEALTHCHECK, {"label": label}))
+            elif (copy_text := match.group("copy_text")) is not None:
+                if _is_clipboard_text(copy_text):
+                    calls.append(
+                        PlannedCall(TOOL_DESKTOP_WRITE_CLIPBOARD_TEXT, {"text": copy_text})
+                    )
             elif target is not None:
                 path = target.rstrip(_TRAILING_PUNCTUATION)
                 if path:

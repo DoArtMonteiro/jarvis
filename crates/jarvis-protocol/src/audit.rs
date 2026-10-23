@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::message::Label;
 use crate::{
-    AgentHealth, ApprovalId, Capability, Fingerprint, GovernorReason, JobId, JobStatus,
+    AgentReport, ApprovalId, Capability, Fingerprint, GovernorReason, JobId, JobStatus,
     PolicyDecision, ProtocolVersion, RequestId, SessionId, TaskId, TaskStatus, ToolName, WireError,
 };
 
@@ -177,9 +177,12 @@ pub enum AuditEventKind {
         client: String,
         reason: String,
     },
-    /// The Core started its Session Agent.
+    /// The Core started its Session Agent. `image_sha256` is the SHA-256
+    /// of the executable the Core started, when it could read it: a record
+    /// for later checks, not a defence against a same-user process.
     SessionAgentStarted {
         pid: Option<u32>,
+        image_sha256: Option<Fingerprint>,
     },
     /// The Core stopped its Session Agent; every live grant was revoked.
     SessionAgentStopped {
@@ -199,7 +202,7 @@ pub enum AuditEventKind {
     /// Core and the person; the worker only learns that it completed.
     SessionAgentCompleted {
         grant_id: ApprovalId,
-        report: AgentHealth,
+        report: AgentReport,
     },
     /// The operation was not performed: the Core or the agent refused it.
     SessionAgentRefused {
@@ -321,10 +324,10 @@ mod tests {
             },
             AuditEventKind::SessionAgentCompleted {
                 grant_id: ApprovalId::new(),
-                report: AgentHealth {
+                report: AgentReport::Healthcheck(crate::AgentHealth {
                     label: crate::AgentLabel::try_from("ping".to_owned()).unwrap(),
                     performed: 1,
-                },
+                }),
             },
             AuditEventKind::SessionAgentRefused {
                 grant_id: None,

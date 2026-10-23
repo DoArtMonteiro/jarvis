@@ -17,10 +17,10 @@ library (3.11 or newer). After the handshake it waits for jobs: for each goal it
 asks the Core to run them one at a time, and reports a one-line summary. A call that needs a
 person simply takes longer to answer; the worker never sees or handles approvals.
 
-The stub planner understands three phrases, in order of appearance: a topic word (`system`,
+The stub planner understands these phrases, in order of appearance: a topic word (`system`,
 `runtime`, `machine`, `environment`) asks for `system.info`; `read <path>` asks for
 `filesystem.read_fixture`; `write <path>: <text>` asks for `workspace.write_file` with the rest of
-the goal as content.
+the goal as content; `copy "<text>"` asks for `desktop.write_clipboard_text` (single-line text; the Core re-checks it).
 
 Frames go to stdout, logs go to stderr. Exit code `0` means the Core closed the session while the
 worker was idle, `2` is a usage error and `3` is a session or protocol failure.

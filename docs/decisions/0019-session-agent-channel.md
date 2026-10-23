@@ -1,6 +1,6 @@
 # 0019. The first Session Agent: a Core-owned channel and one synthetic operation
 
-**Status:** Accepted. Implements the transport, grants and audit of ADR 0017 for one operation that touches no desktop data. No desktop operation can be performed.
+**Status:** Accepted. Implements the transport, grants and audit of ADR 0017 for one operation that touches no desktop data. No desktop operation can be performed here; ADR 0020 later adds writing approved text to the clipboard.
 
 ## Context
 
@@ -48,7 +48,7 @@ The agent's identity is the channel: an OS object only the Core and that child h
 
 On an unknown outcome the agent is stopped and every grant is revoked, so a late reply has no channel to arrive on. The operation is never sent again. A job holding such a task is quarantined, not resumed (ADR 0015). The Core starts the agent at most `session_agent.max_starts` times per run; after that, agent operations are refused before their approval is used.
 
-**What is not claimed.** Exactly-once holds for this synthetic operation, which has no effect outside the agent. A future desktop operation with a real effect can be left in an unknown state by a crash after `perform` is sent. It is then recorded as unknown and never retried, which is fail-closed, not exactly-once.
+**What is not claimed.** Exactly-once holds for this synthetic operation, which has no effect outside the agent. A future desktop operation with a real effect can be left in an unknown state by a crash after `perform` is sent. It is then recorded as unknown and never retried, which is fail-closed, not exactly-once. (After a Core crash, start-up recovery records the unknown outcome; ADR 0020 added this.)
 
 ## Consequences
 
@@ -58,8 +58,8 @@ On an unknown outcome the agent is stopped and every grant is revoked, so a late
 
 ## Not built
 
-- Any desktop code: capture, clipboard, input, the window picker, binding a target to one picker session, or checking focus before typing.
-- Stopping same-user processes at medium integrity from reading the agent's memory, opening it, or replacing its executable: the Core starts the configured program (or `jarvis-session-agent` next to its own executable) without checking its integrity. That account is trusted by the same rule as for the RPC endpoint.
+- Any desktop code: capture, clipboard, input, the window picker, binding a target to one picker session, or checking focus before typing. (ADR 0020 later adds clipboard writes and records why typing stays closed.)
+- Stopping same-user processes at medium integrity from reading the agent's memory, opening it, or replacing its executable: the Core starts the configured program (or `jarvis-session-agent` next to its own executable) without checking its integrity. That account is trusted by the same rule as for the RPC endpoint. (ADR 0020 later records the SHA-256 of the executable it starts; that is a record, not a check.)
 - A start budget that refills: after `session_agent.max_starts` starts, agent operations are refused until the Core restarts.
 - Concurrency: one operation at a time. The link holds its lock while it starts the agent and waits for an answer, so a slow agent delays other agent operations and shutdown by up to the configured timeout.
 - On Linux, `PR_SET_PDEATHSIG` follows the thread that started the agent. The Core starts it from its runtime's worker threads, which live as long as the Core; the agent also exits when its input closes.

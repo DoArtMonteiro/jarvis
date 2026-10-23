@@ -997,6 +997,59 @@ fn approval_rows_are_protected_by_triggers() {
 }
 
 #[test]
+fn recovery_records_an_unanswered_agent_operation_as_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let session = SessionId::new();
+    let Pending { task, approval } = pending(&store, session, "r1", HOUR_MS);
+    let (id, fingerprint) = (approval.approval_id, approval.fingerprint);
+    store
+        .grant_approval(id, &fingerprint, "client", now_ms())
+        .unwrap();
+    let dispatched = AuditEventKind::SessionAgentDispatched {
+        grant_id: id,
+        tool: "desktop.write_clipboard_text".into(),
+        ttl_ms: 5_000,
+    };
+    store
+        .consume_approval(id, &fingerprint, now_ms(), &[started(), dispatched])
+        .unwrap();
+    // A second task was executing without anything sent to the agent.
+    let other = new_task(session, "r2");
+    store.create_task(&other).unwrap();
+    store
+        .transition(
+            other.task_id,
+            &[TaskStatus::Received],
+            &TaskChange::to(TaskStatus::Executing),
+            &[started()],
+        )
+        .unwrap();
+
+    store.recover(MAX_ATTEMPTS).unwrap();
+    let unknown = |task_id| {
+        store
+            .audit_events(Some(task_id), 100)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.event {
+                AuditEventKind::SessionAgentOutcomeUnknown { grant_id, .. } => Some(grant_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(unknown(task.task_id), [id]);
+    assert!(unknown(other.task_id).is_empty());
+    assert_eq!(
+        store.task(task.task_id).unwrap().unwrap().status,
+        TaskStatus::Interrupted
+    );
+    // Recovering again adds nothing.
+    store.recover(MAX_ATTEMPTS).unwrap();
+    assert_eq!(unknown(task.task_id), [id]);
+}
+
+#[test]
 fn consuming_an_approval_hands_out_its_proof_once() {
     use jarvis_protocol::{AgentLabel, HealthcheckArgs, ToolCall};
 

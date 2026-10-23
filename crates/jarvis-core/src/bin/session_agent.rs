@@ -2,8 +2,9 @@
 //!
 //! Started only by the Core, which holds the other ends of its standard
 //! input and output. It takes no arguments and reads no environment. It
-//! performs only the operations in `jarvis_protocol::AgentOperation`, today a
-//! synthetic health check, and touches no desktop, clipboard or input.
+//! performs only the operations in `jarvis_protocol::AgentOperation`: a
+//! synthetic health check and writing approved text to the clipboard (ADR
+//! 0020). It never reads the clipboard and touches no screen or input.
 
 use std::io::{self, BufReader};
 use std::process::ExitCode;

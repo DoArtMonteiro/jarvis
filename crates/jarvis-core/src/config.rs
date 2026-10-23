@@ -589,9 +589,15 @@ impl Config {
         };
 
         for (&capability, &decision) in &raw.policy {
-            if capability.is_desktop() && decision != PolicyDecision::Deny {
+            // Writing the clipboard is the one desktop operation (ADR 0020).
+            // The owner opts in here; each write still needs an approval.
+            if capability.is_desktop()
+                && capability != Capability::DesktopClipboardWrite
+                && decision != PolicyDecision::Deny
+            {
                 return Err(ConfigError::Invalid(format!(
-                    "policy cannot set `{capability}` to `{decision}`: desktop operations                      are not available yet, so a desktop capability can only be `deny`"
+                    "policy cannot set `{capability}` to `{decision}`: that desktop operation \
+                     is not available, so it can only be `deny`"
                 )));
             }
             let ceiling = capability.class().ceiling();
@@ -734,7 +740,21 @@ mod tests {
 
     #[test]
     fn desktop_capabilities_can_only_be_denied() {
-        for capability in Capability::ALL.iter().filter(|c| c.is_desktop()) {
+        let clipboard = Capability::DesktopClipboardWrite;
+        for decision in ["deny", "require_confirmation"] {
+            let text = format!("{MINIMAL}\"{clipboard}\" = \"{decision}\"\n");
+            assert!(
+                Config::from_toml(&text, Path::new(".")).is_ok(),
+                "{decision}"
+            );
+        }
+        let text = format!("{MINIMAL}\"{clipboard}\" = \"allow\"\n");
+        let error = Config::from_toml(&text, Path::new(".")).unwrap_err();
+        assert!(error.to_string().contains("class"), "{error}");
+        for capability in Capability::ALL
+            .iter()
+            .filter(|c| c.is_desktop() && **c != clipboard)
+        {
             for decision in ["allow", "require_confirmation"] {
                 let text = format!(
                     "{MINIMAL}\"{capability}\" = \"{decision}\"

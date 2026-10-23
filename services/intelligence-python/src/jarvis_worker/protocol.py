@@ -21,6 +21,7 @@ from typing import NoReturn, TypeAlias, assert_never
 
 __all__ = [
     "PROTOCOL_VERSION",
+    "TOOL_DESKTOP_WRITE_CLIPBOARD_TEXT",
     "TOOL_READ_FIXTURE",
     "TOOL_SESSION_AGENT_HEALTHCHECK",
     "TOOL_SYSTEM_INFO",
@@ -70,6 +71,7 @@ TOOL_SYSTEM_INFO = "system.info"
 TOOL_READ_FIXTURE = "filesystem.read_fixture"
 TOOL_WRITE_FILE = "workspace.write_file"
 TOOL_SESSION_AGENT_HEALTHCHECK = "session_agent.healthcheck"
+TOOL_DESKTOP_WRITE_CLIPBOARD_TEXT = "desktop.write_clipboard_text"
 
 JsonValue: TypeAlias = "bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None"
 

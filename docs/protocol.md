@@ -158,7 +158,7 @@ A job can be handed out again after its worker or the Core stopped. Requests are
 | `session_agent.healthcheck` | `session_agent.healthcheck` | B | `{"label"}` | `agent_operation` (a receipt) |
 | `desktop.capture_window` | `desktop.screen.observe` | B, `deny` only | `{"target"}` | none: not performable |
 | `desktop.read_clipboard_text` | `desktop.clipboard.read` | B, `deny` only | `{}` | none: not performable |
-| `desktop.write_clipboard_text` | `desktop.clipboard.write` | B, `deny` only | `{"text"}` | none: not performable |
+| `desktop.write_clipboard_text` | `desktop.clipboard.write` | B, `deny` by default; may be `require_confirmation` | `{"text"}` | `{"agent_operation"}` receipt |
 | `desktop.type_text` | `desktop.input.send` | B, `deny` only | `{"target", "text"}` | none: not performable |
 
 `system.info` never returns hostname, username, environment variables or paths.
@@ -169,15 +169,15 @@ A job can be handed out again after its worker or the Core stopped. Requests are
 
 `session_agent.healthcheck` is performed by the Session Agent, a separate process the Core starts (ADR 0019). `label` is 1 to 64 visible characters. The Core keeps the agent's report and answers the worker with a receipt, `{"agent_operation": "session_agent.healthcheck"}`, whatever an agent operation returns.
 
-The `desktop.*` tools are typed so that a person can be shown exactly what one would do, but none can run: the configuration may only `deny` their capabilities. `target` is a window number; `text` is at most 4096 visible characters with no invisible formatting characters, and for `desktop.type_text` no control characters at all.
+`desktop.write_clipboard_text` is performed by the Session Agent when the owner has set `desktop.clipboard.write` to `require_confirmation` (ADR 0020). `text` is 1 to 1024 characters, each a newline, tab, space, printable ASCII, a letter or digit of any script, or common typographic punctuation (ADR 0020 lists what is refused). The text is written exactly as given, and the worker gets the same receipt as for the health check. The other `desktop.*` tools are typed so that a person can be shown exactly what one would do, but none can run: the configuration may only `deny` their capabilities. `target` is a window number; for `desktop.type_text`, `text` is at most 4096 visible characters with no control characters at all.
 
 ## Session Agent channel, version 1
 
 Between the Core and the Session Agent only, over the agent's standard input and output, which the Core creates for that one child. One JSON object per line, at most 16 KiB, every object carrying `"v": 1`; unknown fields, operations and versions are rejected.
 
 - Agent to Core, once at start: `{"type": "ready", "v": 1, "agent_version": "0.2.0"}`.
-- Core to agent: `{"type": "perform", "v": 1, "grant_id": "<approval id>", "operation": {"op": "healthcheck", "label": "ping"}, "ttl_ms": 9800}`. `healthcheck` is the only operation.
-- Agent to Core, once per `perform`: `{"type": "result", "v": 1, "grant_id": "<the same id>", "outcome": {"status": "done", "report": {"label": "ping", "performed": 1}}}`, or an outcome of `{"status": "refused", "reason": "replayed_grant" | "expired"}`.
+- Core to agent: `{"type": "perform", "v": 1, "grant_id": "<approval id>", "operation": {"op": "healthcheck", "label": "ping"}, "ttl_ms": 9800}`. The operations are `healthcheck` and `{"op": "write_clipboard_text", "text": "..."}`.
+- Agent to Core, once per `perform`: `{"type": "result", "v": 1, "grant_id": "<the same id>", "outcome": {"status": "done", "report": {"op": "healthcheck", "label": "ping", "performed": 1}}}` or, for a clipboard write, a report of `{"op": "write_clipboard_text", "utf16_units": 41}` (never the text). A refusal, meaning nothing was done, is `{"status": "refused", "reason": "replayed_grant" | "expired" | "clipboard_busy" | "clipboard_unavailable"}`. `{"status": "faulted", "reason": "clipboard_incomplete"}` means the operation started and may have taken effect; the Core records it as unknown.
 
 Anything else from the agent, or no answer within the configured time, ends the agent; see ADR 0019 for how each outcome is recorded.
 
