@@ -1,0 +1,30 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Donna main window: its own commands and event listening, nothing else.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-app-info",
+    "allow-core-connect",
+    "allow-load-model",
+    "allow-unload-model",
+    "allow-set-context-size",
+    "allow-chat-send",
+    "allow-chat-regenerate",
+    "allow-chat-cancel",
+    "allow-chat-follow",
+    "allow-list-conversations",
+    "allow-get-conversation",
+    "allow-delete-conversation",
+    "allow-delete-all-conversations",
+    "allow-list-approvals",
+    "allow-approve",
+    "allow-deny",
+    "allow-submit-copy-proposal",
+    "allow-get-job"
+  ]
+}

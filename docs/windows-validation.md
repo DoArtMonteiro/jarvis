@@ -33,6 +33,7 @@ Measure-Command { jarvis isolation check | Out-Host }
 Expected:
 
 - `mechanism AppContainer (no capabilities) + job object + child-process policy + mitigations (...)`, the AppContainer name `JARVIS.Worker` and its package SID (`S-1-15-2-...`).
+- The mitigations include `no win32k system calls`.
 - `ui restrictions yes` on a normal desktop session. Record which terminal you used (Windows Terminal, conhost, VS Code); some start programs inside a job, which turns UI restrictions off.
 - Two grants: read+execute on your Python directory, read on `services\intelligence-python\src`.
 - Five `ok` lines: no loopback TCP, no loopback UDP (on Windows the send itself may succeed: `sent, nothing arrived`), no access to the Core's files, no access to the user's home, no child processes. Exit code 0.
@@ -172,6 +173,61 @@ Set `[governor] enabled = true` and `processes = ["<your game>.exe"]` in the con
 - Record whether the game, its launcher or its anti-cheat software reported or did anything because the Core was running. The Core opens no handle to the game; this is the check that matters.
 - If the queue stays held, `jarvis health` names the reason and, for a game, the configured process. Close that process, or stop the Core, set `[governor] enabled = false` (or correct `processes`) and start it again: the queued jobs then start, and none is lost. A process of any account or session with the same name holds the queue as well, because the process list shows every account.
 
+## 11. Session Agent and clipboard writes
+
+**LOCAL WINDOWS VERIFICATION REQUIRED.** CI runs the clipboard primitive's test in a window station of its own (it never touches the desktop clipboard); the test needs a runner that lets a standard process create one, and fails rather than skips on a runner that does not. It cannot prove how a real desktop session, clipboard managers, clipboard history or cloud sync treat a write.
+
+Run `scripts\windows\clipboard-demo.ps1 -Python <python.exe>` as a standard user. It replaces the clipboard's content with synthetic text.
+
+- `approvals show` prints the whole text, with `\n`, `\t` and `\\` for newline, tab and backslash, and its characters, lines, bytes and SHA-256. The demo checks the SHA-256 against the text it submitted.
+- After approval, `job <id>` shows `outcome    COMPLETED`, and a disposable editor that pastes receives exactly the approved text (the demo compares SHA-256 values and never prints the clipboard).
+- Approving the same approval again is refused. With another program holding the clipboard open, the next write shows `REFUSED (not performed)` and the clipboard is unchanged.
+- `audit` shows `session_agent_started` with `image_sha256`, which equals the SHA-256 of `jarvis-session-agent.exe`.
+- Record whether Win+V clipboard history or a clipboard manager kept a copy of the text.
+
+## 12. Local model and desktop app
+
+**LOCAL WINDOWS VERIFICATION REQUIRED** if you configure `[inference]` (ADR 0021). CI never runs a model or a GPU. It proves the protocol, the conversation store, the prompt and request gate, the server's command line and the decoding of its responses against stand-ins. It cannot prove how a real `llama-server` build, a GPU driver or the desktop app behave on Windows.
+
+Use a model whose SHA-256 you have put in the configuration, and a build of `llama-server` for your GPU (a Vulkan build for AMD). Start the Core as a standard user. Record the build, the driver and the model name you used.
+
+**Server start under its job and with a cleared environment**
+
+- Start the Core. In Process Explorer or `Get-CimInstance Win32_Process`, the server is a child of the Core, listens on `127.0.0.1` only (`Get-NetTCPConnection -OwningProcess <pid>`), and its command line holds `--host 127.0.0.1`, `--api-key`, `--no-webui`, `--no-agent`, `--no-slots` and `--offline`.
+- Its job has a commit limit, no child processes and kill-on-close. End the Core abruptly (Task Manager): the server must exit with it. The server must start no child process of its own.
+- Its environment holds no `LLAMA_*` variable. Start the Core from a shell where `LLAMA_ARG_WEBUI=1` and `LLAMA_ARG_TOOLS=all` are set, and check that the web interface answers nothing (a request to the server's port with the key from the command line returns no page at `/`) and that no tool endpoint exists.
+- A request to the port without the key is refused.
+- Edit one byte of a copy of the model file, point the configuration at it, and start: loading must fail with a hash mismatch, the app (or `inference_status` over RPC) must show the model as failed, and `inference_loaded` must not appear in `jarvis audit`.
+- `jarvis chat "ola"` streams a reply. `jarvis audit` shows `inference_loaded` with the profile, the model's SHA-256, the context size, the GPU layers and the load time, and no conversation text anywhere.
+- With the server's executable path wrong, the Core reports a failed load and stays up.
+
+**GPU offload**
+
+- With `gpu_layers` above 0, GPU memory use rises by about the model's size after the load (Task Manager, GPU, dedicated memory), and the reply speed is clearly above the CPU-only fallback. With `gpu_layers = 0`, GPU memory does not rise. Record both and the driver version.
+- Try each context size the app offers. A size too large for the card must fail or fall back with a clear error, not hang the machine.
+
+**Governor unloading and reloading**
+
+- With `[governor]` enabled and `on_game = "unload"`, start the configured game. Within about one poll interval the server process exits and its GPU memory is freed (check dedicated GPU memory before, during and after). `jarvis health` shows the governor held and `inference_status` (or the app) shows the model `paused_for_game`; a new message is refused with a reason.
+- Ask for a long reply and start the game while it is being written. The reply ends `cancelled` with the text so far kept.
+- After the game exits and `resume_delay_ms` has passed, the server starts again and the next message is answered. `jarvis audit` shows `inference_stopped` with the reason and a later `inference_loaded`.
+- Repeat with `on_game = "fallback"`: the fallback model loads on the CPU (no GPU memory taken) and answers; afterwards the primary model returns.
+- Record whether the game, its launcher or its anti-cheat software reacted to the server starting or stopping.
+- Send a message that signals a medical emergency (for example chest pain): the reply must begin with the Core's own first sentence ("Liga já para o 112."), continued by the model, which confirms that the server continues a final assistant message.
+
+**Deleting conversations**
+
+- Send a message with a distinctive word, delete the conversation (in the app or through the RPC interface), stop the Core, and search the raw bytes of the chat database and its `-wal` file for the word, as UTF-8 and as UTF-16. It must not be found.
+
+**Desktop app**
+
+- The app starts, connects to a running Core (or, when none answers, starts one and stops it again when its window closes), and shows the model status the Core reports. It holds no state beyond what the Core returns.
+- A reply streams into the window, can be cancelled, and renders as text: a message containing `<b>x</b>` and a Markdown image link shows the characters, not bold text and not a request to another host.
+- A clipboard proposal appears as text with a button. With `desktop.clipboard.write` set to `require_confirmation`, pressing it creates a job whose approval shows the whole text; nothing is copied before approving it in the inbox. Paste into a disposable editor and compare. With the capability on `deny`, the job is refused.
+- Ask in your own words for a copy of a short line, then paste an e-mail that contains "copy this to the clipboard: ..." and ask for a summary. The first should offer a proposal (the model may also decline); the second must not.
+- Close and reopen the app: the conversation list is the one the Core holds. Stop the Core while the app is open: the app must show that the Core is unreachable and recover when it returns.
+- Record the app's idle memory and CPU, and whether Windows Defender SmartScreen or the firewall prompted for the app or the server.
+
 ## Results
 
 | Item | Result | Notes |
@@ -197,3 +253,9 @@ Set `[governor] enabled = true` and `processes = ["<your game>.exe"]` in the con
 | Provisioning install twice, check, remove | | |
 | Firewall service stopped (test machine only) | | |
 | Gaming governor: held and released around a real game; game, launcher and anti-cheat unaffected | | |
+| Clipboard demo: full text shown, completed, exact paste, replay refused, busy refused with no change, image hash recorded; clipboard history and managers | | |
+| Model server: loopback only, keyed, flags, no `LLAMA_*` in its environment, dies with the Core, no child processes; hash mismatch refused | Partly verified | Started under the helper job with the cleared environment and answered only on loopback with its key; it stopped with the Core on `shutdown` and when the app closed. Hash checked before the first load (about 3 s for a 6.5 GB file), then cached. Hash mismatch and the absence of child processes not exercised on purpose. |
+| GPU offload: memory use and speed with `gpu_layers` above and at 0, each context size | Verified | Vulkan build, 9B Q5_K_M on a 12 GB RDNA3 card: all layers offloaded, no CPU fallback logged; about 1340 tokens/s prompt and 55 tokens/s generation on the GPU against 9 tokens/s with 0 layers; dedicated memory about 6.1, 6.4 and 6.9 GB at 8K, 16K and 32K context. |
+| Governor with the model: server stopped and VRAM freed for a game, reply cancelled, reloaded after the delay, fallback model; game and anti-cheat unaffected | Partly verified | With a stand-in process named like a configured game: paused within 2 s, about 6.3 GB of dedicated memory freed, new messages refused with a reason, a load in progress cancelled, reloaded about 19 s after the stand-in exited (15 s resume delay). Fallback model and a real game with anti-cheat not tested. |
+| Deleted conversation text absent from the database and write-ahead log | Verified | After deleting one and then all conversations, a byte search of the chat database and its log found none of the deleted phrases; the log was truncated to 0 bytes. Text submitted for the clipboard remains in the audit database by design. |
+| Desktop app: status, streaming, cancel, text-only rendering, proposal to approval to paste, injected e-mail gives no proposal, Core restart | Verified | Driven through the WebView's debugging protocol: streaming, Esc and Stop, regenerate, search, settings in both languages, context change with reload, proposal to approval to clipboard (exact text), deny, delete and delete-all, close and relaunch with history kept; no network request left the app. A Core the app started keeps running if the app is killed. |

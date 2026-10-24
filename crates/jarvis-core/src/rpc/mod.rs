@@ -27,6 +27,7 @@ use crate::approval;
 use crate::config::RpcConfig;
 use crate::framing::{Frame, FrameReader};
 use crate::hub::Hub;
+use crate::inference::{Inference, InferenceError};
 use crate::store::{ApprovalError, JobRecord, Store, StoreError, now_ms};
 use transport::Stream;
 pub use transport::{Endpoint, Listener, Peer};
@@ -44,6 +45,8 @@ pub struct RpcState {
     pub shutdown: CancellationToken,
     pub started: Instant,
     pub core_version: &'static str,
+    /// The local model, when configured (ADR 0021).
+    pub inference: Option<Arc<Inference>>,
 }
 
 /// Accept connections until `stop` is cancelled, then wait briefly for the
@@ -163,6 +166,13 @@ fn refusal(state: &RpcState, peer: &Peer) -> Option<&'static str> {
     };
     if state.hub.is_worker_process(pid) {
         return Some("connections from the worker are not allowed");
+    }
+    if state
+        .inference
+        .as_ref()
+        .is_some_and(|inference| inference.is_server_process(pid))
+    {
+        return Some("connections from the model server are not allowed");
     }
     #[cfg(unix)]
     if peer.uid != Some(jarvis_sandbox::current_uid()) {
@@ -331,8 +341,89 @@ async fn handle(state: &RpcState, request: RpcRequest, peer: &Peer) -> RpcRespon
                 ))
             }
         }
+        chat => chat_request(state, chat).await,
     };
     result.unwrap_or_else(RpcResponse::Error)
+}
+
+/// The conversation and model operations (ADR 0021). None of them runs a
+/// tool: they reach the model, which only produces text.
+async fn chat_request(state: &RpcState, request: RpcRequest) -> Result<RpcResponse, RpcError> {
+    let Some(inference) = state.inference.as_ref() else {
+        return Err(RpcError::new(
+            RpcErrorCode::Unavailable,
+            "the local model is not configured",
+        ));
+    };
+    let response = match request {
+        RpcRequest::ChatSend {
+            conversation_id,
+            text,
+            language,
+        } => RpcResponse::ChatTurn(inference.send(conversation_id, text, language).await?),
+        RpcRequest::ChatRegenerate {
+            conversation_id,
+            language,
+        } => RpcResponse::ChatTurn(inference.regenerate(conversation_id, language).await?),
+        RpcRequest::ChatPoll {
+            turn_id,
+            cursor,
+            wait_ms,
+        } => {
+            let wait = Duration::from_millis(u64::from(wait_ms)).min(RpcConfig::MAX_WAIT);
+            RpcResponse::ChatDelta(inference.poll(turn_id, cursor, wait).await?)
+        }
+        RpcRequest::ChatCancel { turn_id } => {
+            RpcResponse::ChatDelta(inference.cancel(turn_id).await?)
+        }
+        RpcRequest::ListConversations { query, limit } => RpcResponse::Conversations {
+            conversations: inference.conversations(query, limit.min(MAX_LIST)).await?,
+        },
+        RpcRequest::GetConversation { conversation_id } => {
+            RpcResponse::Conversation(inference.conversation(conversation_id).await?)
+        }
+        RpcRequest::DeleteConversation { conversation_id } => RpcResponse::Deleted {
+            conversations: inference.delete_conversation(conversation_id).await?,
+        },
+        RpcRequest::DeleteAllConversations {} => RpcResponse::Deleted {
+            conversations: inference.delete_all().await?,
+        },
+        RpcRequest::InferenceStatus {} => RpcResponse::Inference(inference.status()),
+        RpcRequest::LoadModel {} => RpcResponse::Inference(inference.load()?),
+        RpcRequest::UnloadModel {} => RpcResponse::Inference(inference.unload().await),
+        RpcRequest::SetContextSize { context_size } => {
+            RpcResponse::Inference(inference.set_context_size(context_size).await?)
+        }
+        _ => {
+            return Err(RpcError::new(
+                RpcErrorCode::Internal,
+                "the Core could not complete the request",
+            ));
+        }
+    };
+    Ok(response)
+}
+
+impl From<InferenceError> for RpcError {
+    fn from(error: InferenceError) -> Self {
+        let code = match &error {
+            InferenceError::Busy => RpcErrorCode::Conflict,
+            InferenceError::NotFound(_) => RpcErrorCode::NotFound,
+            InferenceError::Paused | InferenceError::Load(_) => RpcErrorCode::Unavailable,
+            InferenceError::Invalid(_) => RpcErrorCode::MalformedRequest,
+            InferenceError::Store(crate::inference::chat_store::ChatStoreError::ScrubPending) => {
+                RpcErrorCode::Conflict
+            }
+            InferenceError::Store(store) => {
+                tracing::error!(error = %store, "chat request failed");
+                return RpcError::new(
+                    RpcErrorCode::Internal,
+                    "the Core could not complete the request",
+                );
+            }
+        };
+        RpcError::new(code, error.to_string())
+    }
 }
 
 fn decided(
@@ -454,6 +545,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             started: Instant::now(),
             core_version: "test",
+            inference: None,
         }
     }
 

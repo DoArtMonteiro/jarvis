@@ -91,3 +91,11 @@ alert_after_ms = 14400000
 "system.info" = "allow"
 "filesystem.read.fixture" = "allow"
 "workspace.write" = "require_confirmation"
+# The Session Agent's synthetic health check (ADR 0019); class B.
+"session_agent.healthcheck" = "require_confirmation"
+# Writing text a person approved to the clipboard (ADR 0020); class B and
+# off by default. Set it to "require_confirmation" to opt in: every write is
+# then shown in full and needs its own approval. The other desktop
+# capabilities ("desktop.screen.observe", "desktop.clipboard.read",
+# "desktop.input.send") can only be "deny".
+"desktop.clipboard.write" = "deny"

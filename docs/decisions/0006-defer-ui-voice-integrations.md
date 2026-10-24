@@ -1,6 +1,6 @@
 # 0006. Dashboard, voice and personal integrations are deferred
 
-**Status:** Accepted
+**Status:** Accepted. Amended by [ADR 0021](0021-local-inference.md) for model-backed conversation and a desktop client; voice, remote access and personal integrations stay deferred.
 
 ## Context
 

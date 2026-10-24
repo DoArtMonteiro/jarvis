@@ -54,21 +54,23 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
 use windows_sys::Win32::System::SystemServices::{
-    JOB_OBJECT_UILIMIT_ALL, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
-    SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+    JOB_OBJECT_UILIMIT_ALL, PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY,
+    SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID, SYSTEM_MANDATORY_LABEL_ACE_TYPE,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, GetExitCodeProcess, OpenProcess, OpenProcessToken,
-    OpenThreadToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetCurrentThread, GetExitCodeProcess, GetProcessMitigationPolicy,
+    OpenProcess, OpenProcessToken, OpenThreadToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    ProcessSystemCallDisablePolicy,
 };
 
 use crate::{Confinement, PipeClient, Report};
 
 mod appcontainer;
+pub(crate) mod clipboard;
 mod launch;
 mod processes;
 
-pub(crate) use launch::{Process, Stderr, Stdin, Stdout, spawn};
+pub(crate) use launch::{Process, Stderr, Stdin, Stdout, spawn, spawn_helper};
 pub(crate) use processes::{PROCESS_NAME_LIMIT, visit_process_names};
 
 /// Describe the AppContainer the worker would run in, without creating it.
@@ -231,6 +233,32 @@ fn require_in_job(process: HANDLE, job: &Handle) -> io::Result<()> {
     check(ok, "IsProcessInJob(worker)")?;
     if in_job == 0 {
         return Err(io::Error::other("the worker is not inside its job object"));
+    }
+    Ok(())
+}
+
+/// Confirm, as the kernel reports it, that the suspended worker cannot make
+/// win32k system calls. This holds whether or not the job's UI restrictions
+/// apply, but it is one property: it does not by itself prove every desktop
+/// channel closed.
+fn require_win32k_disabled(process: HANDLE) -> io::Result<()> {
+    // SAFETY: an all-zero policy is a valid value of this plain C struct.
+    let mut policy: PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY = unsafe { zeroed() };
+    // SAFETY: a valid process handle and a buffer of the policy's size.
+    let ok = unsafe {
+        GetProcessMitigationPolicy(
+            process,
+            ProcessSystemCallDisablePolicy,
+            (&raw mut policy).cast::<c_void>(),
+            size_of::<PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY>(),
+        )
+    };
+    check(ok, "GetProcessMitigationPolicy(worker)")?;
+    // SAFETY: every bit pattern of the flags union is a valid u32.
+    let flags = unsafe { policy.Anonymous.Flags };
+    // Bit 0: DisallowWin32kSystemCalls.
+    if flags & 1 == 0 {
+        return Err(io::Error::other("the worker can make win32k system calls"));
     }
     Ok(())
 }

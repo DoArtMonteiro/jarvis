@@ -35,7 +35,9 @@ cargo run -p jarvis-core -- approvals list --config config/jarvis.example.toml
 cargo run -p jarvis-core -- audit --config config/jarvis.example.toml
 ```
 
-CI runs all of the above on every pull request. Rust tests also run on Windows. Windows behaviour that CI cannot prove is listed in `docs/windows-validation.md`. On Linux the tests need a kernel with Landlock enabled; on Windows, a real `python.exe` (not the `py` launcher or a virtual environment).
+With `[inference]` configured (`config/donna.example.toml`, which needs a local model server and model file), `cargo run -p jarvis-core -- chat "hello" --config <that file>` talks to the local model. CI does not run it.
+
+CI runs the checks above on every pull request. Rust tests also run on Windows. Windows behaviour that CI cannot prove is listed in `docs/windows-validation.md`. On Linux the tests need a kernel with Landlock enabled; on Windows, a real `python.exe` (not the `py` launcher or a virtual environment).
 
 ## Invariants
 
@@ -50,7 +52,7 @@ Do not weaken these without an ADR in `docs/decisions/` and an update to the thr
 7. State changes and their audit events commit in one transaction. Audit events are append-only; terminal tasks, decided approvals and finished jobs are immutable.
 8. Decoding is strict on every interface: unknown fields, unknown types and other protocol versions are rejected.
 9. Everything the worker or a client can influence is bounded: frame and request sizes, request and error counts, tool, job and approval time, result size, buffered frames, connections, long polls, worker memory and restarts.
-10. The worker starts with a cleared environment, is never started through a shell, runs inside its OS isolation (ADRs 0013, 0014) from its first instruction with no network, no child processes and no user files beyond its runtime and source (on Windows it can also write its own AppContainer folder and read system files; ADR 0013 lists the registry and screen gaps), and is refused by the RPC server. The Core checks the isolation with a probe at start-up and does not run a worker if a check fails.
+10. The worker starts with a cleared environment, is never started through a shell, runs inside its OS isolation (ADRs 0013, 0014) from its first instruction with no network, no child processes and no user files beyond its runtime and source (on Windows it can also write its own AppContainer folder and read system files, and can make no win32k system calls; ADRs 0013 and 0018 list the registry and screen gaps), and is refused by the RPC server. The Core checks the isolation with a probe at start-up and does not run a worker if a check fails.
 11. The worker package never performs privileged operations itself (`tests/test_boundaries.py` guards this).
 
 ## Adding a tool
@@ -84,4 +86,4 @@ This repository is public. Write for an engineer reading it for the first time.
 
 ## Out of scope for now
 
-Model routing, voice, remote access, wake-on-LAN, browser automation, personal application integrations, memory, a WASM plugin runtime, shell execution and deployment. See `docs/decisions/0006-defer-ui-voice-integrations.md`.
+Model routing, model-backed planning or tools for the model, voice, remote access, wake-on-LAN, browser automation, personal application integrations, memory, a WASM plugin runtime, shell execution and deployment. See `docs/decisions/0006-defer-ui-voice-integrations.md`; ADR 0021 amends it for the model-backed conversation and the desktop client only.

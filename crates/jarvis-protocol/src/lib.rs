@@ -9,8 +9,10 @@
 //! tool and its arguments; it never names capabilities. Capabilities are
 //! derived by the Core from the typed [`ToolCall`].
 
+mod agent;
 mod audit;
 mod capability;
+mod chat;
 mod error;
 mod ids;
 mod message;
@@ -19,10 +21,25 @@ mod task;
 mod text;
 mod tools;
 
+pub use agent::{
+    AgentDecodeError, AgentFault, AgentHealth, AgentLabel, AgentOperation, AgentOutcome,
+    AgentReceipt, AgentRefusal, AgentReport, AgentToCore, AgentVersion, CaptureWindowArgs,
+    ClipboardText, ClipboardWritten, CoreToAgent, HealthcheckArgs, MAX_AGENT_FRAME_BYTES,
+    MAX_GRANT_TTL_MS, ReadClipboardTextArgs, TypeTextArgs, TypedText, WindowTarget,
+    WriteClipboardTextArgs, decode_agent_to_core, decode_core_to_agent, encode_agent_frame,
+};
 pub use audit::{AuditEvent, AuditEventKind};
 pub use capability::{ActionClass, Capability, UnknownCapability};
+pub use chat::{
+    CONTEXT_SIZES, ChatDelta, ChatLanguage, ChatRole, ChatText, ChatTurn, ClipboardProposal,
+    ConversationSummary, ConversationView, InferenceState, InferenceView, MessageStatus,
+    MessageView, ModelProfile, SearchQuery, TurnStats,
+};
 pub use error::{ErrorCode, WireError};
-pub use ids::{ApprovalId, Fingerprint, InvalidId, JobId, RequestId, SessionId, TaskId, ToolName};
+pub use ids::{
+    ApprovalId, ConversationId, Fingerprint, InvalidId, JobId, MessageId, RequestId, SessionId,
+    TaskId, ToolName,
+};
 pub use message::{
     CoreMessage, DecodeError, ErrorMessage, Hello, JobAssignment, JobOutcome, JobResult, Label,
     SessionLimits, ToolOutcome, ToolRequest, ToolResponse, Welcome, WorkerMessage,
@@ -34,7 +51,7 @@ pub use rpc::{
     decode_rpc_response, encode_rpc_request, encode_rpc_response,
 };
 pub use task::{ApprovalStatus, JobStatus, PolicyDecision, TaskStatus};
-pub use text::{Goal, Summary};
+pub use text::{Goal, Summary, strip_hidden};
 pub use tools::{
     CallError, FixtureContent, ReadFixtureArgs, RelativePath, SystemInfo, SystemInfoArgs, ToolCall,
     ToolResult, WriteFileArgs, WriteOutcome,

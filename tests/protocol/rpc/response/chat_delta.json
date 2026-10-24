@@ -1,0 +1,16 @@
+{
+  "rpc": 3,
+  "type": "chat_delta",
+  "turn_id": "01928f5e-7c41-7a80-a192-adbecfd0e1f2",
+  "text": "Sempre. ",
+  "next_cursor": 8,
+  "status": "complete",
+  "error": null,
+  "stats": {
+    "prompt_tokens": 412,
+    "completion_tokens": 3,
+    "first_token_ms": 180,
+    "tokens_per_second_x10": 552
+  },
+  "proposal": "Reunião às 15h"
+}

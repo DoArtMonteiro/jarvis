@@ -185,6 +185,19 @@ async fn assert_refused(what: &str, attempt: &str, expected: &[&str]) {
     );
 }
 
+/// Run `code` unconfined, as a plain child of the test that inherits its
+/// inheritable handles: the positive control that shows a probe can see the
+/// operation succeed, so a refusal under confinement is not a broken probe.
+#[cfg(windows)]
+fn run_unconfined(code: &str) -> Option<i32> {
+    std::process::Command::new(which_python())
+        .args(["-I", "-S", "-B", "-c", code])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("the unconfined control did not start")
+        .code()
+}
+
 fn py_str(path: &Path) -> String {
     format!("r'{}'", path.display())
 }
@@ -663,14 +676,16 @@ async fn the_worker_has_no_capabilities() {
 #[cfg(windows)]
 #[tokio::test]
 async fn reading_another_process_is_denied() {
+    // `_winapi` is built into the interpreter, so the probe needs no FFI
+    // module, which the worker cannot load (see the win32k tests).
     let parent = std::process::id();
-    assert_denied(
-        "opening the Core's process for reading",
-        &format!(
-            "import ctypes\nfrom ctypes import wintypes\nk = ctypes.WinDLL('kernel32', use_last_error=True)\nk.OpenProcess.restype = wintypes.HANDLE\nh = k.OpenProcess(0x0010 | 0x0400, False, {parent})\nif not h:\n    raise ctypes.WinError(ctypes.get_last_error())"
-        ),
-    )
-    .await;
+    let attempt = format!("import _winapi\n_winapi.OpenProcess(0x0010 | 0x0400, False, {parent})");
+    assert_eq!(
+        run_unconfined(&denial_probe(&attempt)),
+        Some(0),
+        "control: an unconfined process could not open the test process"
+    );
+    assert_denied("opening the Core's process for reading", &attempt).await;
 }
 
 #[cfg(target_os = "linux")]
@@ -706,52 +721,174 @@ async fn an_inheritable_handle_does_not_reach_the_worker() {
     let ok = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
     assert_ne!(ok, 0);
     let value = handle as usize;
-    assert_refused(
-        "using an inherited handle",
-        &format!(
-            "import ctypes\nfrom ctypes import wintypes\nk = ctypes.WinDLL('kernel32', use_last_error=True)\nk.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]\nbuf = ctypes.create_unicode_buffer(1024)\nn = k.GetFinalPathNameByHandleW(wintypes.HANDLE({value}), buf, 1024, 0)\nif n == 0 or 'jarvis-canary' not in buf.value:\n    raise OSError('the handle was not inherited')"
-        ),
-        &["OSError"],
-    )
-    .await;
+    // Read through the handle value and look for the canary's content, so a
+    // different handle that happens to have the same value does not count.
+    // Only a disk file is read, so a pipe at that value cannot block the probe.
+    let attempt = format!(
+        "import _winapi\nme = _winapi.GetCurrentProcess()\nh = _winapi.DuplicateHandle(me, {value}, me, 0, False, _winapi.DUPLICATE_SAME_ACCESS)\nif _winapi.GetFileType(h) != _winapi.FILE_TYPE_DISK:\n    raise OSError('the handle is not the canary file')\ndata, _ = _winapi.ReadFile(h, 64)\nif b'canary-secret' not in data:\n    raise OSError('the handle was not inherited')"
+    );
+    assert_eq!(
+        run_unconfined(&denial_probe(&attempt)),
+        Some(0),
+        "control: an unconfined child did not inherit the handle"
+    );
+    assert_refused("using an inherited handle", &attempt, &["OSError"]).await;
 }
 
 // --- Windows: identity and the Core's pipe --------------------------------------------------
 
+/// Read the running worker's token from the test process, as the kernel
+/// reports it: whether it is an AppContainer token and its integrity RID.
+/// Observed from outside, so it needs no code in the confined process.
+#[cfg(windows)]
+fn worker_token(pid: u32) -> (u32, u32) {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY, TokenIntegrityLevel, TokenIsAppContainer,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: plain Win32 calls on handles this function opens and closes;
+    // buffers are sized for what each call writes.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        assert!(!process.is_null(), "OpenProcess(worker) failed");
+        let mut token = std::ptr::null_mut();
+        assert_ne!(OpenProcessToken(process, TOKEN_QUERY, &mut token), 0);
+        let mut is_container = 0u32;
+        let mut len = 0u32;
+        assert_ne!(
+            GetTokenInformation(
+                token,
+                TokenIsAppContainer,
+                (&raw mut is_container).cast::<c_void>(),
+                4,
+                &mut len
+            ),
+            0
+        );
+        let mut buffer = [0u64; 32];
+        assert_ne!(
+            GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                size_of_val(&buffer) as u32,
+                &mut len
+            ),
+            0
+        );
+        let sid = (*buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid;
+        let count = u32::from(*GetSidSubAuthorityCount(sid));
+        let level = *GetSidSubAuthority(sid, count - 1);
+        CloseHandle(token);
+        CloseHandle(process);
+        (is_container, level)
+    }
+}
+
+/// Start a confined worker that waits for stdin to close, run `check` on
+/// its pid while it is alive, then let it exit.
+#[cfg(windows)]
+async fn with_live_worker<T>(check: impl FnOnce(u32) -> T) -> T {
+    let Spawned {
+        mut process,
+        contained: _contained,
+        stdin,
+        stdout: _stdout,
+        stderr: _stderr,
+    } = start(
+        "import sys
+sys.stdin.read()",
+    );
+    let result = check(process.id());
+    drop(stdin);
+    tokio::time::timeout(Duration::from_secs(30), process.wait())
+        .await
+        .expect("the worker did not exit")
+        .unwrap();
+    result
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn the_worker_runs_in_an_app_container_at_low_integrity() {
-    // TokenIsAppContainer = 29, TokenIntegrityLevel = 25; low = 0x1000.
-    let outcome = run(concat!(
-        "import ctypes, sys\n",
-        "from ctypes import wintypes\n",
-        "a = ctypes.WinDLL('advapi32', use_last_error=True)\n",
-        "k = ctypes.WinDLL('kernel32', use_last_error=True)\n",
-        "k.GetCurrentProcess.restype = wintypes.HANDLE\n",
-        "a.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]\n",
-        "a.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]\n",
-        "a.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]\n",
-        "a.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)\n",
-        "a.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]\n",
-        "a.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)\n",
-        "token = wintypes.HANDLE()\n",
-        "if not a.OpenProcessToken(k.GetCurrentProcess(), 0x0008, ctypes.byref(token)):\n",
-        "    raise ctypes.WinError(ctypes.get_last_error())\n",
-        "value = wintypes.DWORD()\n",
-        "n = wintypes.DWORD()\n",
-        "if not a.GetTokenInformation(token, 29, ctypes.addressof(value), 4, ctypes.byref(n)):\n",
-        "    raise ctypes.WinError(ctypes.get_last_error())\n",
-        "buf = ctypes.create_string_buffer(256)\n",
-        "if not a.GetTokenInformation(token, 25, ctypes.addressof(buf), 256, ctypes.byref(n)):\n",
-        "    raise ctypes.WinError(ctypes.get_last_error())\n",
-        "sid = ctypes.c_void_p.from_buffer(buf).value\n",
-        "count = a.GetSidSubAuthorityCount(sid).contents.value\n",
-        "level = a.GetSidSubAuthority(sid, count - 1).contents.value\n",
-        "print(value.value, hex(level))\n",
-        "sys.exit(0 if value.value == 1 and level <= 0x1000 else 1)\n",
-    ))
-    .await;
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let (is_container, level) = with_live_worker(worker_token).await;
+    assert_eq!(
+        is_container, 1,
+        "the worker's token is not an AppContainer token"
+    );
+    assert!(
+        level <= 0x1000,
+        "worker integrity RID {level:#x}, expected low or below"
+    );
+    // Control: the same reading of this test's own process gives a
+    // non-AppContainer token above low integrity.
+    let (own_container, own_level) = worker_token(std::process::id());
+    assert_eq!(own_container, 0);
+    assert!(own_level > 0x1000);
+}
+
+/// The worker's win32k system-call policy, read from the test process as the
+/// kernel reports it: whether window, GDI and input system calls are
+/// disallowed for that process.
+#[cfg(windows)]
+fn win32k_disallowed(pid: u32) -> bool {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::SystemServices::PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY;
+    use windows_sys::Win32::System::Threading::{
+        GetProcessMitigationPolicy, OpenProcess, PROCESS_QUERY_INFORMATION,
+        ProcessSystemCallDisablePolicy,
+    };
+
+    // SAFETY: a handle this function opens and closes, and a buffer of the
+    // policy's size.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+        assert!(!process.is_null(), "OpenProcess(worker) failed");
+        let mut policy: PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY = std::mem::zeroed();
+        let ok = GetProcessMitigationPolicy(
+            process,
+            ProcessSystemCallDisablePolicy,
+            (&raw mut policy).cast::<c_void>(),
+            size_of_val(&policy),
+        );
+        CloseHandle(process);
+        assert_ne!(ok, 0, "GetProcessMitigationPolicy failed");
+        policy.Anonymous.Flags & 1 != 0
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn the_worker_cannot_make_win32k_system_calls() {
+    assert!(
+        with_live_worker(win32k_disallowed).await,
+        "the kernel reports the worker may make win32k system calls"
+    );
+    // Control: this test process is not under the policy.
+    assert!(!win32k_disallowed(std::process::id()));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn the_worker_cannot_load_a_foreign_function_interface() {
+    // Under the win32k policy `ctypes` fails to initialise, so worker code
+    // cannot call arbitrary Windows APIs through it. The worker itself never
+    // imports it.
+    let outcome = run("import ctypes").await;
+    assert_ne!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("ImportError"),
+        "expected an ImportError: {outcome:?}"
+    );
+    // Control: unconfined, the same import succeeds.
+    assert_eq!(run_unconfined("import ctypes"), Some(0));
 }
 
 #[cfg(windows)]
@@ -902,4 +1039,208 @@ fn resident_kib(pid: u32) -> u64 {
 #[cfg(not(any(target_os = "linux", windows)))]
 fn resident_kib(_pid: u32) -> u64 {
     0
+}
+
+// --- Trusted helpers (the Session Agent) ------------------------------------------------------
+
+/// A helper that waits for its input to close, as the Session Agent does.
+fn start_helper() -> Spawned {
+    jarvis_sandbox::spawn_helper(&command("import sys\nsys.stdin.read()"), MEMORY)
+        .expect("the helper did not start")
+}
+
+/// Whether process `pid` holds a handle to the same object as `handle` at the
+/// same value: duplicated out of that process and compared by the kernel.
+#[cfg(windows)]
+fn holds_handle(pid: u32, handle: std::os::windows::io::RawHandle) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
+    };
+
+    // SAFETY: plain Win32 calls on handles this function opens and closes;
+    // `handle` is a value, never dereferenced in this process.
+    unsafe {
+        let process = OpenProcess(PROCESS_DUP_HANDLE, 0, pid);
+        assert!(!process.is_null(), "OpenProcess(helper) failed");
+        let mut copy = std::ptr::null_mut();
+        let duplicated = DuplicateHandle(
+            process,
+            handle,
+            GetCurrentProcess(),
+            &mut copy,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        ) != 0;
+        let same = duplicated && CompareObjectHandles(copy, handle) != 0;
+        if duplicated {
+            CloseHandle(copy);
+        }
+        CloseHandle(process);
+        same
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_helper_inherits_only_its_stdio_handles() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    let canary = Canary::new();
+    let file = std::fs::File::open(&canary.path).unwrap();
+    let handle = file.as_raw_handle();
+    // SAFETY: marking a handle this test owns as inheritable.
+    let ok = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+    assert_ne!(ok, 0);
+
+    // Control: a child started the ordinary way inherits it.
+    let mut ordinary = std::process::Command::new(which_python())
+        .args(["-I", "-S", "-B", "-c", "import sys\nsys.stdin.read()"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(
+        holds_handle(ordinary.id(), handle),
+        "control: an ordinary child did not inherit the handle"
+    );
+    let _ = ordinary.kill();
+    let _ = ordinary.wait();
+
+    let helper = start_helper();
+    assert!(
+        !holds_handle(helper.process.id(), handle),
+        "the helper inherited a handle outside its handle list"
+    );
+}
+
+/// The helper's pipes are single-instance, already connected and owner-only:
+/// no other client can open one, whoever it runs as, and the confined worker
+/// cannot either.
+#[cfg(windows)]
+#[tokio::test]
+async fn no_one_can_join_a_helpers_channel() {
+    let _helper = start_helper();
+    let prefix = format!("jarvis-worker-{}-", std::process::id());
+    // Every pipe of this test process: the helper's and those of any worker
+    // a parallel test started. None may accept another client.
+    let attempt = format!(
+        "import os
+names = [n for n in os.listdir('//./pipe/') if n.startswith({prefix:?})]
+if len(names) < 3:
+    raise SystemExit(3)
+for name in names:
+    try:
+        open('//./pipe/' + name, 'r+b').close()
+    except OSError:
+        continue
+    raise SystemExit(0)
+raise PermissionError('every pipe refused the client')"
+    );
+    assert_eq!(
+        run_unconfined(&denial_probe(&attempt)),
+        Some(DENIED),
+        "a same-user process outside the sandbox joined a helper pipe, or none was found"
+    );
+    assert_refused(
+        "joining the helper's channel",
+        &attempt,
+        &["PermissionError", "FileNotFoundError"],
+    )
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_helper_inherits_only_its_stdio_descriptors() {
+    use std::os::fd::AsRawFd;
+
+    let canary = Canary::new();
+    let file = std::fs::File::open(&canary.path).unwrap();
+    // SAFETY: clears close-on-exec on a descriptor this test owns.
+    let cleared = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) };
+    assert_eq!(cleared, 0);
+    let holds = |pid: u32| {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .any(|target| target == canary.path)
+    };
+
+    let mut ordinary = std::process::Command::new(which_python())
+        .args(["-I", "-S", "-B", "-c", "import sys\nsys.stdin.read()"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        holds(ordinary.id()),
+        "control: an ordinary child did not inherit the descriptor"
+    );
+    let _ = ordinary.kill();
+    let _ = ordinary.wait();
+
+    let helper = start_helper();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !holds(helper.process.id()),
+        "the helper inherited a descriptor beyond its stdio"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_worker_cannot_write_to_a_helpers_input() {
+    let helper = start_helper();
+    let pid = helper.process.id();
+    assert_denied(
+        "writing to the helper's input",
+        &format!("open('/proc/{pid}/fd/0', 'wb')"),
+    )
+    .await;
+}
+
+/// Dropping the helper, as the Core does when it stops it, ends the
+/// process. (Death with the Core itself rests on the job object and
+/// `PR_SET_PDEATHSIG`, which this does not exercise.)
+#[tokio::test]
+async fn a_helper_ends_when_the_core_lets_go_of_it() {
+    let helper = start_helper();
+    let pid = helper.process.id();
+    assert!(process_exists(pid));
+    drop(helper);
+    for _ in 0..500 {
+        if !process_exists(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the helper outlived its handles");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_helper_cannot_start_a_child_process() {
+    let code = "import subprocess, sys\ntry:\n    subprocess.run([sys.executable, '-c', 'pass'], check=True)\nexcept OSError:\n    sys.exit(44)\nsys.exit(0)";
+    let mut helper = jarvis_sandbox::spawn_helper(&command(code), MEMORY).unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(60), helper.process.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(DENIED));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_worker_cannot_forge_a_helpers_replies() {
+    let helper = start_helper();
+    let pid = helper.process.id();
+    assert_denied(
+        "writing to the helper's output",
+        &format!("open('/proc/{pid}/fd/1', 'wb')"),
+    )
+    .await;
 }

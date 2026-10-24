@@ -9,18 +9,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use jarvis_core::config::Limits;
+use jarvis_core::config::SessionAgentConfig;
 use jarvis_core::gateway::Gateway;
 use jarvis_core::hub::Hub;
 use jarvis_core::policy::Policy;
 use jarvis_core::session::{SessionContext, SessionEnd, SessionError, SessionReport, run_session};
+use jarvis_core::session_agent::{Launched, Launcher, ProcessLauncher, SessionAgent};
 use jarvis_core::store::{ApprovalError, ApprovalRecord, Store, now_ms};
 use jarvis_protocol::{
-    ApprovalStatus, AuditEventKind, Capability, CoreMessage, ErrorCode, Fingerprint, Goal, JobId,
-    JobStatus, PolicyDecision, Summary, TaskStatus, ToolCall, ToolOutcome, ToolResult,
-    decode_core_message,
+    AgentReport, ApprovalStatus, AuditEventKind, Capability, ClipboardWritten, CoreMessage,
+    ErrorCode, Fingerprint, Goal, JobId, JobStatus, PolicyDecision, Summary, TaskStatus, ToolCall,
+    ToolOutcome, ToolResult, decode_core_message,
 };
 use jarvis_tools::{FixtureRoot, ToolExecutor, ToolFuture, Toolbox, WorkspaceRoot};
 use serde_json::{Value, json};
+use sha2::Digest;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -52,6 +55,7 @@ struct Options {
     job_timeout: Duration,
     /// Capacity of the pipe from the Core to the worker.
     reply_buffer: usize,
+    session_agent: Option<Arc<SessionAgent>>,
 }
 
 impl Default for Options {
@@ -74,6 +78,7 @@ impl Default for Options {
             approval_ttl: Duration::from_secs(60),
             job_timeout: Duration::from_secs(120),
             reply_buffer: 1 << 20,
+            session_agent: None,
         }
     }
 }
@@ -127,6 +132,7 @@ impl Harness {
             job_timeout: options.job_timeout,
             core_version: "test",
             hub: Arc::clone(&hub),
+            session_agent: options.session_agent,
         };
 
         let (to_core, core_reader) = tokio::io::duplex(1 << 20);
@@ -1533,4 +1539,766 @@ async fn buffered_requests_do_not_extend_a_job_past_its_limit() {
     for task in store.tasks(10).unwrap() {
         assert!(task.status.is_terminal(), "{:?}", task.status);
     }
+}
+
+// --- Session Agent -------------------------------------------------------------------------------
+
+fn agent_policy() -> Vec<(Capability, PolicyDecision)> {
+    let mut policy = Options::default().policy;
+    policy.push((
+        Capability::SessionAgentHealthcheck,
+        PolicyDecision::RequireConfirmation,
+    ));
+    for capability in Capability::ALL.iter().filter(|c| c.is_desktop()) {
+        policy.push((*capability, PolicyDecision::Deny));
+    }
+    policy
+}
+
+fn agent_config(timeout: Duration, max_starts: u32) -> SessionAgentConfig {
+    SessionAgentConfig {
+        program: None,
+        timeout,
+        grant_ttl: Duration::from_secs(10),
+        max_starts,
+    }
+}
+
+/// The real `jarvis-session-agent` executable, started as a trusted helper.
+fn real_agent() -> Arc<SessionAgent> {
+    let launcher = ProcessLauncher::new(env!("CARGO_BIN_EXE_jarvis-session-agent").into());
+    Arc::new(SessionAgent::new(
+        Arc::new(launcher),
+        &agent_config(Duration::from_secs(10), 4),
+    ))
+}
+
+/// How a fake agent behaves after it announced itself (or instead of it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fake {
+    /// Never announces itself.
+    Silent,
+    /// Reads the operation and exits without answering.
+    ExitAfterPerform,
+    /// Answers for a grant it was not given.
+    WrongGrant,
+    /// Reads the operation and never answers.
+    Hang,
+    /// Answers with a frame that is not a valid reply.
+    Garbage,
+    /// Refuses the grant as already seen.
+    Refuse,
+    /// Performs one operation, then exits while idle.
+    OnceThenExit,
+    /// Reports a clipboard write of the text it was sent.
+    Clipboard,
+    /// Refuses a clipboard write because the clipboard is in use.
+    ClipboardBusy,
+    /// Reports that a clipboard write may be incomplete.
+    ClipboardFault,
+    /// Reports a clipboard write of a different length.
+    ClipboardWrongLength,
+}
+
+/// Launches in-memory agents that misbehave as told, counting launches and
+/// the operations they received.
+#[derive(Debug)]
+struct FakeLauncher {
+    behaviour: Fake,
+    launches: Arc<AtomicUsize>,
+    performs: Arc<AtomicUsize>,
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl Launcher for FakeLauncher {
+    fn launch(&self) -> std::io::Result<Launched> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        let (core_writer, agent_reader) = tokio::io::duplex(64 * 1024);
+        let (agent_writer, core_reader) = tokio::io::duplex(64 * 1024);
+        let behaviour = self.behaviour;
+        let performs = Arc::clone(&self.performs);
+        let task = tokio::spawn(async move {
+            let mut lines = BufReader::new(agent_reader).lines();
+            let mut out = agent_writer;
+            if behaviour == Fake::Silent {
+                std::future::pending::<()>().await;
+            }
+            out.write_all(b"{\"type\":\"ready\",\"v\":1,\"agent_version\":\"fake\"}\n")
+                .await
+                .unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                performs.fetch_add(1, Ordering::SeqCst);
+                let frame: Value = serde_json::from_str(&line).unwrap();
+                let grant = frame["grant_id"].clone();
+                let units = frame["operation"]["text"]
+                    .as_str()
+                    .map_or(0, |text| text.encode_utf16().count());
+                let reply = match behaviour {
+                    Fake::Silent | Fake::ExitAfterPerform => return,
+                    Fake::Hang => std::future::pending().await,
+                    Fake::WrongGrant => json!({"type": "result", "v": 1,
+                        "grant_id": jarvis_protocol::ApprovalId::new(),
+                        "outcome": {"status": "done", "report": {"op": "healthcheck", "label": "ping", "performed": 1}}}),
+                    Fake::Garbage => json!({"type": "result", "v": 1, "grant_id": grant,
+                        "outcome": {"status": "done", "report": {"op": "healthcheck", "label": "ping", "performed": 1,
+                        "screen": "AAAA"}}}),
+                    Fake::Refuse => json!({"type": "result", "v": 1, "grant_id": grant,
+                        "outcome": {"status": "refused", "reason": "replayed_grant"}}),
+                    Fake::OnceThenExit => json!({"type": "result", "v": 1, "grant_id": grant,
+                        "outcome": {"status": "done", "report": {"op": "healthcheck", "label": "ping", "performed": 1}}}),
+                    Fake::Clipboard => json!({"type": "result", "v": 1, "grant_id": grant,
+                        "outcome": {"status": "done",
+                        "report": {"op": "write_clipboard_text", "utf16_units": units}}}),
+                    Fake::ClipboardBusy => json!({"type": "result", "v": 1, "grant_id": grant,
+                        "outcome": {"status": "refused", "reason": "clipboard_busy"}}),
+                    Fake::ClipboardFault => json!({"type": "result", "v": 1, "grant_id": grant,
+                        "outcome": {"status": "faulted", "reason": "clipboard_incomplete"}}),
+                    Fake::ClipboardWrongLength => {
+                        json!({"type": "result", "v": 1, "grant_id": grant,
+                        "outcome": {"status": "done",
+                        "report": {"op": "write_clipboard_text", "utf16_units": units + 1}}})
+                    }
+                };
+                let mut bytes = serde_json::to_vec(&reply).unwrap();
+                bytes.push(b'\n');
+                out.write_all(&bytes).await.unwrap();
+                if behaviour == Fake::OnceThenExit {
+                    return;
+                }
+            }
+        });
+        Ok(Launched {
+            reader: Box::new(core_reader),
+            writer: Box::new(core_writer),
+            pid: None,
+            image_sha256: None,
+            keep: Box::new(AbortOnDrop(task)),
+        })
+    }
+}
+
+fn fake_agent(
+    behaviour: Fake,
+    timeout: Duration,
+    max_starts: u32,
+) -> (Arc<SessionAgent>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let launches = Arc::new(AtomicUsize::new(0));
+    let performs = Arc::new(AtomicUsize::new(0));
+    let launcher = FakeLauncher {
+        behaviour,
+        launches: Arc::clone(&launches),
+        performs: Arc::clone(&performs),
+    };
+    let agent = SessionAgent::new(Arc::new(launcher), &agent_config(timeout, max_starts));
+    (Arc::new(agent), launches, performs)
+}
+
+fn agent_options(agent: Option<Arc<SessionAgent>>) -> Options {
+    Options {
+        policy: agent_policy(),
+        session_agent: agent,
+        ..Options::default()
+    }
+}
+
+fn healthcheck(label: &str) -> Value {
+    json!({ "label": label })
+}
+
+/// The agent policy, with clipboard writes enabled as an owner would: each
+/// one still needs a person's approval.
+fn clipboard_options(agent: Option<Arc<SessionAgent>>) -> Options {
+    let mut options = agent_options(agent);
+    for (capability, decision) in &mut options.policy {
+        if *capability == Capability::DesktopClipboardWrite {
+            *decision = PolicyDecision::RequireConfirmation;
+        }
+    }
+    options
+}
+
+/// Text with a line end, a tab, a backslash and a letter outside the BMP:
+/// what the person is shown must be all of it, with layout made visible.
+const CLIPBOARD_TEXT: &str = "Demo: hello\n\tfrom the Session Agent \\ caf\u{e9} \u{20000}";
+
+/// Request a clipboard write and approve it after checking what the person
+/// is shown.
+async fn approved_clipboard_write(h: &mut Harness, id: &str, text: &str) -> ToolOutcome {
+    h.send_request(id, "desktop.write_clipboard_text", json!({ "text": text }))
+        .await;
+    let approval = h.pending_approval().await;
+    assert_eq!(approval.capabilities, [Capability::DesktopClipboardWrite]);
+    let shown = jarvis_core::approval::view(&approval, now_ms());
+    assert!(shown.arguments["action"].contains("clipboard"), "{shown:?}");
+    assert_eq!(
+        shown.arguments["text"],
+        jarvis_core::approval::display_safe(text, usize::MAX)
+    );
+    assert_eq!(
+        shown.arguments["characters"],
+        text.chars().count().to_string()
+    );
+    h.grant(&approval, &approval.fingerprint).unwrap();
+    h.response(id).await
+}
+
+#[tokio::test]
+async fn an_approved_clipboard_write_is_shown_in_full_and_sent_once() {
+    let (agent, launches, performs) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.ready().await;
+    let outcome = approved_clipboard_write(&mut h, "c1", CLIPBOARD_TEXT).await;
+    let ToolOutcome::Completed {
+        result: ToolResult::AgentReceipt(receipt),
+    } = outcome
+    else {
+        panic!("expected a receipt, got {outcome:?}");
+    };
+    assert_eq!(receipt.agent_operation, "desktop.write_clipboard_text");
+    let (_, store, calls) = h.finish().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing ran in the Core");
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert_eq!(performs.load(Ordering::SeqCst), 1);
+    let task = &store.tasks(10).unwrap()[0];
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(
+        task.result.as_deref(),
+        Some(r#"{"agent_operation":"desktop.write_clipboard_text"}"#)
+    );
+    let (kinds, report) = agent_events(&store);
+    assert_eq!(
+        kinds,
+        [
+            "session_agent_started",
+            "session_agent_dispatched",
+            "session_agent_completed",
+        ]
+    );
+    assert_eq!(
+        report,
+        Some(AgentReport::WriteClipboardText(ClipboardWritten {
+            utf16_units: u32::try_from(CLIPBOARD_TEXT.encode_utf16().count()).unwrap(),
+        }))
+    );
+}
+
+#[tokio::test]
+async fn a_busy_clipboard_is_refused_and_never_retried() {
+    let (agent, _, performs) = fake_agent(Fake::ClipboardBusy, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.ready().await;
+    let outcome = approved_clipboard_write(&mut h, "c1", "hello").await;
+    let ToolOutcome::Failed { error } = outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::ToolFailed);
+    let (_, store, _) = h.finish().await;
+    assert_eq!(performs.load(Ordering::SeqCst), 1);
+    let events = store.audit_events(None, 1000).unwrap();
+    assert!(events.iter().any(|event| matches!(&event.event,
+        AuditEventKind::SessionAgentRefused { reason, .. } if reason.contains("clipboard_busy"))));
+}
+
+#[tokio::test]
+async fn an_unconfirmed_clipboard_write_fails_closed() {
+    for behaviour in [Fake::ClipboardFault, Fake::ClipboardWrongLength] {
+        let (agent, launches, performs) = fake_agent(behaviour, Duration::from_secs(5), 4);
+        let mut h = Harness::start(clipboard_options(Some(agent)));
+        h.ready().await;
+        let outcome = approved_clipboard_write(&mut h, "c1", "hello").await;
+        let ToolOutcome::Failed { error } = outcome else {
+            panic!("{behaviour:?}: expected a failure, got {outcome:?}");
+        };
+        assert_eq!(error.code, ErrorCode::Internal, "{behaviour:?}");
+        let (_, store, _) = h.finish().await;
+        assert_eq!(launches.load(Ordering::SeqCst), 1, "{behaviour:?}");
+        assert_eq!(
+            performs.load(Ordering::SeqCst),
+            1,
+            "{behaviour:?}: sent once"
+        );
+        assert_eq!(
+            agent_events(&store).0,
+            [
+                "session_agent_started",
+                "session_agent_dispatched",
+                "session_agent_stopped",
+                "session_agent_outcome_unknown",
+            ],
+            "{behaviour:?}"
+        );
+        let task = &store.tasks(10).unwrap()[0];
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.error.as_ref().unwrap().code, ErrorCode::Internal);
+    }
+}
+
+#[tokio::test]
+async fn other_desktop_operations_stay_closed_with_clipboard_writes_enabled() {
+    let (agent, launches, _) = fake_agent(Fake::Clipboard, Duration::from_secs(5), 4);
+    let mut h = Harness::start(clipboard_options(Some(agent)));
+    h.ready().await;
+    for (id, tool, args) in [
+        ("d1", "desktop.capture_window", json!({"target": 1})),
+        ("d2", "desktop.read_clipboard_text", json!({})),
+        (
+            "d3",
+            "desktop.type_text",
+            json!({"target": 1, "text": "hi"}),
+        ),
+    ] {
+        let outcome = h.request(id, tool, args).await;
+        assert!(matches!(outcome, ToolOutcome::Denied { .. }), "{outcome:?}");
+    }
+    for (id, args) in [
+        ("x1", json!({"text": ""})),
+        ("x2", json!({"text": "a\rb"})),
+        ("x3", json!({"text": "x".repeat(1025)})),
+        ("x4", json!({"text": "pay\u{202E}lap"})),
+        ("x6", json!({"text": "line\u{2028}break"})),
+        ("x7", json!({"text": "tag\u{E0041}"})),
+        ("x5", json!({"text": "hi", "target": 1})),
+    ] {
+        let outcome = h.request(id, "desktop.write_clipboard_text", args).await;
+        assert!(
+            matches!(outcome, ToolOutcome::Rejected { .. }),
+            "{outcome:?}"
+        );
+    }
+    let (_, store, _) = h.finish().await;
+    assert!(store.pending_approvals().unwrap().is_empty());
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+}
+
+/// The `session_agent_*` events and the report of the completion, if any.
+fn agent_events(store: &Store) -> (Vec<&'static str>, Option<AgentReport>) {
+    let events = store.audit_events(None, 1000).unwrap();
+    let report = events.iter().find_map(|event| match &event.event {
+        AuditEventKind::SessionAgentCompleted { report, .. } => Some(report.clone()),
+        _ => None,
+    });
+    let kinds = events
+        .into_iter()
+        .map(|event| event.event.name())
+        .filter(|kind| kind.starts_with("session_agent"))
+        .collect();
+    (kinds, report)
+}
+
+/// Request a health check and approve it as a person would, after checking
+/// what that person is shown.
+async fn approved_healthcheck(h: &mut Harness, id: &str, label: &str) -> ToolOutcome {
+    h.send_request(id, "session_agent.healthcheck", healthcheck(label))
+        .await;
+    let approval = h.pending_approval().await;
+    assert_eq!(approval.capabilities, [Capability::SessionAgentHealthcheck]);
+    let shown = jarvis_core::approval::view(&approval, now_ms());
+    assert!(
+        shown.arguments["action"].contains("health check"),
+        "{shown:?}"
+    );
+    assert_eq!(shown.arguments["label"], label);
+    h.grant(&approval, &approval.fingerprint).unwrap();
+    h.response(id).await
+}
+
+#[tokio::test]
+async fn an_approved_healthcheck_runs_once_in_the_real_session_agent() {
+    let mut h = Harness::start(agent_options(Some(real_agent())));
+    h.ready().await;
+    let outcome = approved_healthcheck(&mut h, "a1", "ping").await;
+    let ToolOutcome::Completed {
+        result: ToolResult::AgentReceipt(receipt),
+    } = outcome
+    else {
+        panic!("expected a receipt, got {outcome:?}");
+    };
+    // The worker learns that it completed, nothing the agent reported.
+    assert_eq!(receipt.agent_operation, "session_agent.healthcheck");
+
+    // The same request again is a new request: it needs its own approval.
+    let second = approved_healthcheck(&mut h, "a2", "ping").await;
+    assert!(
+        matches!(second, ToolOutcome::Completed { .. }),
+        "{second:?}"
+    );
+
+    let (_, store, calls) = h.finish().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing ran in the Core");
+    let tasks = store.tasks(10).unwrap();
+    assert!(tasks.iter().all(|t| t.status == TaskStatus::Completed));
+    for task in &tasks {
+        assert_eq!(
+            task.result.as_deref(),
+            Some(r#"{"agent_operation":"session_agent.healthcheck"}"#)
+        );
+    }
+    let (kinds, report) = agent_events(&store);
+    assert_eq!(
+        kinds,
+        [
+            "session_agent_started",
+            "session_agent_dispatched",
+            "session_agent_completed",
+            "session_agent_dispatched",
+            "session_agent_completed",
+        ]
+    );
+    let Some(AgentReport::Healthcheck(report)) = report else {
+        panic!("expected a health report, got {report:?}");
+    };
+    assert_eq!(report.label.as_str(), "ping");
+    // The executable that was started is recorded by its SHA-256.
+    let recorded = store
+        .audit_events(None, 1000)
+        .unwrap()
+        .into_iter()
+        .find_map(|event| match event.event {
+            AuditEventKind::SessionAgentStarted { image_sha256, .. } => image_sha256,
+            _ => None,
+        })
+        .expect("the agent's image hash was recorded");
+    let image = std::fs::read(env!("CARGO_BIN_EXE_jarvis-session-agent")).unwrap();
+    let digest: [u8; 32] = sha2::Sha256::digest(&image).into();
+    assert_eq!(recorded, Fingerprint::from_digest(&digest));
+    let first_task = tasks.last().unwrap().task_id;
+    let task_events: Vec<_> = store
+        .audit_events(Some(first_task), 100)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.event.name())
+        .collect();
+    assert_eq!(
+        task_events,
+        [
+            "request_received",
+            "policy_evaluated",
+            "approval_requested",
+            "approval_granted",
+            "session_agent_started",
+            "approval_consumed",
+            "execution_started",
+            "session_agent_dispatched",
+            "session_agent_completed",
+            "execution_finished",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_declined_healthcheck_never_reaches_the_agent() {
+    let (agent, launches, _) = fake_agent(Fake::Refuse, Duration::from_secs(5), 4);
+    let mut h = Harness::start(agent_options(Some(agent)));
+    h.ready().await;
+    h.send_request("a1", "session_agent.healthcheck", healthcheck("ping"))
+        .await;
+    let approval = h.pending_approval().await;
+    h.deny(&approval, "no").unwrap();
+    assert!(matches!(
+        h.response("a1").await,
+        ToolOutcome::Declined { .. }
+    ));
+    let (_, store, _) = h.finish().await;
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    assert!(agent_events(&store).0.is_empty());
+}
+
+#[tokio::test]
+async fn desktop_operations_are_denied_and_never_reach_the_agent() {
+    let (agent, launches, _) = fake_agent(Fake::Refuse, Duration::from_secs(5), 4);
+    let mut h = Harness::start(agent_options(Some(agent)));
+    h.ready().await;
+    for (id, tool, args) in [
+        ("d1", "desktop.capture_window", json!({"target": 1})),
+        ("d2", "desktop.read_clipboard_text", json!({})),
+        ("d3", "desktop.write_clipboard_text", json!({"text": "hi"})),
+        (
+            "d4",
+            "desktop.type_text",
+            json!({"target": 1, "text": "hi"}),
+        ),
+    ] {
+        let outcome = h.request(id, tool, args).await;
+        assert!(matches!(outcome, ToolOutcome::Denied { .. }), "{outcome:?}");
+    }
+    // Unknown operations and smuggled fields are rejected before policy.
+    for (id, tool, args) in [
+        ("x1", "desktop.capture_screen", json!({})),
+        ("x2", "session_agent.run", json!({"command": "cmd.exe"})),
+        (
+            "x3",
+            "session_agent.healthcheck",
+            json!({"label": "ping", "grant": 1}),
+        ),
+        (
+            "x4",
+            "desktop.type_text",
+            json!({"target": 1, "text": "a\nb"}),
+        ),
+    ] {
+        let outcome = h.request(id, tool, args).await;
+        assert!(
+            matches!(outcome, ToolOutcome::Rejected { .. }),
+            "{outcome:?}"
+        );
+    }
+    let (_, store, _) = h.finish().await;
+    assert!(store.pending_approvals().unwrap().is_empty());
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn without_a_session_agent_the_approval_expires_unused() {
+    let mut h = Harness::start(agent_options(None));
+    h.ready().await;
+    h.send_request("a1", "session_agent.healthcheck", healthcheck("ping"))
+        .await;
+    let approval = h.pending_approval().await;
+    h.grant(&approval, &approval.fingerprint).unwrap();
+    assert!(matches!(
+        h.response("a1").await,
+        ToolOutcome::Expired { .. }
+    ));
+    assert_eq!(h.approval_status(&approval), ApprovalStatus::Expired);
+    let (_, store, _) = h.finish().await;
+    assert_eq!(store.tasks(1).unwrap()[0].status, TaskStatus::Expired);
+    assert!(
+        !Harness::task_kinds(&store).contains(&"approval_consumed"),
+        "a refusal before consumption leaves the approval unused"
+    );
+}
+
+/// After a `perform` was sent, no valid answer means: the agent is stopped,
+/// the task fails with `internal`, and the operation is never sent again.
+#[tokio::test]
+async fn an_ambiguous_agent_outcome_fails_closed() {
+    for behaviour in [
+        Fake::ExitAfterPerform,
+        Fake::WrongGrant,
+        Fake::Hang,
+        Fake::Garbage,
+    ] {
+        let (agent, launches, performs) = fake_agent(behaviour, Duration::from_millis(500), 4);
+        let mut h = Harness::start(agent_options(Some(agent)));
+        h.ready().await;
+        let outcome = approved_healthcheck(&mut h, "a1", "ping").await;
+        let ToolOutcome::Failed { error } = outcome else {
+            panic!("{behaviour:?}: expected a failure, got {outcome:?}");
+        };
+        assert_eq!(error.code, ErrorCode::Internal, "{behaviour:?}");
+        // The next operation starts a fresh agent; nothing is resent.
+        let next = approved_healthcheck(&mut h, "a2", "ping").await;
+        assert!(matches!(next, ToolOutcome::Failed { .. }), "{behaviour:?}");
+        let (_, store, _) = h.finish().await;
+        assert_eq!(launches.load(Ordering::SeqCst), 2, "{behaviour:?}");
+        assert_eq!(
+            performs.load(Ordering::SeqCst),
+            2,
+            "{behaviour:?}: one send each"
+        );
+        let (kinds, _) = agent_events(&store);
+        assert_eq!(
+            kinds,
+            [
+                "session_agent_started",
+                "session_agent_dispatched",
+                "session_agent_stopped",
+                "session_agent_outcome_unknown",
+                "session_agent_started",
+                "session_agent_dispatched",
+                "session_agent_stopped",
+                "session_agent_outcome_unknown",
+            ],
+            "{behaviour:?}"
+        );
+        for task in store.tasks(10).unwrap() {
+            assert_eq!(task.status, TaskStatus::Failed);
+            assert_eq!(task.error.unwrap().code, ErrorCode::Internal);
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_agent_refusal_is_recorded_as_not_performed() {
+    let (agent, _, performs) = fake_agent(Fake::Refuse, Duration::from_secs(5), 4);
+    let mut h = Harness::start(agent_options(Some(agent)));
+    h.ready().await;
+    let outcome = approved_healthcheck(&mut h, "a1", "ping").await;
+    let ToolOutcome::Failed { error } = outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::ToolFailed);
+    let (_, store, _) = h.finish().await;
+    assert_eq!(performs.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        agent_events(&store).0,
+        [
+            "session_agent_started",
+            "session_agent_dispatched",
+            "session_agent_refused",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_agent_that_never_starts_leaves_the_approval_unused() {
+    let (agent, launches, performs) = fake_agent(Fake::Silent, Duration::from_millis(300), 1);
+    let mut h = Harness::start(agent_options(Some(agent)));
+    h.ready().await;
+    // The agent is started before the approval is used: a failed start
+    // expires the approval, unconsumed.
+    for id in ["a1", "a2"] {
+        h.send_request(id, "session_agent.healthcheck", healthcheck("ping"))
+            .await;
+        let approval = h.pending_approval().await;
+        h.grant(&approval, &approval.fingerprint).unwrap();
+        assert!(matches!(h.response(id).await, ToolOutcome::Expired { .. }));
+        assert_eq!(h.approval_status(&approval), ApprovalStatus::Expired);
+    }
+    let (_, store, _) = h.finish().await;
+    // The second attempt found the start budget spent and started nothing.
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert_eq!(performs.load(Ordering::SeqCst), 0);
+    assert_eq!(agent_events(&store).0, ["session_agent_stopped"]);
+    assert!(!Harness::task_kinds(&store).contains(&"approval_consumed"));
+}
+
+/// An agent that exits while idle is noticed before the next operation is
+/// sent: a new one is started, and nothing is recorded as unknown.
+#[tokio::test]
+async fn an_agent_that_exits_while_idle_is_replaced_before_anything_is_sent() {
+    let (agent, launches, performs) = fake_agent(Fake::OnceThenExit, Duration::from_secs(5), 4);
+    let mut h = Harness::start(agent_options(Some(agent)));
+    h.ready().await;
+    for id in ["a1", "a2"] {
+        let outcome = approved_healthcheck(&mut h, id, "ping").await;
+        assert!(
+            matches!(outcome, ToolOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+    }
+    let (_, store, _) = h.finish().await;
+    assert_eq!(launches.load(Ordering::SeqCst), 2);
+    assert_eq!(performs.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        agent_events(&store).0,
+        [
+            "session_agent_started",
+            "session_agent_dispatched",
+            "session_agent_completed",
+            "session_agent_stopped",
+            "session_agent_started",
+            "session_agent_dispatched",
+            "session_agent_completed",
+        ]
+    );
+}
+
+/// A job holding an operation whose outcome is unknown is never resumed:
+/// the session that dispatched it ends, and the job is quarantined.
+#[tokio::test]
+async fn a_job_with_an_unknown_agent_outcome_is_not_resumed() {
+    let (agent, _, _) = fake_agent(Fake::ExitAfterPerform, Duration::from_millis(500), 4);
+    let mut h = Harness::start(agent_options(Some(agent)));
+    h.ready().await;
+    let job = h.job_id();
+    approved_healthcheck(&mut h, "a1", "ping").await;
+    // The worker goes away mid-job, as on a crash.
+    let (_, store, _) = h.finish().await;
+    let settled = store.job(job).unwrap().unwrap();
+    assert_eq!(settled.status, JobStatus::Interrupted);
+    assert!(Harness::kinds(&store).contains(&"job_quarantined"));
+}
+
+#[tokio::test]
+async fn shutdown_while_the_agent_works_is_an_unknown_outcome() {
+    let (agent, _, performs) = fake_agent(Fake::Hang, Duration::from_secs(30), 4);
+    let mut h = Harness::start(agent_options(Some(agent)));
+    h.ready().await;
+    h.send_request("a1", "session_agent.healthcheck", healthcheck("ping"))
+        .await;
+    let approval = h.pending_approval().await;
+    h.grant(&approval, &approval.fingerprint).unwrap();
+    for _ in 0..500 {
+        if performs.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    h.shutdown.cancel();
+    let outcome = h.response("a1").await;
+    let ToolOutcome::Failed { error } = outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::Internal);
+    let store = h.store.clone();
+    let _ = tokio::time::timeout(Duration::from_secs(10), h.session).await;
+    assert!(
+        agent_events(&store)
+            .0
+            .contains(&"session_agent_outcome_unknown")
+    );
+}
+
+/// The real agent, killed while idle, is replaced before the next operation
+/// is sent: its end of the channel shows end of input, and nothing is
+/// recorded as unknown.
+#[tokio::test]
+async fn a_real_agent_killed_while_idle_is_replaced() {
+    let mut h = Harness::start(agent_options(Some(real_agent())));
+    h.ready().await;
+    let first = approved_healthcheck(&mut h, "a1", "ping").await;
+    assert!(matches!(first, ToolOutcome::Completed { .. }), "{first:?}");
+    let pid = h
+        .store
+        .audit_events(None, 1000)
+        .unwrap()
+        .into_iter()
+        .find_map(|event| match event.event {
+            AuditEventKind::SessionAgentStarted { pid, .. } => pid,
+            _ => None,
+        })
+        .expect("the agent's pid was recorded");
+    let killed = if cfg!(windows) {
+        std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .output()
+    } else {
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output()
+    };
+    assert!(killed.unwrap().status.success());
+    for _ in 0..500 {
+        if !jarvis_sandbox::process_exists(pid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let second = approved_healthcheck(&mut h, "a2", "ping").await;
+    assert!(
+        matches!(second, ToolOutcome::Completed { .. }),
+        "{second:?}"
+    );
+    let (_, store, _) = h.finish().await;
+    let (kinds, _) = agent_events(&store);
+    assert_eq!(
+        kinds,
+        [
+            "session_agent_started",
+            "session_agent_dispatched",
+            "session_agent_completed",
+            "session_agent_stopped",
+            "session_agent_started",
+            "session_agent_dispatched",
+            "session_agent_completed",
+        ]
+    );
 }

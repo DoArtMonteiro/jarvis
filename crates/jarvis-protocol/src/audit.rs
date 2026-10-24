@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::message::Label;
 use crate::{
-    ApprovalId, Capability, Fingerprint, GovernorReason, JobId, JobStatus, PolicyDecision,
-    ProtocolVersion, RequestId, SessionId, TaskId, TaskStatus, ToolName, WireError,
+    AgentReport, ApprovalId, Capability, Fingerprint, GovernorReason, JobId, JobStatus,
+    ModelProfile, PolicyDecision, ProtocolVersion, RequestId, SessionId, TaskId, TaskStatus,
+    ToolName, WireError,
 };
 
 /// One entry of the append-only audit log.
@@ -152,6 +153,20 @@ pub enum AuditEventKind {
     ApprovalConsumed {
         approval_id: ApprovalId,
     },
+    /// The local model server started and answers (ADR 0021). Metadata
+    /// only: conversations are never recorded in the audit log.
+    InferenceLoaded {
+        profile: ModelProfile,
+        model_sha256: String,
+        context_size: u32,
+        gpu_layers: u32,
+        load_ms: u64,
+    },
+    /// The local model server stopped: on request, for a game, at shutdown,
+    /// or because it failed.
+    InferenceStopped {
+        reason: String,
+    },
     /// The gaming governor stopped queued jobs from starting. `process` is
     /// the configured name that matched when `reason` is `game`; nothing
     /// else about the process list is recorded. Jobs already running are
@@ -175,6 +190,44 @@ pub enum AuditEventKind {
     /// it came from the worker process.
     RpcClientRejected {
         client: String,
+        reason: String,
+    },
+    /// The Core started its Session Agent. `image_sha256` is the SHA-256
+    /// of the executable the Core started, when it could read it: a record
+    /// for later checks, not a defence against a same-user process.
+    SessionAgentStarted {
+        pid: Option<u32>,
+        image_sha256: Option<Fingerprint>,
+    },
+    /// The Core stopped its Session Agent; every live grant was revoked.
+    SessionAgentStopped {
+        reason: String,
+    },
+    /// The approval `grant_id` is being used for a Session Agent operation.
+    /// Committed with the approval's consumption, before a grant is issued
+    /// or anything is sent. It is followed by `session_agent_completed`,
+    /// `session_agent_refused` (nothing was sent, or the agent refused) or
+    /// `session_agent_outcome_unknown`.
+    SessionAgentDispatched {
+        grant_id: ApprovalId,
+        tool: String,
+        ttl_ms: u64,
+    },
+    /// The Session Agent performed the operation. The report is for the
+    /// Core and the person; the worker only learns that it completed.
+    SessionAgentCompleted {
+        grant_id: ApprovalId,
+        report: AgentReport,
+    },
+    /// The operation was not performed: the Core or the agent refused it.
+    SessionAgentRefused {
+        grant_id: Option<ApprovalId>,
+        reason: String,
+    },
+    /// The operation was sent and no valid answer came back. Whether it was
+    /// performed is unknown; it is never sent again.
+    SessionAgentOutcomeUnknown {
+        grant_id: ApprovalId,
         reason: String,
     },
 }
@@ -211,10 +264,18 @@ impl AuditEventKind {
             Self::ApprovalDenied { .. } => "approval_denied",
             Self::ApprovalExpired { .. } => "approval_expired",
             Self::ApprovalConsumed { .. } => "approval_consumed",
+            Self::InferenceLoaded { .. } => "inference_loaded",
+            Self::InferenceStopped { .. } => "inference_stopped",
             Self::GovernorHold { .. } => "governor_hold",
             Self::GovernorReleased { .. } => "governor_released",
             Self::GovernorHoldOverdue { .. } => "governor_hold_overdue",
             Self::RpcClientRejected { .. } => "rpc_client_rejected",
+            Self::SessionAgentStarted { .. } => "session_agent_started",
+            Self::SessionAgentStopped { .. } => "session_agent_stopped",
+            Self::SessionAgentDispatched { .. } => "session_agent_dispatched",
+            Self::SessionAgentCompleted { .. } => "session_agent_completed",
+            Self::SessionAgentRefused { .. } => "session_agent_refused",
+            Self::SessionAgentOutcomeUnknown { .. } => "session_agent_outcome_unknown",
         }
     }
 }
@@ -272,6 +333,26 @@ mod tests {
             AuditEventKind::GovernorReleased { held_ms: 61_000 },
             AuditEventKind::GovernorHoldOverdue {
                 held_ms: 14_400_000,
+            },
+            AuditEventKind::SessionAgentDispatched {
+                grant_id: ApprovalId::new(),
+                tool: "session_agent.healthcheck".into(),
+                ttl_ms: 5_000,
+            },
+            AuditEventKind::SessionAgentCompleted {
+                grant_id: ApprovalId::new(),
+                report: AgentReport::Healthcheck(crate::AgentHealth {
+                    label: crate::AgentLabel::try_from("ping".to_owned()).unwrap(),
+                    performed: 1,
+                }),
+            },
+            AuditEventKind::SessionAgentRefused {
+                grant_id: None,
+                reason: "desktop operations are not available".into(),
+            },
+            AuditEventKind::SessionAgentOutcomeUnknown {
+                grant_id: ApprovalId::new(),
+                reason: "the agent exited".into(),
             },
         ];
         for event in events {

@@ -65,9 +65,9 @@ impl Client {
     /// Send one request and wait for its response.
     pub async fn call(&mut self, request: &RpcRequest) -> Result<RpcResponse, ClientError> {
         let wait = match request {
-            RpcRequest::GetJob { wait_ms, .. } | RpcRequest::ListApprovals { wait_ms } => {
-                Duration::from_millis(u64::from(*wait_ms))
-            }
+            RpcRequest::GetJob { wait_ms, .. }
+            | RpcRequest::ListApprovals { wait_ms }
+            | RpcRequest::ChatPoll { wait_ms, .. } => Duration::from_millis(u64::from(*wait_ms)),
             _ => Duration::ZERO,
         };
         let exchange = async {

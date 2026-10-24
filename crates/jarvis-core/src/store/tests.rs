@@ -995,3 +995,91 @@ fn approval_rows_are_protected_by_triggers() {
         .unwrap_err();
     assert!(error.to_string().contains("never deleted"), "{error}");
 }
+
+#[test]
+fn recovery_records_an_unanswered_agent_operation_as_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let session = SessionId::new();
+    let Pending { task, approval } = pending(&store, session, "r1", HOUR_MS);
+    let (id, fingerprint) = (approval.approval_id, approval.fingerprint);
+    store
+        .grant_approval(id, &fingerprint, "client", now_ms())
+        .unwrap();
+    let dispatched = AuditEventKind::SessionAgentDispatched {
+        grant_id: id,
+        tool: "desktop.write_clipboard_text".into(),
+        ttl_ms: 5_000,
+    };
+    store
+        .consume_approval(id, &fingerprint, now_ms(), &[started(), dispatched])
+        .unwrap();
+    // A second task was executing without anything sent to the agent.
+    let other = new_task(session, "r2");
+    store.create_task(&other).unwrap();
+    store
+        .transition(
+            other.task_id,
+            &[TaskStatus::Received],
+            &TaskChange::to(TaskStatus::Executing),
+            &[started()],
+        )
+        .unwrap();
+
+    store.recover(MAX_ATTEMPTS).unwrap();
+    let unknown = |task_id| {
+        store
+            .audit_events(Some(task_id), 100)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.event {
+                AuditEventKind::SessionAgentOutcomeUnknown { grant_id, .. } => Some(grant_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(unknown(task.task_id), [id]);
+    assert!(unknown(other.task_id).is_empty());
+    assert_eq!(
+        store.task(task.task_id).unwrap().unwrap().status,
+        TaskStatus::Interrupted
+    );
+    // Recovering again adds nothing.
+    store.recover(MAX_ATTEMPTS).unwrap();
+    assert_eq!(unknown(task.task_id), [id]);
+}
+
+#[test]
+fn consuming_an_approval_hands_out_its_proof_once() {
+    use jarvis_protocol::{AgentLabel, HealthcheckArgs, ToolCall};
+
+    use crate::session_agent::{Grants, Refusal};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let Pending { task, approval } = pending(&store, SessionId::new(), "r1", HOUR_MS);
+    let (id, fingerprint) = (approval.approval_id, approval.fingerprint);
+    store
+        .grant_approval(id, &fingerprint, "client", now_ms())
+        .unwrap();
+    let consumed = store
+        .consume_approval(id, &fingerprint, now_ms(), &[started()])
+        .unwrap();
+    assert_eq!(consumed.approval_id(), id);
+    assert_eq!(consumed.task_id(), task.task_id);
+    assert_eq!(consumed.fingerprint(), &fingerprint);
+    // There is no second proof for the same approval.
+    assert!(matches!(
+        store.consume_approval(id, &fingerprint, now_ms(), &[started()]),
+        Err(ApprovalError::NotGranted(ApprovalStatus::Consumed))
+    ));
+    // The proof is for the tool call that was approved; it backs no grant
+    // for a Session Agent operation.
+    let check = ToolCall::SessionAgentHealthcheck(HealthcheckArgs {
+        label: AgentLabel::try_from("ping".to_owned()).unwrap(),
+    });
+    assert_eq!(
+        Grants::default().issue(consumed, &check, 0, 5_000),
+        Err(Refusal::NotApproved)
+    );
+}

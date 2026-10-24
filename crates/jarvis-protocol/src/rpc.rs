@@ -8,7 +8,7 @@
 //! request being approved.
 //!
 //! ```json
-//! {"rpc":2,"type":"approve","approval_id":"…","fingerprint":"…"}
+//! {"rpc":3,"type":"approve","approval_id":"…","fingerprint":"…"}
 //! ```
 
 use std::collections::BTreeMap;
@@ -16,10 +16,15 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::chat::{
+    ChatDelta, ChatLanguage, ChatText, ChatTurn, ConversationSummary, ConversationView,
+    InferenceView, SearchQuery,
+};
 use crate::message::decode_versioned;
 use crate::{
-    ApprovalId, ApprovalStatus, Capability, DecodeError, Fingerprint, Goal, JobId, JobStatus,
-    ProtocolVersion, RequestId, Summary, TaskId, ToolName, error::sanitize_message,
+    ApprovalId, ApprovalStatus, Capability, ConversationId, DecodeError, Fingerprint, Goal, JobId,
+    JobStatus, MessageId, ProtocolVersion, RequestId, Summary, TaskId, ToolName,
+    error::sanitize_message,
 };
 
 /// Version of the RPC protocol. Like the worker protocol, the Core accepts
@@ -29,7 +34,7 @@ use crate::{
 pub struct RpcVersion(pub u32);
 
 impl RpcVersion {
-    pub const CURRENT: Self = Self(2);
+    pub const CURRENT: Self = Self(3);
 }
 
 impl fmt::Display for RpcVersion {
@@ -78,6 +83,58 @@ pub enum RpcRequest {
     },
     /// Stop the Core. Refused unless the configuration allows it.
     Shutdown {},
+    /// Send a message to the assistant, in a new conversation when
+    /// `conversation_id` is null. The reply is generated under the returned
+    /// turn; poll it with `chat_poll`. One reply is generated at a time.
+    ChatSend {
+        #[serde(deserialize_with = "Option::deserialize")]
+        conversation_id: Option<ConversationId>,
+        text: ChatText,
+        language: ChatLanguage,
+    },
+    /// Replace the last reply of a conversation with a new one.
+    ChatRegenerate {
+        conversation_id: ConversationId,
+        language: ChatLanguage,
+    },
+    /// The reply text after `cursor`. With `wait_ms > 0`, waits until there
+    /// is new text, the reply is final, or the time is up.
+    ChatPoll {
+        turn_id: MessageId,
+        cursor: u32,
+        wait_ms: u32,
+    },
+    /// Stop generating a reply. The text so far is kept.
+    ChatCancel {
+        turn_id: MessageId,
+    },
+    /// Conversations, most recently updated first; with `query`, only those
+    /// with a message containing it.
+    ListConversations {
+        #[serde(deserialize_with = "Option::deserialize")]
+        query: Option<SearchQuery>,
+        limit: u32,
+    },
+    GetConversation {
+        conversation_id: ConversationId,
+    },
+    /// Delete one conversation and its messages for good.
+    DeleteConversation {
+        conversation_id: ConversationId,
+    },
+    /// Delete every stored conversation for good.
+    DeleteAllConversations {},
+    InferenceStatus {},
+    /// Load the model now instead of on the next message.
+    LoadModel {},
+    /// Stop the model server and free its memory. A reply being generated
+    /// is cancelled.
+    UnloadModel {},
+    /// Use another context size (one of `CONTEXT_SIZES`). A loaded model is
+    /// reloaded.
+    SetContextSize {
+        context_size: u32,
+    },
 }
 
 /// Replies from the Core.
@@ -86,10 +143,24 @@ pub enum RpcRequest {
 pub enum RpcResponse {
     Health(HealthReport),
     Job(JobView),
-    Jobs { jobs: Vec<JobView> },
+    Jobs {
+        jobs: Vec<JobView>,
+    },
     Approval(ApprovalView),
-    Approvals { approvals: Vec<ApprovalView> },
+    Approvals {
+        approvals: Vec<ApprovalView>,
+    },
     ShuttingDown {},
+    ChatTurn(ChatTurn),
+    ChatDelta(ChatDelta),
+    Conversations {
+        conversations: Vec<ConversationSummary>,
+    },
+    Conversation(ConversationView),
+    Deleted {
+        conversations: u32,
+    },
+    Inference(InferenceView),
     Error(RpcError),
 }
 
@@ -338,49 +409,39 @@ mod tests {
             fingerprint: Fingerprint::from_digest(&[7; 32]),
         };
         let bytes = encode_rpc_request(&request).unwrap();
-        assert!(bytes.starts_with(br#"{"rpc":2,"type":"approve""#));
+        assert!(bytes.starts_with(br#"{"rpc":3,"type":"approve""#));
         assert_eq!(decode_rpc_request(&bytes).unwrap(), request);
         let health = encode_rpc_request(&RpcRequest::Health {}).unwrap();
-        assert_eq!(health, br#"{"rpc":2,"type":"health"}"#);
+        assert_eq!(health, br#"{"rpc":3,"type":"health"}"#);
     }
 
     #[test]
     fn requests_are_strict() {
         for value in [
-            json!({"rpc": 2, "type": "health", "extra": true}),
-            json!({"rpc": 2, "type": "run_command", "command": "id"}),
-            json!({"rpc": 2, "type": "submit_job"}),
-            json!({"rpc": 2, "type": "submit_job", "goal": ""}),
-            json!({"rpc": 2, "type": "submit_job", "goal": "a\nb"}),
-            json!({"rpc": 2, "type": "get_job", "job_id": JobId::new()}),
-            json!({"rpc": 2, "type": "approve", "approval_id": ApprovalId::new()}),
-            json!({"rpc": 2, "type": "approve", "approval_id": ApprovalId::new(),
+            json!({"rpc": 3, "type": "health", "extra": true}),
+            json!({"rpc": 3, "type": "run_command", "command": "id"}),
+            json!({"rpc": 3, "type": "submit_job"}),
+            json!({"rpc": 3, "type": "submit_job", "goal": ""}),
+            json!({"rpc": 3, "type": "submit_job", "goal": "a\nb"}),
+            json!({"rpc": 3, "type": "get_job", "job_id": JobId::new()}),
+            json!({"rpc": 3, "type": "approve", "approval_id": ApprovalId::new()}),
+            json!({"rpc": 3, "type": "approve", "approval_id": ApprovalId::new(),
                    "fingerprint": "abc"}),
-            json!({"rpc": 2, "type": "approve", "approval_id": ApprovalId::new(),
+            json!({"rpc": 3, "type": "approve", "approval_id": ApprovalId::new(),
                    "fingerprint": "a".repeat(64), "approved": true}),
             json!({"protocol": 2, "type": "health"}),
         ] {
             let error = decode_rpc_request(&frame(value.clone())).unwrap_err();
             assert_eq!(error.code(), crate::ErrorCode::MalformedFrame, "{value}");
         }
-        let error = decode_rpc_request(&frame(json!({"rpc": 3, "type": "health"}))).unwrap_err();
-        assert!(matches!(
-            error,
-            DecodeError::UnsupportedVersion {
-                found: 3,
-                expected: 2,
-                ..
-            }
-        ));
-        let error = decode_rpc_request(&frame(json!({"rpc": 1, "type": "health"}))).unwrap_err();
-        assert!(matches!(
-            error,
-            DecodeError::UnsupportedVersion {
-                found: 1,
-                expected: 2,
-                ..
-            }
-        ));
+        for old in [1, 2, 4] {
+            let error =
+                decode_rpc_request(&frame(json!({"rpc": old, "type": "health"}))).unwrap_err();
+            assert!(matches!(
+                error,
+                DecodeError::UnsupportedVersion { found, expected: 3, .. } if found == old
+            ));
+        }
     }
 
     #[test]

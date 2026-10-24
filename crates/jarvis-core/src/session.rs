@@ -27,11 +27,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jarvis_protocol::{
-    ApprovalId, ApprovalStatus, AuditEventKind, CallError, CoreMessage, DecodeError, ErrorCode,
-    ErrorMessage, Fingerprint, JobId, JobStatus, PolicyDecision, RequestId, SessionId,
+    AgentReceipt, ApprovalId, ApprovalStatus, AuditEventKind, CallError, CoreMessage, DecodeError,
+    ErrorCode, ErrorMessage, Fingerprint, JobId, JobStatus, PolicyDecision, RequestId, SessionId,
     SessionLimits, Summary, TaskId, TaskStatus, ToolCall, ToolName, ToolOutcome, ToolRequest,
-    ToolResponse, Welcome, WireError, WorkerMessage, WorkerState, decode_worker_message,
-    encode_core_message,
+    ToolResponse, ToolResult, Welcome, WireError, WorkerMessage, WorkerState,
+    decode_worker_message, encode_core_message,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, watch};
@@ -45,8 +45,11 @@ use crate::gateway::{Execution, Gateway};
 use crate::governor::Status as GovernorStatus;
 use crate::hub::Hub;
 use crate::policy::{Policy, required_capabilities};
+use crate::session_agent::link::Performed;
+use crate::session_agent::{Refusal, SessionAgent};
 use crate::store::{
-    ApprovalError, JobStep, NewApproval, NewTask, Store, StoreError, TaskChange, now_ms,
+    ApprovalError, ConsumedApproval, JobStep, NewApproval, NewTask, Store, StoreError, TaskChange,
+    now_ms,
 };
 
 mod job;
@@ -67,6 +70,9 @@ pub struct SessionContext {
     pub job_timeout: Duration,
     pub core_version: &'static str,
     pub hub: Arc<Hub>,
+    /// Performs Session Agent operations. `None`: every such operation is
+    /// refused before its approval is used.
+    pub session_agent: Option<Arc<SessionAgent>>,
 }
 
 /// Why a session ended.
@@ -656,18 +662,55 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
         fingerprint: &Fingerprint,
         shutdown: &CancellationToken,
     ) -> Result<Handled, SessionError> {
-        let started = AuditEventKind::ExecutionStarted {
+        let mut events = vec![AuditEventKind::ExecutionStarted {
             tool: call.tool_name().to_owned(),
-        };
+        }];
+        if call.is_agent_operation() {
+            // The grant checks run, and a live agent is started, before the
+            // approval is used, so these refusals leave nothing consumed. A
+            // race after this point is recorded as not performed.
+            let ready = match &self.ctx.session_agent {
+                None => Err(Refusal::Unavailable),
+                Some(agent) => {
+                    let (ready, lifecycle) = agent.prepare(call).await;
+                    for event in lifecycle {
+                        self.audit(Some(task_id), event).await?;
+                    }
+                    ready.map(|()| agent.grant_ttl_ms())
+                }
+            };
+            match ready {
+                Ok(ttl_ms) => events.push(AuditEventKind::SessionAgentDispatched {
+                    grant_id: approval_id,
+                    tool: call.tool_name().to_owned(),
+                    ttl_ms,
+                }),
+                Err(refusal) => {
+                    tracing::warn!(session = %self.id, task = %task_id, approval = %approval_id, "Session Agent refused before consumption: {refusal}");
+                    self.expire_with(
+                        approval_id,
+                        format!("the Session Agent cannot take this operation: {refusal}"),
+                    )
+                    .await?;
+                    return Ok(Handled::Reply(ToolOutcome::Expired { approval_id }));
+                }
+            }
+        }
         let fingerprint = fingerprint.clone();
         let consumed = self
             .ctx
             .store
-            .call(move |s| Ok(s.consume_approval(approval_id, &fingerprint, now_ms(), &[started])))
+            .call(move |s| Ok(s.consume_approval(approval_id, &fingerprint, now_ms(), &events)))
             .await?;
         self.ctx.hub.changed();
         match consumed {
-            Ok(()) => {
+            Ok(consumed) if call.is_agent_operation() => {
+                tracing::info!(session = %self.id, task = %task_id, approval = %approval_id, "approval consumed for the Session Agent");
+                self.perform_agent(task_id, consumed, call, shutdown)
+                    .await
+                    .map(Handled::Reply)
+            }
+            Ok(_consumed) => {
                 tracing::info!(session = %self.id, task = %task_id, approval = %approval_id, "approval consumed");
                 self.execute(task_id, call, shutdown)
                     .await
@@ -690,12 +733,105 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
         approval_id: ApprovalId,
         reason: &'static str,
     ) -> Result<(), SessionError> {
+        self.expire_with(approval_id, reason.to_owned()).await
+    }
+
+    async fn expire_with(
+        &self,
+        approval_id: ApprovalId,
+        reason: String,
+    ) -> Result<(), SessionError> {
         self.ctx
             .store
-            .call(move |s| s.expire_approval(approval_id, reason))
+            .call(move |s| s.expire_approval(approval_id, &reason))
             .await?;
         self.ctx.hub.changed();
         Ok(())
+    }
+
+    /// Issue a grant from the approval just consumed and have the Session
+    /// Agent perform the call once. The task is `executing`, with
+    /// `approval_consumed`, `execution_started` and `session_agent_dispatched`
+    /// already committed. Every path ends it in exactly one state with its
+    /// events in the same transaction:
+    ///
+    /// - performed: `completed`, and the worker gets a receipt only;
+    /// - refused by the Core or the agent: `failed` with `tool_failed`, since
+    ///   nothing happened;
+    /// - no valid answer: `failed` with `internal`, so a job holding it is
+    ///   never resumed (ADR 0015).
+    async fn perform_agent(
+        &self,
+        task_id: TaskId,
+        consumed: ConsumedApproval,
+        call: &ToolCall,
+        shutdown: &CancellationToken,
+    ) -> Result<ToolOutcome, SessionError> {
+        let started = std::time::Instant::now();
+        let grant_id = consumed.approval_id();
+        let (performed, mut events) = match &self.ctx.session_agent {
+            None => (
+                Performed::Refused(Refusal::Unavailable.to_string()),
+                Vec::new(),
+            ),
+            Some(agent) => match agent.issue(consumed, call).await {
+                Err(refusal) => (Performed::Refused(refusal.to_string()), Vec::new()),
+                Ok(grant) => {
+                    let report = agent.perform(grant, call, shutdown).await;
+                    (report.performed, report.events)
+                }
+            },
+        };
+        let duration_ms = millis(started.elapsed());
+        let (status, change, outcome, event) = match performed {
+            Performed::Done(report) => {
+                let result = ToolResult::AgentReceipt(AgentReceipt {
+                    agent_operation: call.tool_name().to_owned(),
+                });
+                let json = serde_json::to_string(&result)?;
+                let change = TaskChange {
+                    result: Some(json),
+                    ..TaskChange::to(TaskStatus::Completed)
+                };
+                let event = AuditEventKind::SessionAgentCompleted { grant_id, report };
+                (
+                    TaskStatus::Completed,
+                    change,
+                    ToolOutcome::Completed { result },
+                    event,
+                )
+            }
+            Performed::Refused(reason) => {
+                // The reason stays in the audit log: it says whether the
+                // agent runs, which is none of the worker's business.
+                let error = WireError::new(
+                    ErrorCode::ToolFailed,
+                    "the Session Agent operation was not performed",
+                );
+                let event = AuditEventKind::SessionAgentRefused {
+                    grant_id: Some(grant_id),
+                    reason,
+                };
+                failed_agent(error, event)
+            }
+            Performed::Unknown(reason) => {
+                let error = WireError::new(
+                    ErrorCode::Internal,
+                    "the Session Agent did not confirm the outcome; it is not retried",
+                );
+                let event = AuditEventKind::SessionAgentOutcomeUnknown { grant_id, reason };
+                failed_agent(error, event)
+            }
+        };
+        events.push(event);
+        events.push(AuditEventKind::ExecutionFinished {
+            status,
+            duration_ms,
+            error: change.error.clone(),
+        });
+        self.transition(task_id, TaskStatus::Executing, change, events)
+            .await?;
+        Ok(outcome)
     }
 
     /// Run a call whose task is already `executing` and record the outcome.
@@ -908,6 +1044,22 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Session<'_, R, W> {
             ),
         )
     }
+}
+
+fn failed_agent(
+    error: WireError,
+    event: AuditEventKind,
+) -> (TaskStatus, TaskChange, ToolOutcome, AuditEventKind) {
+    let change = TaskChange {
+        error: Some(error.clone()),
+        ..TaskChange::to(TaskStatus::Failed)
+    };
+    (
+        TaskStatus::Failed,
+        change,
+        ToolOutcome::Failed { error },
+        event,
+    )
 }
 
 async fn sleep_until(deadline: Option<Instant>) {

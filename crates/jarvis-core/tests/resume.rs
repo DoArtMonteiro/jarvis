@@ -148,6 +148,7 @@ impl Env {
             job_timeout: Duration::from_secs(120),
             core_version: "test",
             hub: Arc::clone(&hub),
+            session_agent: None,
         };
         let (to_core, core_reader) = tokio::io::duplex(1 << 20);
         let (core_writer, from_core) = tokio::io::duplex(1 << 20);

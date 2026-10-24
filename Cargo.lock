@@ -484,6 +484,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -503,6 +504,7 @@ version = "0.2.0"
 dependencies = [
  "libc",
  "tempfile",
+ "thiserror",
  "tokio",
  "windows-sys 0.61.2",
 ]

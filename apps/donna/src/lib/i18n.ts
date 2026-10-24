@@ -1,0 +1,387 @@
+// UI strings. European Portuguese first; English tied to the language setting.
+// PT-PT rules: "ecrã", "utilizador", "definições", "apagar", "área de
+// transferência"; "estou a fazer", never the gerund; no Brazilianisms.
+
+export const pt = {
+  appName: "Donna",
+  skipToChat: "Saltar para a conversa",
+
+  // Sidebar
+  newChat: "Nova conversa",
+  searchLabel: "Pesquisar conversas",
+  searchPlaceholder: "Pesquisar conversas…",
+  clearSearch: "Limpar pesquisa",
+  historyLabel: "Histórico de conversas",
+  noConversations: "Ainda não há conversas. A primeira é por tua conta.",
+  noResults: "Nada encontrado para essa pesquisa.",
+  untitled: "Conversa sem título",
+  messageCount: "{n} mensagens",
+  messageCountOne: "{n} mensagem",
+  deleteConversation: "Apagar conversa",
+  deleteConversationTitle: "Apagar esta conversa?",
+  deleteConversationBody: "«{title}» e todas as suas mensagens vão ser apagadas de forma definitiva.",
+  cancel: "Cancelar",
+  delete: "Apagar",
+  close: "Fechar",
+
+  // Header
+  settings: "Definições",
+  approvalsButton: "Pedidos de aprovação",
+  approvalsButtonCount: "Pedidos de aprovação: {n} pendentes",
+  modelStatus: "Estado do modelo",
+  collapseSidebar: "Mostrar ou esconder o histórico",
+
+  // Model state
+  stateReady: "Pronta",
+  stateLoading: "A carregar",
+  stateGenerating: "A gerar",
+  statePaused: "Em pausa — jogo a correr",
+  stateUnloaded: "Fora da memória",
+  stateFailed: "Erro",
+  stateDisabled: "Sem modelo",
+  stateUnknown: "A verificar…",
+  gpuOn: "GPU · Vulkan",
+  cpuOnly: "CPU",
+  contextSize: "{n} de contexto",
+  tokensPerSecond: "{n} tok/s",
+
+  // Model panel
+  modelPanelTitle: "Modelo local",
+  modelName: "Modelo",
+  modelProfile: "Perfil",
+  profilePrimary: "Principal",
+  profileFallback: "Reserva (durante jogos)",
+  modelSha: "SHA-256 do ficheiro",
+  modelLoadTime: "Último carregamento",
+  loadSeconds: "{n} s",
+  loadModel: "Carregar modelo",
+  unloadModel: "Libertar modelo",
+  unloadHint: "Liberta a memória da placa gráfica. Uma resposta em curso é interrompida.",
+  lastError: "Último erro",
+  modelFailedTitle: "O modelo não conseguiu carregar",
+  modelFailedBody: "A Donna não consegue responder enquanto o modelo estiver em erro. Podes tentar carregá-lo outra vez.",
+  modelDisabledBody: "Não há nenhum modelo configurado na instalação do Core. Define a secção [inference] na configuração.",
+  pausedTitle: "Em pausa — jogo a correr",
+  pausedBody:
+    "A Donna libertou o modelo da placa gráfica para o jogo ficar com ela. Retoma sozinha quando o jogo fechar.",
+  pausedBodyProcess: "A Donna libertou o modelo da placa gráfica porque {process} está a correr, para o jogo ficar com ela. Retoma sozinha quando o jogo fechar.",
+  loadingBody: "A carregar o modelo para a memória. Pode demorar alguns segundos.",
+
+  // Chat
+  emptyTitle: "Em que posso ajudar?",
+  emptyBody: "Diz-me o que precisas. Eu trato do resto, com a elegância habitual.",
+  suggestionsLabel: "Sugestões para começar",
+  suggestion1: "Ajuda-me a escrever um e-mail difícil",
+  suggestion2: "Explica-me um conceito como se eu tivesse dez anos",
+  suggestion3: "Dá-me ideias para o jantar de hoje",
+  suggestion4: "Prepara-me para uma conversa de negociação",
+  composerLabel: "Mensagem para a Donna",
+  composerPlaceholder: "Escreve uma mensagem…",
+  composerHint: "Enter envia · Shift+Enter muda de linha · Esc interrompe a resposta",
+  send: "Enviar",
+  stop: "Parar",
+  regenerate: "Gerar outra resposta",
+  you: "Tu",
+  donna: "Donna",
+  messagesLabel: "Mensagens",
+  streamingLabel: "A Donna está a escrever",
+  doneAnnouncement: "A Donna terminou a resposta.",
+  statusCancelled: "Parada",
+  statusFailed: "Não foi possível terminar esta resposta.",
+  statusInterrupted: "Resposta interrompida por um reinício.",
+  tooLong: "A mensagem é demasiado longa.",
+  invalidText: "A mensagem tem caracteres que não consigo enviar.",
+  emptyMessage: "Escreve primeiro uma mensagem.",
+  chatBusy: "A Donna ainda está a responder. Espera ou carrega em Parar.",
+  sendFailed: "Não foi possível enviar a mensagem.",
+  statsLine: "{tps} tok/s · {ms} ms até ao 1.º token",
+
+  // Proposal card
+  proposalTitle: "A Donna sugere copiar para a área de transferência:",
+  proposalAsk: "Pedir aprovação",
+  proposalSubmitting: "A enviar o pedido…",
+  proposalWaiting: "À espera da tua aprovação",
+  proposalWaitingHint: "Abre os pedidos de aprovação para decidir.",
+  proposalDone: "Copiado para a área de transferência.",
+  proposalFailed: "Não foi copiado. O pedido falhou.",
+  proposalCancelled: "Não foi copiado. O pedido foi recusado ou expirou.",
+  proposalError: "Não foi possível pedir a aprovação.",
+  proposalOpen: "Ver pedidos",
+
+  // Approvals
+  approvalsTitle: "Pedidos de aprovação",
+  approvalsEmpty: "Nada à espera de aprovação.",
+  approvalsEmptyHint: "Quando a Donna precisar da tua autorização, o pedido aparece aqui.",
+  approvalsIntro: "Nada acontece sem a tua decisão. Confirma sempre os argumentos exatos.",
+  approve: "Aprovar",
+  deny: "Recusar",
+  denyReasonLabel: "Motivo (opcional)",
+  denyConfirm: "Confirmar recusa",
+  expiresIn: "Expira em {time}",
+  expired: "Expirado",
+  fingerprint: "Código de verificação",
+  exactArguments: "Argumentos exatos",
+  capabilities: "Capacidades",
+  approvalFailed: "Não foi possível registar a decisão.",
+  tool_desktop_write_clipboard_text: "Escrever na área de transferência",
+  tool_desktop_read_clipboard_text: "Ler a área de transferência",
+  tool_desktop_capture_window: "Capturar uma janela",
+  tool_desktop_type_text: "Escrever texto numa janela",
+  tool_filesystem_read_fixture: "Ler um ficheiro de exemplo",
+  tool_workspace_write_file: "Escrever um ficheiro na pasta de trabalho",
+  tool_system_info: "Ler informação do sistema",
+  tool_session_agent_healthcheck: "Verificar o agente de sessão",
+
+  // Core states
+  coreUnreachableTitle: "Não consigo falar com o Core",
+  coreUnreachableBody:
+    "A Donna precisa do Core local para pensar e guardar as conversas. Confirma que está a correr e tenta outra vez.",
+  coreStartingTitle: "A arrancar o Core…",
+  coreStartingBody: "Só um instante. Estou a pôr tudo a postos.",
+  coreLaunchFailedTitle: "Não consegui arrancar o Core",
+  coreVersionTitle: "Versões incompatíveis",
+  coreVersionBody:
+    "O Core fala a versão {found} do protocolo e esta aplicação fala a {expected}. Usa o jarvis-core da mesma compilação e reinicia o Core.",
+  coreConfigTitle: "Falta a configuração",
+  coreConfigBody: "Não consegui ler o ficheiro de configuração.",
+  configPath: "Ficheiro de configuração",
+  retry: "Tentar outra vez",
+  technicalDetails: "Detalhes técnicos",
+
+  // Settings
+  settingsTitle: "Definições",
+  languageHeading: "Idioma",
+  languageHelp: "Define o idioma da aplicação e o idioma em que a Donna responde.",
+  langPt: "Português (Portugal)",
+  langEn: "English",
+  langAuto: "Automático",
+  contextHeading: "Contexto do modelo",
+  contextHelp:
+    "Quanto texto a Donna consegue ter presente de cada vez. Valores maiores usam mais memória da placa gráfica. Mudar o valor recarrega o modelo.",
+  contextTokens: "{n} tokens",
+  contextChanged: "Contexto atualizado.",
+  contextFailed: "Não foi possível mudar o contexto.",
+  storageHeading: "Armazenamento e retenção",
+  storageBody:
+    "As conversas ficam guardadas apenas neste computador, na base de dados local do Core. Nada é enviado para a Internet e a aplicação não faz cópias. Ficam até as apagares (uma a uma, na lista, ou todas de uma vez abaixo), a não ser que o Core tenha um período de retenção configurado, que apaga as conversas mais antigas.",
+  clipboardHeading: "Área de transferência",
+  clipboardBody:
+    "A Donna nunca escreve na área de transferência por conta própria. Quando sugere copiar um texto, só o pedido aparece nos pedidos de aprovação, com o texto exato. Só depois de aprovares é que o Core o copia, uma única vez. Ler a área de transferência não está disponível.",
+  dangerHeading: "Zona de perigo",
+  deleteAll: "Apagar todas as conversas",
+  deleteAllTitle: "Apagar todas as conversas?",
+  deleteAllBody: "Isto apaga de forma definitiva todas as conversas e mensagens guardadas. Não há como desfazer.",
+  deleteAllType: "Para confirmar, escreve {word}.",
+  deleteAllWord: "APAGAR",
+  deleteAllDone: "{n} conversas apagadas.",
+  deleteAllFailed: "Não foi possível apagar as conversas.",
+  aboutVersion: "Donna {app} · Core {core}",
+
+  // Misc
+  loading: "A carregar…",
+  genericError: "Algo correu mal.",
+  conversationLoadFailed: "Não foi possível abrir a conversa.",
+  dismiss: "Dispensar",
+  notifications: "Notificações",
+} as const;
+
+export type StringKey = keyof typeof pt;
+
+export const en: Record<StringKey, string> = {
+  appName: "Donna",
+  skipToChat: "Skip to the conversation",
+
+  newChat: "New conversation",
+  searchLabel: "Search conversations",
+  searchPlaceholder: "Search conversations…",
+  clearSearch: "Clear search",
+  historyLabel: "Conversation history",
+  noConversations: "No conversations yet. The first one is on you.",
+  noResults: "Nothing found for that search.",
+  untitled: "Untitled conversation",
+  messageCount: "{n} messages",
+  messageCountOne: "{n} message",
+  deleteConversation: "Delete conversation",
+  deleteConversationTitle: "Delete this conversation?",
+  deleteConversationBody: "“{title}” and all of its messages will be permanently deleted.",
+  cancel: "Cancel",
+  delete: "Delete",
+  close: "Close",
+
+  settings: "Settings",
+  approvalsButton: "Approval requests",
+  approvalsButtonCount: "Approval requests: {n} pending",
+  modelStatus: "Model status",
+  collapseSidebar: "Show or hide the history",
+
+  stateReady: "Ready",
+  stateLoading: "Loading",
+  stateGenerating: "Generating",
+  statePaused: "Paused — game running",
+  stateUnloaded: "Unloaded",
+  stateFailed: "Error",
+  stateDisabled: "No model",
+  stateUnknown: "Checking…",
+  gpuOn: "GPU · Vulkan",
+  cpuOnly: "CPU",
+  contextSize: "{n} context",
+  tokensPerSecond: "{n} tok/s",
+
+  modelPanelTitle: "Local model",
+  modelName: "Model",
+  modelProfile: "Profile",
+  profilePrimary: "Primary",
+  profileFallback: "Fallback (during games)",
+  modelSha: "File SHA-256",
+  modelLoadTime: "Last load",
+  loadSeconds: "{n} s",
+  loadModel: "Load model",
+  unloadModel: "Unload model",
+  unloadHint: "Frees the graphics memory. A reply in progress is cancelled.",
+  lastError: "Last error",
+  modelFailedTitle: "The model failed to load",
+  modelFailedBody: "Donna cannot answer while the model is in error. You can try loading it again.",
+  modelDisabledBody: "No model is configured in the Core installation. Set the [inference] section in the configuration.",
+  pausedTitle: "Paused — game running",
+  pausedBody:
+    "Donna unloaded the model so the game keeps the GPU. It resumes by itself once the game closes.",
+  pausedBodyProcess: "Donna unloaded the model because {process} is running, so the game keeps the GPU. It resumes by itself once the game closes.",
+  loadingBody: "Loading the model into memory. This can take a few seconds.",
+
+  emptyTitle: "What can I help with?",
+  emptyBody: "Tell me what you need. I will take care of the rest, with the usual elegance.",
+  suggestionsLabel: "Ways to start",
+  suggestion1: "Help me write a difficult email",
+  suggestion2: "Explain a concept to me like I am ten",
+  suggestion3: "Give me ideas for tonight's dinner",
+  suggestion4: "Prepare me for a negotiation",
+  composerLabel: "Message to Donna",
+  composerPlaceholder: "Write a message…",
+  composerHint: "Enter sends · Shift+Enter new line · Esc stops the reply",
+  send: "Send",
+  stop: "Stop",
+  regenerate: "Regenerate reply",
+  you: "You",
+  donna: "Donna",
+  messagesLabel: "Messages",
+  streamingLabel: "Donna is writing",
+  doneAnnouncement: "Donna finished the reply.",
+  statusCancelled: "Stopped",
+  statusFailed: "This reply could not be completed.",
+  statusInterrupted: "Reply interrupted by a restart.",
+  tooLong: "The message is too long.",
+  invalidText: "The message has characters that cannot be sent.",
+  emptyMessage: "Write a message first.",
+  chatBusy: "Donna is still replying. Wait, or press Stop.",
+  sendFailed: "The message could not be sent.",
+  statsLine: "{tps} tok/s · {ms} ms to first token",
+
+  proposalTitle: "Donna suggests copying to the clipboard:",
+  proposalAsk: "Request approval",
+  proposalSubmitting: "Sending the request…",
+  proposalWaiting: "Waiting for your approval",
+  proposalWaitingHint: "Open the approval requests to decide.",
+  proposalDone: "Copied to the clipboard.",
+  proposalFailed: "Not copied. The request failed.",
+  proposalCancelled: "Not copied. The request was declined or expired.",
+  proposalError: "Could not request approval.",
+  proposalOpen: "View requests",
+
+  approvalsTitle: "Approval requests",
+  approvalsEmpty: "Nothing is waiting for approval.",
+  approvalsEmptyHint: "When Donna needs your permission, the request shows up here.",
+  approvalsIntro: "Nothing happens without your decision. Always check the exact arguments.",
+  approve: "Approve",
+  deny: "Deny",
+  denyReasonLabel: "Reason (optional)",
+  denyConfirm: "Confirm denial",
+  expiresIn: "Expires in {time}",
+  expired: "Expired",
+  fingerprint: "Verification code",
+  exactArguments: "Exact arguments",
+  capabilities: "Capabilities",
+  approvalFailed: "The decision could not be recorded.",
+  tool_desktop_write_clipboard_text: "Write to the clipboard",
+  tool_desktop_read_clipboard_text: "Read the clipboard",
+  tool_desktop_capture_window: "Capture a window",
+  tool_desktop_type_text: "Type text into a window",
+  tool_filesystem_read_fixture: "Read a sample file",
+  tool_workspace_write_file: "Write a file in the workspace",
+  tool_system_info: "Read system information",
+  tool_session_agent_healthcheck: "Check the session agent",
+
+  coreUnreachableTitle: "I cannot reach the Core",
+  coreUnreachableBody:
+    "Donna needs the local Core to think and to store conversations. Make sure it is running and try again.",
+  coreStartingTitle: "Starting the Core…",
+  coreStartingBody: "Just a moment. Getting everything ready.",
+  coreLaunchFailedTitle: "I could not start the Core",
+  coreVersionTitle: "Incompatible versions",
+  coreVersionBody:
+    "The Core speaks protocol version {found} and this app speaks {expected}. Use the jarvis-core from the same build and restart the Core.",
+  coreConfigTitle: "Configuration missing",
+  coreConfigBody: "I could not read the configuration file.",
+  configPath: "Configuration file",
+  retry: "Try again",
+  technicalDetails: "Technical details",
+
+  settingsTitle: "Settings",
+  languageHeading: "Language",
+  languageHelp: "Sets the app language and the language Donna replies in.",
+  langPt: "Português (Portugal)",
+  langEn: "English",
+  langAuto: "Automatic",
+  contextHeading: "Model context",
+  contextHelp:
+    "How much text Donna can keep in mind at once. Larger values use more graphics memory. Changing it reloads the model.",
+  contextTokens: "{n} tokens",
+  contextChanged: "Context updated.",
+  contextFailed: "Could not change the context.",
+  storageHeading: "Storage and retention",
+  storageBody:
+    "Conversations are kept only on this computer, in the Core's local database. Nothing is sent to the Internet and the app makes no copies. They stay until you delete them (one by one in the list, or all at once below), unless the Core has a retention period configured, which deletes older conversations.",
+  clipboardHeading: "Clipboard",
+  clipboardBody:
+    "Donna never writes to the clipboard on its own. When it suggests copying some text, only the request appears in the approval requests, with the exact text. Only after you approve does the Core copy it, once. Reading the clipboard is not available.",
+  dangerHeading: "Danger zone",
+  deleteAll: "Delete all conversations",
+  deleteAllTitle: "Delete all conversations?",
+  deleteAllBody: "This permanently deletes every stored conversation and message. It cannot be undone.",
+  deleteAllType: "To confirm, type {word}.",
+  deleteAllWord: "DELETE",
+  deleteAllDone: "{n} conversations deleted.",
+  deleteAllFailed: "Could not delete the conversations.",
+  aboutVersion: "Donna {app} · Core {core}",
+
+  loading: "Loading…",
+  genericError: "Something went wrong.",
+  conversationLoadFailed: "Could not open the conversation.",
+  dismiss: "Dismiss",
+  notifications: "Notifications",
+};
+
+export type UiLang = "pt" | "en";
+export type LangSetting = "pt_pt" | "en" | "auto";
+
+export const dictionaries: Record<UiLang, Record<StringKey, string>> = { pt, en };
+
+/** The UI language for a setting: "auto" follows the system language. */
+export function resolveLang(setting: LangSetting, system: string): UiLang {
+  if (setting === "en") return "en";
+  if (setting === "pt_pt") return "pt";
+  return system.toLowerCase().startsWith("pt") ? "pt" : "en";
+}
+
+export function translate(lang: UiLang, key: StringKey, vars?: Record<string, string | number>): string {
+  const template = dictionaries[lang][key];
+  if (!vars) return template;
+  return template.replace(/\{(\w+)\}/g, (match, name: string) =>
+    name in vars ? String(vars[name]) : match,
+  );
+}
+
+/** Friendly name for a tool, or the raw name when it is not known. */
+export function toolLabel(lang: UiLang, tool: string): string {
+  const key = `tool_${tool.replace(/[^a-z0-9]/gi, "_")}` as StringKey;
+  return key in dictionaries[lang] ? dictionaries[lang][key] : tool;
+}

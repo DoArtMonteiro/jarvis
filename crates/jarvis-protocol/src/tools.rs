@@ -8,7 +8,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ProtocolVersion, ToolName};
+use crate::{
+    AgentReceipt, CaptureWindowArgs, HealthcheckArgs, ProtocolVersion, ReadClipboardTextArgs,
+    ToolName, TypeTextArgs, WriteClipboardTextArgs,
+};
 
 /// Arguments of `system.info`. The tool takes none; any field is an error.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +42,13 @@ pub enum ToolCall {
     SystemInfo(SystemInfoArgs),
     ReadFixture(ReadFixtureArgs),
     WriteFile(WriteFileArgs),
+    /// Run the Session Agent's synthetic operation (ADR 0019).
+    SessionAgentHealthcheck(HealthcheckArgs),
+    /// Desktop operations: typed and approvable, not performable yet.
+    CaptureWindow(CaptureWindowArgs),
+    ReadClipboardText(ReadClipboardTextArgs),
+    WriteClipboardText(WriteClipboardTextArgs),
+    TypeText(TypeTextArgs),
 }
 
 /// Why a well-formed request could not become a [`ToolCall`].
@@ -54,10 +64,23 @@ impl ToolCall {
     pub const SYSTEM_INFO: &'static str = "system.info";
     pub const READ_FIXTURE: &'static str = "filesystem.read_fixture";
     pub const WRITE_FILE: &'static str = "workspace.write_file";
+    pub const SESSION_AGENT_HEALTHCHECK: &'static str = "session_agent.healthcheck";
+    pub const CAPTURE_WINDOW: &'static str = "desktop.capture_window";
+    pub const READ_CLIPBOARD_TEXT: &'static str = "desktop.read_clipboard_text";
+    pub const WRITE_CLIPBOARD_TEXT: &'static str = "desktop.write_clipboard_text";
+    pub const TYPE_TEXT: &'static str = "desktop.type_text";
 
     /// Every tool the protocol defines, in a stable order.
-    pub const NAMES: &'static [&'static str] =
-        &[Self::READ_FIXTURE, Self::SYSTEM_INFO, Self::WRITE_FILE];
+    pub const NAMES: &'static [&'static str] = &[
+        Self::CAPTURE_WINDOW,
+        Self::READ_CLIPBOARD_TEXT,
+        Self::TYPE_TEXT,
+        Self::WRITE_CLIPBOARD_TEXT,
+        Self::READ_FIXTURE,
+        Self::SESSION_AGENT_HEALTHCHECK,
+        Self::SYSTEM_INFO,
+        Self::WRITE_FILE,
+    ];
 
     /// Resolve a tool name and decode its arguments into the tool's schema.
     pub fn from_request(tool: &ToolName, args: &serde_json::Value) -> Result<Self, CallError> {
@@ -65,6 +88,18 @@ impl ToolCall {
             Self::SYSTEM_INFO => decode_args(Self::SYSTEM_INFO, args).map(Self::SystemInfo),
             Self::READ_FIXTURE => decode_args(Self::READ_FIXTURE, args).map(Self::ReadFixture),
             Self::WRITE_FILE => decode_args(Self::WRITE_FILE, args).map(Self::WriteFile),
+            Self::SESSION_AGENT_HEALTHCHECK => decode_args(Self::SESSION_AGENT_HEALTHCHECK, args)
+                .map(Self::SessionAgentHealthcheck),
+            Self::CAPTURE_WINDOW => {
+                decode_args(Self::CAPTURE_WINDOW, args).map(Self::CaptureWindow)
+            }
+            Self::READ_CLIPBOARD_TEXT => {
+                decode_args(Self::READ_CLIPBOARD_TEXT, args).map(Self::ReadClipboardText)
+            }
+            Self::WRITE_CLIPBOARD_TEXT => {
+                decode_args(Self::WRITE_CLIPBOARD_TEXT, args).map(Self::WriteClipboardText)
+            }
+            Self::TYPE_TEXT => decode_args(Self::TYPE_TEXT, args).map(Self::TypeText),
             other => Err(CallError::UnknownTool(other.to_owned())),
         }
     }
@@ -74,6 +109,24 @@ impl ToolCall {
             Self::SystemInfo(_) => Self::SYSTEM_INFO,
             Self::ReadFixture(_) => Self::READ_FIXTURE,
             Self::WriteFile(_) => Self::WRITE_FILE,
+            Self::SessionAgentHealthcheck(_) => Self::SESSION_AGENT_HEALTHCHECK,
+            Self::CaptureWindow(_) => Self::CAPTURE_WINDOW,
+            Self::ReadClipboardText(_) => Self::READ_CLIPBOARD_TEXT,
+            Self::WriteClipboardText(_) => Self::WRITE_CLIPBOARD_TEXT,
+            Self::TypeText(_) => Self::TYPE_TEXT,
+        }
+    }
+
+    /// Whether the call is performed by the Session Agent rather than a
+    /// first-party tool in the Core.
+    pub fn is_agent_operation(&self) -> bool {
+        match self {
+            Self::SystemInfo(_) | Self::ReadFixture(_) | Self::WriteFile(_) => false,
+            Self::SessionAgentHealthcheck(_)
+            | Self::CaptureWindow(_)
+            | Self::ReadClipboardText(_)
+            | Self::WriteClipboardText(_)
+            | Self::TypeText(_) => true,
         }
     }
 
@@ -85,6 +138,11 @@ impl ToolCall {
             Self::SystemInfo(args) => serde_json::to_value(args),
             Self::ReadFixture(args) => serde_json::to_value(args),
             Self::WriteFile(args) => serde_json::to_value(args),
+            Self::SessionAgentHealthcheck(args) => serde_json::to_value(args),
+            Self::CaptureWindow(args) => serde_json::to_value(args),
+            Self::ReadClipboardText(args) => serde_json::to_value(args),
+            Self::WriteClipboardText(args) => serde_json::to_value(args),
+            Self::TypeText(args) => serde_json::to_value(args),
         };
         // Plain structs of strings always serialise.
         encoded.unwrap_or(serde_json::Value::Null)
@@ -256,6 +314,7 @@ pub enum ToolResult {
     SystemInfo(SystemInfo),
     Fixture(FixtureContent),
     Written(WriteOutcome),
+    AgentReceipt(AgentReceipt),
 }
 
 impl ToolResult {
@@ -266,6 +325,12 @@ impl ToolResult {
             (Self::SystemInfo(_), ToolCall::SystemInfo(_))
                 | (Self::Fixture(_), ToolCall::ReadFixture(_))
                 | (Self::Written(_), ToolCall::WriteFile(_))
+        ) || matches!(
+            (self, call),
+            (
+                Self::AgentReceipt(receipt),
+                ToolCall::SessionAgentHealthcheck(_) | ToolCall::WriteClipboardText(_)
+            ) if receipt.agent_operation == call.tool_name()
         )
     }
 }

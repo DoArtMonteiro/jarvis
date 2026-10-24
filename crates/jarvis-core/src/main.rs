@@ -11,9 +11,9 @@ use jarvis_core::rpc::client::Client;
 use jarvis_core::store::Store;
 use jarvis_core::{daemon, isolation};
 use jarvis_protocol::{
-    ApprovalId, ApprovalStatus, ApprovalView, Fingerprint, Goal, GovernorPhase, GovernorReason,
-    GovernorView, HealthReport, JobId, JobStatus, JobView, RpcError, RpcRequest, RpcResponse,
-    Summary, TaskId,
+    ApprovalId, ApprovalStatus, ApprovalView, ChatLanguage, ChatText, ConversationId, Fingerprint,
+    Goal, GovernorPhase, GovernorReason, GovernorView, HealthReport, JobId, JobStatus, JobView,
+    MessageStatus, RpcError, RpcRequest, RpcResponse, Summary, TaskId,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -97,6 +97,21 @@ enum Command {
         config: ConfigArg,
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send one message to the local model and print the reply as it is
+    /// written (ADR 0021).
+    Chat {
+        #[command(flatten)]
+        config: ConfigArg,
+        message: String,
+        /// Continue this conversation instead of starting one.
+        #[arg(long)]
+        conversation: Option<ConversationId>,
+        #[arg(long, value_enum, default_value_t = Language::PtPt)]
+        language: Language,
+        /// Print the final reply and its measurements as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -414,6 +429,13 @@ fn client_command(command: Command) -> anyhow::Result<bool> {
                 timeout,
                 json,
             } => submit(&config.config, goal, wait.then_some(*timeout), json).await,
+            Command::Chat {
+                config,
+                message,
+                conversation,
+                language,
+                json,
+            } => chat(&config.config, &message, conversation, language, json).await,
             Command::Job {
                 config,
                 job_id,
@@ -432,6 +454,9 @@ fn client_command(command: Command) -> anyhow::Result<bool> {
                     )?
                 };
                 print_job(&job, json)?;
+                if !json {
+                    print_job_outcomes(&config.config, job_id);
+                }
                 Ok(!job.status.is_terminal() || job.status == JobStatus::Completed)
             }
             Command::Jobs {
@@ -472,6 +497,103 @@ fn client_command(command: Command) -> anyhow::Result<bool> {
             }
         }
     })
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Language {
+    PtPt,
+    En,
+    Auto,
+}
+
+async fn chat(
+    config_path: &Path,
+    message: &str,
+    conversation: Option<ConversationId>,
+    language: Language,
+    json: bool,
+) -> anyhow::Result<bool> {
+    let text = ChatText::try_from(message.to_owned()).map_err(anyhow::Error::msg)?;
+    let language = match language {
+        Language::PtPt => ChatLanguage::PtPt,
+        Language::En => ChatLanguage::En,
+        Language::Auto => ChatLanguage::Auto,
+    };
+    let mut client = connect(config_path).await?;
+    let turn = match client
+        .call(&RpcRequest::ChatSend {
+            conversation_id: conversation,
+            text,
+            language,
+        })
+        .await?
+    {
+        RpcResponse::ChatTurn(turn) => turn,
+        other => return Err(unexpected(other)),
+    };
+    let mut cursor = 0;
+    let mut stdout = std::io::stdout();
+    loop {
+        let delta = match client
+            .call(&RpcRequest::ChatPoll {
+                turn_id: turn.turn_id,
+                cursor,
+                wait_ms: 30_000,
+            })
+            .await?
+        {
+            RpcResponse::ChatDelta(delta) => delta,
+            other => return Err(unexpected(other)),
+        };
+        cursor = delta.next_cursor;
+        if !json {
+            write!(stdout, "{}", delta.text)?;
+            stdout.flush()?;
+        }
+        if delta.status.is_final() {
+            if json {
+                let view = match client
+                    .call(&RpcRequest::GetConversation {
+                        conversation_id: turn.conversation_id,
+                    })
+                    .await?
+                {
+                    RpcResponse::Conversation(view) => view,
+                    other => return Err(unexpected(other)),
+                };
+                let reply = view.messages.iter().find(|m| m.message_id == turn.turn_id);
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "conversation_id": turn.conversation_id,
+                        "turn_id": turn.turn_id,
+                        "status": delta.status,
+                        "error": delta.error,
+                        "reply": reply,
+                    })
+                );
+            } else {
+                writeln!(stdout)?;
+                if let Some(error) = &delta.error {
+                    eprintln!("error: {error}");
+                }
+                if let Some(stats) = &delta.stats {
+                    eprintln!(
+                        "[{} prompt tokens, {} reply tokens, first token {} ms, {:.1} tokens/s; conversation {}]",
+                        stats.prompt_tokens,
+                        stats.completion_tokens,
+                        stats.first_token_ms,
+                        f64::from(stats.tokens_per_second_x10) / 10.0,
+                        turn.conversation_id
+                    );
+                }
+                if let Some(proposal) = &delta.proposal {
+                    eprintln!("[clipboard proposal: {:?}]", proposal.as_str());
+                }
+            }
+            return Ok(delta.status == MessageStatus::Complete);
+        }
+    }
 }
 
 async fn connect(config_path: &Path) -> anyhow::Result<Client> {
@@ -730,9 +852,31 @@ async fn approvals(command: ApprovalCommand) -> anyhow::Result<bool> {
                 Some(expected) => expected,
                 None => approval.fingerprint.clone(),
             };
-            if !yes && !confirm()? {
-                println!("not approved");
-                return Ok(false);
+            if !yes {
+                match confirm()? {
+                    Answer::Approve => {}
+                    Answer::Deny => {
+                        let reason = Summary::try_from("denied at the terminal".to_owned())
+                            .map_err(|error| anyhow::anyhow!("invalid reason: {error}"))?;
+                        return match client
+                            .call(&RpcRequest::Deny {
+                                approval_id,
+                                reason,
+                            })
+                            .await?
+                        {
+                            RpcResponse::Approval(_) => {
+                                println!("denied");
+                                Ok(false)
+                            }
+                            other => Err(unexpected(other)),
+                        };
+                    }
+                    Answer::Cancel => {
+                        println!("cancelled; the request is still pending");
+                        return Ok(false);
+                    }
+                }
             }
             match client
                 .call(&RpcRequest::Approve {
@@ -792,16 +936,32 @@ async fn get_approval(
     }
 }
 
+/// What the person typed at the terminal.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    Approve,
+    Deny,
+    Cancel,
+}
+
+fn parse_answer(text: &str) -> Answer {
+    match text.trim() {
+        "yes" => Answer::Approve,
+        "no" => Answer::Deny,
+        _ => Answer::Cancel,
+    }
+}
+
 /// Ask at the terminal. Refuses to guess when there is no terminal.
-fn confirm() -> anyhow::Result<bool> {
+fn confirm() -> anyhow::Result<Answer> {
     if !std::io::stdin().is_terminal() {
         bail!("no terminal to confirm on; review the request and pass --yes to approve it");
     }
-    eprint!("Approve this request? Type `yes` to approve: ");
+    eprint!("Approve this request? Type yes to approve, no to deny, or press Enter to cancel: ");
     std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
-    Ok(answer.trim() == "yes")
+    Ok(parse_answer(&answer))
 }
 
 /// Everything a person needs to decide. Every value comes from the Core
@@ -864,11 +1024,74 @@ fn open_store(config_path: &Path) -> anyhow::Result<Store> {
         .with_context(|| format!("cannot open {}", config.database.display()))
 }
 
+/// Audit events that settle an agent operation, with how each is shown.
+/// In order of precedence: if a task ever had more than one outcome, the
+/// least reassuring one is shown.
+const OUTCOME_EVENTS: [(&str, &str); 3] = [
+    (
+        "session_agent_outcome_unknown",
+        "OUTCOME UNKNOWN (may have happened; not retried)",
+    ),
+    ("session_agent_refused", "REFUSED (not performed)"),
+    ("session_agent_completed", "COMPLETED"),
+];
+
+fn is_agent_tool(tool: &str) -> bool {
+    tool.starts_with("session_agent.") || tool.starts_with("desktop.")
+}
+
+/// How an agent operation ended, from the names of its task's audit events.
+/// `-` while no outcome has been recorded.
+fn agent_outcome(events: &[&str]) -> &'static str {
+    OUTCOME_EVENTS
+        .iter()
+        .find(|(name, _)| events.contains(name))
+        .map_or("-", |(_, text)| text)
+}
+
+/// The outcome of a task, or `None` if it does not go through the Session
+/// Agent.
+fn task_outcome(
+    store: &Store,
+    task_id: TaskId,
+    tool: &str,
+) -> anyhow::Result<Option<&'static str>> {
+    if !is_agent_tool(tool) {
+        return Ok(None);
+    }
+    let events = store.audit_events(Some(task_id), 500)?;
+    let names: Vec<&str> = events.iter().map(|event| event.event.name()).collect();
+    Ok(Some(agent_outcome(&names)))
+}
+
+/// One `outcome` line per agent task of a job, when there are any. A failure
+/// to read the audit log is reported but does not change the exit status.
+fn print_job_outcomes(config_path: &Path, job_id: JobId) {
+    let lines = (|| -> anyhow::Result<Vec<String>> {
+        let store = open_store(config_path)?;
+        let mut lines = Vec::new();
+        for task in store.tasks(500)?.into_iter().rev() {
+            if task.job_id != Some(job_id) {
+                continue;
+            }
+            if let Some(outcome) = task_outcome(&store, task.task_id, &task.tool)? {
+                lines.push(format!("outcome    {outcome}"));
+            }
+        }
+        Ok(lines)
+    })();
+    match lines {
+        Ok(lines) => lines.iter().for_each(|line| println!("{line}")),
+        Err(error) => eprintln!("cannot read the outcome: {error:#}"),
+    }
+}
+
 fn print_tasks(config_path: &Path, limit: u32, json: bool) -> anyhow::Result<()> {
     let store = open_store(config_path)?;
     for task in store.tasks(limit)?.into_iter().rev() {
+        let outcome = task_outcome(&store, task.task_id, &task.tool)?;
         if json {
-            let value = serde_json::json!({
+            let mut value = serde_json::json!({
                 "task_id": task.task_id,
                 "session_id": task.session_id,
                 "job_id": task.job_id,
@@ -881,6 +1104,9 @@ fn print_tasks(config_path: &Path, limit: u32, json: bool) -> anyhow::Result<()>
                 "created_at": task.created_at,
                 "updated_at": task.updated_at,
             });
+            if let (Some(outcome), Some(object)) = (outcome, value.as_object_mut()) {
+                object.insert("outcome".to_owned(), outcome.into());
+            }
             println!("{value}");
         } else {
             let decision = task.decision.map_or("-", |d| d.as_str());
@@ -888,14 +1114,16 @@ fn print_tasks(config_path: &Path, limit: u32, json: bool) -> anyhow::Result<()>
                 .error
                 .map(|e| format!("{}: {}", e.code, e.message))
                 .unwrap_or_default();
+            let outcome = outcome.map_or_else(String::new, |o| format!("  outcome: {o}"));
             let line = format!(
-                "{}  {}  {:<21} {:<23} {:<20} {}",
+                "{}  {}  {:<21} {:<23} {:<20} {}{}",
                 task.created_at,
                 task.task_id,
                 task.status.as_str(),
                 task.tool,
                 decision,
-                error
+                error,
+                outcome
             );
             println!("{}", line.trim_end());
         }
@@ -950,6 +1178,38 @@ mod tests {
             held_ms,
             overdue: false,
         }
+    }
+
+    #[test]
+    fn terminal_answers_are_exact() {
+        assert_eq!(parse_answer("yes\n"), Answer::Approve);
+        assert_eq!(parse_answer(" no \r\n"), Answer::Deny);
+        for other in ["", "\n", "y", "Yes", "NO", "yes please", "n"] {
+            assert_eq!(parse_answer(other), Answer::Cancel, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn agent_outcomes_are_unambiguous() {
+        assert_eq!(
+            agent_outcome(&["execution_started", "session_agent_dispatched"]),
+            "-"
+        );
+        assert_eq!(
+            agent_outcome(&["session_agent_dispatched", "session_agent_completed"]),
+            "COMPLETED"
+        );
+        assert_eq!(
+            agent_outcome(&["session_agent_refused"]),
+            "REFUSED (not performed)"
+        );
+        assert_eq!(
+            agent_outcome(&["session_agent_outcome_unknown"]),
+            "OUTCOME UNKNOWN (may have happened; not retried)"
+        );
+        assert!(is_agent_tool("desktop.write_clipboard_text"));
+        assert!(is_agent_tool("session_agent.healthcheck"));
+        assert!(!is_agent_tool("system.info"));
     }
 
     #[test]

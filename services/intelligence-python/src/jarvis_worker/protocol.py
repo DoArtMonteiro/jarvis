@@ -21,9 +21,12 @@ from typing import NoReturn, TypeAlias, assert_never
 
 __all__ = [
     "PROTOCOL_VERSION",
+    "TOOL_DESKTOP_WRITE_CLIPBOARD_TEXT",
     "TOOL_READ_FIXTURE",
+    "TOOL_SESSION_AGENT_HEALTHCHECK",
     "TOOL_SYSTEM_INFO",
     "TOOL_WRITE_FILE",
+    "AgentReceipt",
     "Capability",
     "Completed",
     "CoreMessage",
@@ -67,6 +70,8 @@ PROTOCOL_VERSION = 2
 TOOL_SYSTEM_INFO = "system.info"
 TOOL_READ_FIXTURE = "filesystem.read_fixture"
 TOOL_WRITE_FILE = "workspace.write_file"
+TOOL_SESSION_AGENT_HEALTHCHECK = "session_agent.healthcheck"
+TOOL_DESKTOP_WRITE_CLIPBOARD_TEXT = "desktop.write_clipboard_text"
 
 JsonValue: TypeAlias = "bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None"
 
@@ -96,6 +101,11 @@ class Capability(StrEnum):
     SYSTEM_INFO = "system.info"
     FILESYSTEM_READ_FIXTURE = "filesystem.read.fixture"
     WORKSPACE_WRITE = "workspace.write"
+    SESSION_AGENT_HEALTHCHECK = "session_agent.healthcheck"
+    DESKTOP_SCREEN_OBSERVE = "desktop.screen.observe"
+    DESKTOP_CLIPBOARD_READ = "desktop.clipboard.read"
+    DESKTOP_CLIPBOARD_WRITE = "desktop.clipboard.write"
+    DESKTOP_INPUT_SEND = "desktop.input.send"
 
 
 class JobOutcome(StrEnum):
@@ -384,7 +394,14 @@ class WriteOutcome:
     created: bool
 
 
-ToolResult: TypeAlias = SystemInfo | FixtureContent | WriteOutcome
+@dataclass(frozen=True, slots=True)
+class AgentReceipt:
+    """A Session Agent operation completed. What the agent reported stays with the Core."""
+
+    agent_operation: str
+
+
+ToolResult: TypeAlias = SystemInfo | FixtureContent | WriteOutcome | AgentReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -527,6 +544,7 @@ _SYSTEM_INFO_FIELDS = frozenset(
 )
 _FIXTURE_CONTENT_FIELDS = frozenset({"path", "bytes", "content"})
 _WRITE_OUTCOME_FIELDS = frozenset({"path", "bytes", "created"})
+_AGENT_RECEIPT_FIELDS = frozenset({"agent_operation"})
 
 
 def decode_core_message(frame: bytes) -> CoreMessage:
@@ -767,5 +785,9 @@ def _decode_result(value: object) -> ToolResult:
             path=validate_relative_path(_text(fields["path"], "path")),
             bytes=_uint(fields["bytes"], "bytes", _U64),
             created=_flag(fields["created"], "created"),
+        )
+    if fields.keys() == _AGENT_RECEIPT_FIELDS:
+        return AgentReceipt(
+            agent_operation=validate_tool_name(_text(fields["agent_operation"], "agent_operation"))
         )
     raise _malformed("result does not match any tool result schema")

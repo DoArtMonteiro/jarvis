@@ -349,7 +349,7 @@ fn the_daemon_runs_jobs_from_clients_with_the_python_worker() {
     let health = setup.health();
     assert_eq!(health["ok"], true);
     assert_eq!(health["worker_protocol"], 2);
-    assert_eq!(health["rpc_protocol"], 2);
+    assert_eq!(health["rpc_protocol"], 3);
     assert!(health["worker"]["pid"].is_u64());
     assert!(!health["worker"]["containment"].as_str().unwrap().is_empty());
 
@@ -943,18 +943,18 @@ fn the_rpc_interface_is_strict_and_bounded() {
     let endpoint = setup.endpoint();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
-        let health = br#"{"rpc":2,"type":"health"}"#;
+        let health = br#"{"rpc":3,"type":"health"}"#;
         let replies = raw_exchange(
             &endpoint,
             &[
                 b"not json",
-                br#"{"rpc":2,"type":"health","extra":1}"#,
-                br#"{"rpc":2,"type":"run_command","command":"id"}"#,
-                br#"{"rpc":3,"type":"health"}"#,
-                br#"{"rpc":1,"type":"health"}"#,
+                br#"{"rpc":3,"type":"health","extra":1}"#,
+                br#"{"rpc":3,"type":"run_command","command":"id"}"#,
+                br#"{"rpc":4,"type":"health"}"#,
+                br#"{"rpc":2,"type":"health"}"#,
                 br#"{"protocol":2,"type":"hello","worker":"w","worker_version":"1"}"#,
-                br#"{"rpc":2,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aa","approved":true}"#,
-                br#"{"rpc":2,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                br#"{"rpc":3,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aa","approved":true}"#,
+                br#"{"rpc":3,"type":"approve","approval_id":"01928f5e-7c3b-7a20-8b3c-4d5e6f7a8b9c","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
                 health,
             ],
         )
@@ -979,13 +979,13 @@ fn the_rpc_interface_is_strict_and_bounded() {
         );
         // A client of the previous version is refused, and the answer is
         // encoded at this version: an older client cannot decode it either.
-        assert_eq!(replies[4]["rpc"], 2);
-        assert!(replies[4]["message"].as_str().unwrap().contains("version 1"));
+        assert_eq!(replies[4]["rpc"], 3);
+        assert!(replies[4]["message"].as_str().unwrap().contains("version 2"));
         assert_eq!(replies[8]["type"], "health", "the connection survives bad requests");
 
         // An oversized request is answered once, then the connection closes.
         let huge = format!(
-            r#"{{"rpc":2,"type":"submit_job","goal":"{}"}}"#,
+            r#"{{"rpc":3,"type":"submit_job","goal":"{}"}}"#,
             "x".repeat(20 * 1024)
         );
         let replies = raw_exchange(&endpoint, &[huge.as_bytes(), health]).await;

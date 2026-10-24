@@ -14,6 +14,11 @@ pub fn required_capabilities(call: &ToolCall) -> Vec<Capability> {
         ToolCall::SystemInfo(_) => vec![Capability::SystemInfo],
         ToolCall::ReadFixture(_) => vec![Capability::FilesystemReadFixture],
         ToolCall::WriteFile(_) => vec![Capability::WorkspaceWrite],
+        ToolCall::SessionAgentHealthcheck(_) => vec![Capability::SessionAgentHealthcheck],
+        ToolCall::CaptureWindow(_) => vec![Capability::DesktopScreenObserve],
+        ToolCall::ReadClipboardText(_) => vec![Capability::DesktopClipboardRead],
+        ToolCall::WriteClipboardText(_) => vec![Capability::DesktopClipboardWrite],
+        ToolCall::TypeText(_) => vec![Capability::DesktopInputSend],
     }
 }
 
@@ -75,7 +80,7 @@ impl Policy {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use jarvis_protocol::{ReadFixtureArgs, RelativePath, SystemInfoArgs, WriteFileArgs};
     use proptest::prelude::*;
 
@@ -85,9 +90,13 @@ mod tests {
         Policy::new(rules.iter().copied().collect())
     }
 
-    #[test]
-    fn every_tool_requires_at_least_one_capability() {
-        let calls = [
+    /// One call of every tool, in the order of `ToolCall::NAMES`' sources.
+    pub(crate) fn one_of_each() -> Vec<ToolCall> {
+        use jarvis_protocol::{
+            AgentLabel, CaptureWindowArgs, ClipboardText, HealthcheckArgs, ReadClipboardTextArgs,
+            TypeTextArgs, TypedText, WindowTarget, WriteClipboardTextArgs,
+        };
+        vec![
             ToolCall::SystemInfo(SystemInfoArgs {}),
             ToolCall::ReadFixture(ReadFixtureArgs {
                 path: RelativePath::try_from("a.txt".to_owned()).unwrap(),
@@ -96,10 +105,40 @@ mod tests {
                 path: RelativePath::try_from("a.txt".to_owned()).unwrap(),
                 content: String::new(),
             }),
-        ];
+            ToolCall::SessionAgentHealthcheck(HealthcheckArgs {
+                label: AgentLabel::try_from("ping".to_owned()).unwrap(),
+            }),
+            ToolCall::CaptureWindow(CaptureWindowArgs {
+                target: WindowTarget(7),
+            }),
+            ToolCall::ReadClipboardText(ReadClipboardTextArgs {}),
+            ToolCall::WriteClipboardText(WriteClipboardTextArgs {
+                text: ClipboardText::try_from("hello".to_owned()).unwrap(),
+            }),
+            ToolCall::TypeText(TypeTextArgs {
+                target: WindowTarget(7),
+                text: TypedText::try_from("hello".to_owned()).unwrap(),
+            }),
+        ]
+    }
+
+    #[test]
+    fn every_tool_requires_at_least_one_capability() {
+        let calls = one_of_each();
         assert_eq!(calls.len(), ToolCall::NAMES.len());
         for call in calls {
-            assert!(!required_capabilities(&call).is_empty(), "{call:?}");
+            let capabilities = required_capabilities(&call);
+            assert!(!capabilities.is_empty(), "{call:?}");
+            // Whatever the Session Agent does, a person confirms each use.
+            if call.is_agent_operation() {
+                for capability in capabilities {
+                    assert_eq!(
+                        capability.class().ceiling(),
+                        PolicyDecision::RequireConfirmation,
+                        "{call:?}"
+                    );
+                }
+            }
         }
     }
 

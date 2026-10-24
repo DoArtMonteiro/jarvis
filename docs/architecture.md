@@ -17,6 +17,7 @@ This document describes what exists in Phase 3. Planned components are marked as
 |  isolation   worker confinement; start-up check that it holds     |
 |  supervisor  start the isolated worker, forward stderr, kill      |
 |  governor    optional: hold job starts while a game runs          |
+|  inference   optional: local model broker, conversations          |
 |  session     handshake, jobs, request pipeline, limits            |
 |  policy      capability extraction, policy evaluation             |
 |  approval    fingerprints, display-safe descriptions, wake-ups    |
@@ -37,14 +38,23 @@ This document describes what exists in Phase 3. Planned components are marked as
 +==============================+
    jarvis-sandbox: starts the worker inside the boundary (the only crate with unsafe code)
    jarvis-protocol: wire types for both protocols, strict decoding
+
+   inference, when configured (ADR 0021):
+
+   desktop app / CLI --RPC--> Core (inference) --loopback HTTP, per-start key--> model server
+   (Tauri, an RPC client)       |                                                 (llama.cpp, no tools)
+                                +--> chat database (SQLite, separate from the audit database)
 ```
+
+The model server and the desktop app are outside the worker's boundary and never talk to it. The worker does not see the model, and the model has no tools.
 
 | Crate or package | Responsibility | Knows about |
 | --- | --- | --- |
-| `crates/jarvis-protocol` | Worker protocol v2 and local RPC v1: messages, IDs, capabilities, typed tool calls and results, task, job and approval statuses, audit event kinds, strict decoding | Nothing else in the repository; no I/O |
+| `crates/jarvis-protocol` | Worker protocol v2 and local RPC v3: messages, IDs, capabilities, typed tool calls and results, task, job and approval statuses, conversation types, audit event kinds, strict decoding | Nothing else in the repository; no I/O |
 | `crates/jarvis-tools` | First-party tools behind the `ToolExecutor` trait | The protocol types. Not policy |
 | `crates/jarvis-sandbox` | Starts the worker under a `Confinement`: AppContainer, job, handle list and mitigations (Windows); Landlock, seccomp and process controls (Linux). Also the owner-only named pipe and peer process helpers | The OS |
-| `crates/jarvis-core` | Everything that decides, executes, records, supervises and serves clients; the CLI | Protocol, tools and sandbox |
+| `crates/jarvis-core` | Everything that decides, executes, records, supervises and serves clients; the CLI. Its `inference` module starts and talks to the model server, owns the conversation database and builds prompts | Protocol, tools and sandbox |
+| `apps/donna` | Desktop client (Tauri 2). An RPC client like the CLI: it holds no policy, approvals or state of its own, renders model text without HTML and never parses it for actions (ADR 0021) | The RPC interface only |
 | `services/intelligence-python` | Worker process: protocol client, job loop and a deterministic planner | The worker protocol only |
 
 ## A job, end to end
@@ -54,6 +64,19 @@ This document describes what exists in Phase 3. Planned components are marked as
 3. The worker plans the goal and sends one `tool_request` at a time, each naming the job.
 4. Each request becomes a task and goes through the request lifecycle below.
 5. The worker sends `job_result` with an outcome and a one-line summary; the job becomes `completed` or `failed`. A client waiting on the job (`--wait`) gets the result.
+
+## A conversation, end to end
+
+This path exists only when `[inference]` is configured (ADR 0021). It never touches the policy, the worker or the approval store, except through the optional last step.
+
+1. A client sends `chat_send` with a message and, for a new conversation, no conversation id. The RPC server validates the text (`ChatText`), checks that no reply is being written and that no game holds the model, stores the person's message and an empty reply in the chat database in one transaction, and answers with a `turn_id`.
+2. In the background the Core makes sure the model server is running: it checks the model file's SHA-256 against the configuration, starts the server with a cleared environment under a job, waits until it answers, and records `inference_loaded`.
+3. The Core builds the prompt from the persona, the language rule and as much of the conversation's history as fits the context, and sends it to the server over loopback with the per-start key. It reads the streamed answer under size and time limits and appends the text to the reply as it arrives.
+4. The client polls `chat_poll` with a byte cursor. Each poll returns the text after the cursor, and waits for new text when asked to. The stream has its own wake-up signal, so it does not wake clients waiting on approvals.
+5. When the stream ends the reply becomes final (`complete`, or `cancelled` or `failed`, with the text so far kept) and is stored with its measurements. If the person's own message asked for something to be copied and the reply holds one clean clipboard block, the final `chat_delta` also carries it as `proposal`.
+6. Optionally, the person presses a button in the client, which submits the proposal as an ordinary job (`copy "<text>"`). From there it is the normal path: the worker plans it, policy requires confirmation, and the person approves the exact text in the approval inbox.
+
+While a configured game runs and the governor is enabled, the Core stops the server (or switches to the fallback model, if configured). A reply being written is cancelled and kept as far as it got.
 
 ## Request lifecycle
 
@@ -118,7 +141,8 @@ The store checks the expected source state of every transition inside the transa
 - A worker that does not complete the handshake, or a job that runs past `job_timeout`, is killed. When the worker stops for any reason, the session expires its approvals and either puts its job back in the queue or ends it (ADR 0015), and the supervisor restarts the worker with exponential backoff, within a restart budget per time window. Once the budget is spent the Core reports itself unhealthy and refuses jobs.
 - With `[governor]` enabled (ADR 0016), a task reads the process list every `poll_ms` and publishes whether queued jobs may start. The Core starts held and the gate is closed until the first reading. Each session reads the gate before it claims a job and does not claim while it is closed, so a held job is not counted as an attempt and its job timer never starts; jobs already running are left alone. A hold is never ended by time: after `alert_after_ms` it is flagged overdue and one event is recorded. A read that takes longer than `poll_ms` counts as failed (the jobs are held) and at most one read is in flight; a hold closes the gate before it is recorded, a release is recorded before the gate opens. The governor does not exist when it is disabled, and the gate is open.
 - On SIGINT, SIGTERM, Ctrl+C, Ctrl+Break or console close, or an authorised `shutdown` request, the Core cancels the running tool, expires pending approvals, closes the worker's stdin, kills it after the grace period, stops the RPC server and records `core_stopped`. A second signal exits immediately.
-- The client commands (`health`, `submit`, `job`, `jobs`, `approvals`, `shutdown`) connect to the endpoint named in the same config file. `tasks` and `audit` read the database directly, read-only.
+- With `[inference]` configured (ADR 0021), the Core starts the model server (`llama-server`) on demand, or at start-up when `load_on_start` is set. It is started like the Session Agent: from an absolute path in the configuration, never through a shell, with a cleared environment, no child processes, a commit limit and a kill-on-close job, so it dies with the Core. It binds `127.0.0.1` on a port chosen at each start and requires a key generated for that start. The RPC server refuses connections from its process. It is not isolated from the user, because it needs the GPU. The Core hashes the model file before its first load and refuses one that does not match the configuration.
+- The client commands (`health`, `submit`, `job`, `jobs`, `approvals`, `chat`, `shutdown`) connect to the endpoint named in the same config file. `tasks` and `audit` read the database directly, read-only.
 
 ## Local RPC
 
@@ -138,6 +162,7 @@ The Core runs on Tokio. A session handles one request at a time: a worker can ne
 - Start-up recovery, in one transaction: approvals still pending or granted become `expired`; tasks left `received` or `executing` become `interrupted`, tasks left `awaiting_confirmation` become `expired`; queued jobs stay queued, and a running job is settled by the same function a session uses when it ends (`requeue_or_close`, ADR 0015) before the open tasks are rewritten. The decision reads the `execution_started` event and the task's final status, so it does not depend on that order; settling first records the quarantine before the task rewrite.
 - The guarantee for approvals is *at most once*: once consumed, an approval can never be used again. A side effect interrupted by a crash may or may not have happened; its task says `interrupted`, and its job is quarantined instead of resumed.
 - Resuming a job never runs a step whose completion is recorded, and never runs one whose outcome is unknown (anything that started and did not end `completed` or `failed` with an error the tool reported). It is not exactly-once. Every task created for a job is recorded with the attempt and position that created it in an insert-only ledger (`job_steps`). When a later attempt asks for a position whose earlier task completed, and the request, current policy and the stored result all still check out, the Core answers with the stored result and records `step_replayed`. Otherwise the job fails.
+- Conversations live in their own SQLite file (`chat_database`), not in the audit database, because a person must be able to delete what they said and the audit log is append-only. It is opened with `secure_delete` on; deleting a conversation, or all of them, removes the rows and truncates the write-ahead log. Retention (`retention_days`) deletes conversations not updated for that long. A reply found unfinished at start-up becomes `interrupted`. The worker's isolation lists the file and the persona as protected paths, so no grant may contain them.
 - A lock file next to the database stops a second Core from opening it. On Unix the Core also refuses to start if another Core answers on its socket.
 - `recursive_triggers` is on, so `INSERT OR REPLACE` fires the delete triggers and cannot rewrite protected rows.
 - Migrations are embedded SQL files applied in order and recorded in `schema_migrations`. A database from a newer Core is refused.
@@ -145,7 +170,7 @@ The Core runs on Tokio. A session handles one request at a time: a worker can ne
 ## Observability
 
 - Structured logs on stderr through `tracing`, as text or JSON (`--log-format json`), filtered with `JARVIS_LOG`.
-- The audit log is typed: every row deserialises back into `AuditEventKind`. Besides the task pipeline it records jobs, approvals (`approval_requested`, `_granted`, `_denied`, `_expired`, `_consumed`), the worker's life (`worker_spawned`, `_exited`, `_killed`, `_restart_scheduled`, `_restart_abandoned`), the governor (`governor_hold`, `governor_released`, `governor_hold_overdue`), refused RPC clients and the Core's start and stop.
+- The audit log is typed: every row deserialises back into `AuditEventKind`. Besides the task pipeline it records jobs, approvals (`approval_requested`, `_granted`, `_denied`, `_expired`, `_consumed`), the worker's life (`worker_spawned`, `_exited`, `_killed`, `_restart_scheduled`, `_restart_abandoned`), the governor (`governor_hold`, `governor_released`, `governor_hold_overdue`), refused RPC clients, the model server (`inference_loaded` with the profile, model SHA-256, context size, GPU layers and load time; `inference_stopped` with the reason) and the Core's start and stop. Conversation text is never recorded in the audit log.
 - `jarvis-core health` reports the worker's state, pid, restarts and containment, the governor (off, open, held with its reason, or releasing, how long, and whether the hold is overdue), queued jobs and pending approvals.
 
 ## Testing strategy
@@ -161,11 +186,15 @@ The Core runs on Tokio. A session handles one request at a time: a worker can ne
 | Processes | The real binary as a daemon with the real Python worker and a hostile worker: CLI approvals, restarts, crashes, signals, recovery, the RPC interface | `crates/jarvis-core/tests/process.rs` |
 | Gaming governor | The state machine as a pure function; the loop against a scripted source on a paused clock (exact release time, one alert, errors, failing audit writes); the gate in a real session (held jobs are not claimed, no attempt, no timer, wake on release, start-up); the real binary with a stand-in process started and killed | `crates/jarvis-core/src/governor/machine.rs`, `tests/governor.rs`, `tests/process.rs` |
 | Process detection | The production function finds the test binary's own name, a stand-in copied to a unique name while it runs and not after it exits | `crates/jarvis-sandbox/tests/processes.rs` |
+| Local model | Prompt building and history fitting; the request gate for clipboard proposals (only the person's own words, outside quoted text, can ask for a copy) and the clipboard block parser; lenient but bounded decoding of the server's responses (chunked bodies, malformed chunks); the server's command line (loopback, key, switched-off features, no `LLAMA_*` in the environment); the conversation store (turns, history, regeneration, search, deletion with a check that deleted text is gone from the files, retention, unfinished replies); chat types and their fixtures | `crates/jarvis-core/src/inference`, `crates/jarvis-protocol/src/chat.rs`, `tests/protocol` |
 | Worker | Protocol client, job loop, planner, contract fixtures, a guard that the package performs no privileged operations | `services/intelligence-python/tests` |
+| Session Agent | Grants as pure functions (exact binding, single use, expiry, revocation, clock, bounds, concurrency); the agent loop; the full path in a real session with the real agent binary; fault injection after dispatch (exit, hang, wrong grant, garbage, refusal, no start, shutdown) and job quarantine; clipboard writes (full text shown, busy refused, faults and wrong lengths unknown) and a write-only clipboard primitive tested in its own window station; the helper inherits no stray handle or descriptor and its pipes accept no other client | `crates/jarvis-core/src/session_agent.rs`, `src/session_agent/serve.rs`, `tests/session.rs`, `crates/jarvis-sandbox/tests/contain.rs`, `crates/jarvis-sandbox/tests/clipboard.rs` |
 
 ## Not built yet
 
-- Dashboard and any client other than the CLI.
-- Model-backed planning, speech, retrieval and memory.
-- Network access for a model, which will be a capability the Core brokers; the worker itself stays without network.
-- More than one worker, and tools beyond the three above.
+- Model-backed planning. The local model converses, but it does not plan jobs, call tools or choose actions; the worker's planner is still deterministic.
+- Speech, retrieval and memory. Nothing is remembered between conversations.
+- A model in the worker. The worker has no model and no network; the model is brokered by the Core.
+- More than one worker.
+- Remote access to the model or the desktop client.
+- Desktop operations other than writing the clipboard. Screen capture, clipboard reading and typing are typed, describable and always denied (ADR 0020 records why typing stays closed).
