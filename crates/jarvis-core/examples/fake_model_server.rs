@@ -11,6 +11,7 @@
 //! - `SCENARIO:huge` streams more text than a reply may hold.
 //! - `SCENARIO:die` exits in the middle of the reply.
 //! - `SCENARIO:cut` closes the connection cleanly before the end marker.
+//! - `SCENARIO:length` stops at the token limit (`finish_reason: "length"`).
 //! - anything else streams a short greeting.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -136,6 +137,17 @@ fn serve(stream: TcpStream, key: &str) {
         }
         "cut" => {
             token(&mut stream, "half");
+            return;
+        }
+        "length" => {
+            token(&mut stream, "partial");
+            let _ = stream.write_all(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}
+
+data: [DONE]
+
+",
+            );
             return;
         }
         "die" => {

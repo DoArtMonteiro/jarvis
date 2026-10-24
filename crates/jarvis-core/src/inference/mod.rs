@@ -749,7 +749,7 @@ impl Inference {
             .await
             .map_err(|e| Some(e.to_string()))?;
         let mut first_token = None;
-        let mut finished = false;
+        let (mut finished, mut truncated) = (false, false);
         let (mut prompt_tokens, mut completion_tokens, mut speed) = (0u32, 0u32, 0f64);
         while let Some(line) = response
             .next_line()
@@ -761,6 +761,7 @@ impl Inference {
             };
             let event = event.map_err(Some)?;
             finished |= event.finished;
+            truncated |= event.truncated;
             // Model text may hold terminal escapes or invisible characters;
             // neither reaches a client, the store or a person.
             let content = event.content.map(|c| jarvis_protocol::strip_hidden(&c));
@@ -786,6 +787,11 @@ impl Inference {
             prompt_tokens = event.prompt_tokens.unwrap_or(prompt_tokens);
             completion_tokens = event.completion_tokens.unwrap_or(completion_tokens);
             speed = event.tokens_per_second.unwrap_or(speed);
+        }
+        if truncated {
+            return Err(Some(
+                "the reply reached the length limit and was cut short".into(),
+            ));
         }
         // A server that dies can close the connection cleanly (it does on
         // Linux); without its end marker the reply is cut, not complete.

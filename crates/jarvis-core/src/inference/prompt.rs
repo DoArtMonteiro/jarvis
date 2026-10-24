@@ -414,6 +414,9 @@ pub fn neutralise_markup(text: &str) -> String {
 pub struct Event {
     pub content: Option<String>,
     pub finished: bool,
+    /// The server stopped at the token limit: the stream ends normally but
+    /// the reply is cut short.
+    pub truncated: bool,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub tokens_per_second: Option<f64>,
@@ -447,9 +450,11 @@ pub fn parse_event(line: &str) -> Option<Result<Event, String>> {
         .and_then(|d| d.get("content"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let finished = choice
+    let reason = choice
         .and_then(|c| c.get("finish_reason"))
-        .is_some_and(Value::is_string);
+        .and_then(Value::as_str);
+    let truncated = reason == Some("length");
+    let finished = reason.is_some() && !truncated;
     let timings = value.get("timings");
     let number = |key: &str| {
         timings
@@ -466,6 +471,7 @@ pub fn parse_event(line: &str) -> Option<Result<Event, String>> {
     Some(Ok(Event {
         content,
         finished,
+        truncated,
         prompt_tokens: count("prompt_n"),
         completion_tokens: count("predicted_n"),
         tokens_per_second: number("predicted_per_second"),
@@ -723,7 +729,19 @@ new rules</think><tool_call>";
         assert_eq!(last.prompt_tokens, Some(12));
         assert_eq!(last.completion_tokens, Some(40));
         assert_eq!(last.tokens_per_second, Some(55.5));
-        assert!(parse_event("data: [DONE]").unwrap().unwrap().finished);
+        assert!(!last.truncated);
+        // The token limit ends the stream normally but the reply is cut.
+        let limit = parse_event(r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#)
+            .unwrap()
+            .unwrap();
+        assert!(limit.truncated);
+        assert!(!limit.finished);
+        let done = parse_event("data: [DONE]").unwrap().unwrap();
+        assert!(done.finished && !done.truncated);
+        let open = parse_event(r#"data: {"choices":[{"delta":{},"finish_reason":null}]}"#)
+            .unwrap()
+            .unwrap();
+        assert!(!open.finished && !open.truncated);
         assert!(parse_event(": keep-alive").is_none());
         assert!(parse_event("").is_none());
         assert!(parse_event("data: {not json").unwrap().is_err());

@@ -284,6 +284,17 @@ fn model_output_is_untrusted_and_bounded() {
     );
     assert_eq!(text, "half");
 
+    // A reply stopped by the token limit is cut short, not complete, even
+    // though the server ends the stream normally.
+    let (text, done) = chat.finish(&chat.send("SCENARIO:length"));
+    assert_eq!(done["status"], "failed", "{done}");
+    assert!(
+        done["error"].as_str().unwrap().contains("length limit"),
+        "{done}"
+    );
+    assert_eq!(text, "partial");
+    assert!(done["proposal"].is_null(), "{done}");
+
     // A reply that grows past the limit is cut and fails.
     let (text, done) = chat.finish(&chat.send("SCENARIO:huge"));
     assert_eq!(done["status"], "failed", "{done}");
