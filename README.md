@@ -2,7 +2,7 @@
 
 A local-first agent runtime with a Rust execution core, typed capabilities and Python intelligence workers.
 
-**Status:** Phase 3. A long-lived Rust Core supervises a Python worker that the operating system isolates (an AppContainer on Windows, Landlock and seccomp on Linux), executes typed tools under a capability policy, asks a person before any action with side effects, and records every decision in SQLite. Local clients use a small typed RPC interface. Tested on Linux and Windows. A local language model can converse through the Core, with no tools and no authority, and a desktop app is an RPC client for it (ADR 0021). There is no model-backed planning, voice or personal integration yet.
+**Status:** M6 desktop and local-inference milestone merged; M7 daily-driver reliability and privacy remains a draft PR awaiting supervised owner acceptance. A long-lived Rust Core supervises an OS-isolated Python worker (Windows AppContainer; Linux Landlock/seccomp), enforces typed capabilities and human approvals, and records decisions in SQLite. The Tauri desktop client communicates through typed RPC. Local language-model conversation runs through the Core without direct tool authority (ADR 0021). Model-backed planning, voice and personal integrations are not yet delivered.
 
 ## Why it exists
 
