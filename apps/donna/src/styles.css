@@ -136,6 +136,9 @@ kbd {
 .app {
   display: grid;
   grid-template-columns: 300px minmax(0, 1fr);
+  /* One row bounded by the window: an auto row grows with a long conversation,
+     and body clips it, so the message list would never scroll. */
+  grid-template-rows: minmax(0, 1fr);
   height: 100%;
 }
 .app[data-sidebar="false"] {
@@ -568,6 +571,9 @@ input[type="search"]::-webkit-search-cancel-button {
   min-height: 0;
   overflow-y: auto;
   padding: 28px 24px 12px;
+}
+.messages:focus-visible {
+  outline-offset: -2px;
 }
 .thread {
   list-style: none;
