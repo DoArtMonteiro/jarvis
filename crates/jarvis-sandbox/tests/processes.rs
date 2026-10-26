@@ -1,8 +1,8 @@
 //! Process detection against the real OS: no fake process list, no game.
 //!
-//! The exit test copies a small system binary to a unique name, runs the
-//! copy, and checks that the production function sees it while it runs and
-//! stops seeing it once it has exited.
+//! The exit test starts a small system binary under a unique name and
+//! checks that the production function sees it while it runs and stops
+//! seeing it once it has exited.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -29,17 +29,33 @@ fn exe_name(stem: &str) -> String {
     }
 }
 
-/// Copy a small system binary to `dir/<file_name>` and start it for 30 s.
+/// Start a small system binary for 30 s under the name `dir/<file_name>`.
+///
+/// Windows names the process after the executable file, so the binary is
+/// copied. Linux takes `comm` from the path passed to `execve`, so a symbolic
+/// link is enough there; a fresh copy would be open for writing while it is
+/// written, and a process another test forks in that moment inherits the
+/// descriptor until it calls `exec`, which makes running the copy fail with
+/// "text file busy".
 fn start_copy(dir: &Path, file_name: &str) -> (Child, PathBuf) {
     let target = dir.join(file_name);
-    let (source, args): (&str, &[&str]) = if cfg!(windows) {
-        (r"C:\Windows\System32\PING.EXE", &["-n", "30", "127.0.0.1"])
-    } else {
-        ("/bin/sleep", &["30"])
+    #[cfg(windows)]
+    let mut command = {
+        std::fs::copy(r"C:\Windows\System32\PING.EXE", &target).unwrap();
+        let mut command = Command::new(&target);
+        command.args(["-n", "30", "127.0.0.1"]);
+        command
     };
-    std::fs::copy(source, &target).unwrap();
-    let child = Command::new(&target)
-        .args(args)
+    #[cfg(unix)]
+    let mut command = {
+        use std::os::unix::process::CommandExt;
+        std::os::unix::fs::symlink("/bin/sleep", &target).unwrap();
+        let mut command = Command::new(&target);
+        // A multi-call build of the system tools picks the tool from argv[0].
+        command.arg0("sleep").arg("30");
+        command
+    };
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
