@@ -2715,7 +2715,10 @@ input[type="search"]::-webkit-search-cancel-button {
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+    /* No transitions at all: a near-zero duration would still transition
+       inherited properties such as visibility and leave a freshly shown
+       drawer unfocusable for a frame. */
+    transition: none !important;
     scroll-behavior: auto !important;
   }
   .screen,
@@ -2741,6 +2744,16 @@ input[type="search"]::-webkit-search-cancel-button {
     animation: none !important;
     width: 100%;
     opacity: 0.55;
+  }
+}
+
+/* The narrow history drawer cross-fades instead of sliding. */
+@media (prefers-reduced-motion: reduce) and (max-width: 1000px) {
+  .hist {
+    opacity: 0;
+  }
+  .chat-screen[data-history="true"] .hist {
+    opacity: 1;
   }
 }
 
