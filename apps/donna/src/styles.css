@@ -1777,9 +1777,13 @@ input[type="search"]::-webkit-search-cancel-button {
 }
 .chat-composer {
   flex: none;
-  padding: 12px var(--cx) 16px;
+  padding: 0 var(--cx) 16px;
+}
+/* The rule sits on the composer itself, so it always spans the text column. */
+.chat-composer > .composer {
+  padding-top: 12px;
   background: linear-gradient(90deg, rgba(184, 149, 90, 0.7), rgba(184, 149, 90, 0.12) 70%, rgba(184, 149, 90, 0))
-    var(--cx) top / calc(100% - 2 * var(--cx)) 1px no-repeat;
+    left top / 100% 1px no-repeat;
 }
 
 /* clipboard proposal, a slip on the page */

@@ -181,12 +181,20 @@ function Machine() {
   const health = s.health;
   const model = inferenceMeta(inference);
   const governor = governorMeta(health?.governor);
-  const stats = inference?.last_stats ?? null;
-  const warmup = inference?.warmup_tokens_per_second_x10 ?? null;
+  // A speed is only current while a model is loaded.
+  const loaded = inference?.state === "ready" || inference?.state === "generating";
+  const stats = loaded ? (inference?.last_stats ?? null) : null;
+  const warmup = loaded ? (inference?.warmup_tokens_per_second_x10 ?? null) : null;
   const unknown = t("unknownValue");
   // The figure says which measurement it is: the last reply, or the warm-up on load.
   const speed = stats ? stats.tokens_per_second_x10 : warmup;
-  const speedLabel = stats ? t("speedLastReply") : warmup !== null ? t("speedOnLoad") : t("speedNone");
+  const speedLabel = !loaded
+    ? t("speedUnloaded")
+    : stats
+      ? t("speedLastReply")
+      : warmup !== null
+        ? t("speedOnLoad")
+        : t("speedNone");
   return (
     <section class="deskpad" aria-labelledby="home-machine">
       <div class="pad-head">
