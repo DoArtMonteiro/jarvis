@@ -8,7 +8,9 @@ import { ScreenHead, StatusTag, ToneIcon, useNow } from "../ui";
 export function Approvals() {
   const s = useStore();
   const now = useNow();
-  const pending = s.approvals.length;
+  // Pending requests are only listed while the Core can confirm them.
+  const offline = s.core !== "ok";
+  const pending = offline ? 0 : s.approvals.length;
   // The decided request has left the list; its result stays in its place.
   const selected =
     s.approvals.find((item) => item.view.approval_id === s.selectedApproval) ??
@@ -49,7 +51,9 @@ export function Approvals() {
       )}
       <div class="appr-page">
         <ScreenHead eyebrow={t("navApprovals")} title={t("approvalsHeading")} lede={t("approvalsLede")} />
-        {pending === 0 ? (
+        {offline ? (
+          <p class="appr-empty t2">{t("approvalsOffline")}</p>
+        ) : pending === 0 ? (
           // Nothing pending: one message, and the last decision if one was just made.
           <div class="appr-empty">
             {s.decision && <Result decision={s.decision} />}

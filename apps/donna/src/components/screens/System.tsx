@@ -164,7 +164,7 @@ function GovernorFacts() {
 
 function Privacy() {
   const s = useStore();
-  const days = s.inference?.retention_days;
+  const days = s.core === "ok" ? s.inference?.retention_days : undefined;
   return (
     <Section id="sys-privacy" class="deskpad" title={t("privacySection")}>
       <p class="privacy-line">
