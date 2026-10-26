@@ -20,6 +20,7 @@ export function Chat() {
   const s = useStore();
   const listRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+  const shownUserMessage = useRef<string | null>(null);
 
   const streaming = s.streaming;
   const stored = streaming ? s.messages.filter((m) => m.message_id !== streaming.turnId) : s.messages;
@@ -31,8 +32,12 @@ export function Chat() {
 
   useLayoutEffect(() => {
     const list = listRef.current;
-    // A message the person has just sent is always brought into view.
-    if (lastMessage?.role === "user") stick.current = true;
+    // A message the person has just sent is brought into view once; while the
+    // reply streams below it, scrolling up is left alone.
+    if (lastMessage?.role === "user" && lastMessage.message_id !== shownUserMessage.current) {
+      shownUserMessage.current = lastMessage.message_id;
+      stick.current = true;
+    }
     if (list && stick.current) list.scrollTop = list.scrollHeight;
   }, [s.messages, streaming?.text, s.activeId]);
 
@@ -50,6 +55,8 @@ export function Chat() {
       <div
         class="messages"
         ref={listRef}
+        // Focusable so the arrow, Page and Home/End keys scroll the conversation.
+        tabIndex={0}
         onScroll={(event) => {
           const el = event.currentTarget;
           stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
