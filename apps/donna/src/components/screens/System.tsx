@@ -35,15 +35,12 @@ export function System() {
   return (
     <div class="screen-wrap">
       <ScreenHead eyebrow={t("navSystem")} title={t("systemTitle")} lede={t("systemLede")} />
-      <div class="two even">
-        <div class="col">
-          <CoreFacts />
-          <GovernorFacts />
-          <Privacy />
-        </div>
-        <div class="col">
-          <ModelFacts />
-        </div>
+      {/* Machine facts on dark desk pads; settings on the paper below. */}
+      <div class="fichas">
+        <CoreFacts />
+        <ModelFacts />
+        <GovernorFacts />
+        <Privacy />
       </div>
       <Settings />
     </div>
@@ -52,13 +49,14 @@ export function System() {
 
 function CoreFacts() {
   const s = useStore();
-  const health = s.health;
+  // Values the Core cannot confirm right now are not shown as current.
+  const health = s.core === "ok" ? s.health : null;
   const unknown = t("unknownValue");
   return (
-    <Section id="sys-core" class="first" title={t("coreSection")}>
+    <Section id="sys-core" class="deskpad" title={t("coreSection")}>
       <dl class="kvs">
-        <KV label={t("kvState")} tone={s.core === "ok" ? "ok" : "danger"} mono={false}>
-          {s.core === "ok" ? t("coreOk") : t("coreLost")}
+        <KV label={t("kvState")} tone={s.core === "ok" ? "ok" : "danger"}>
+          {s.core === "ok" ? t("coreActive") : t("coreLost")}
         </KV>
         <KV label={t("kvVersion")}>{health?.core_version ?? unknown}</KV>
         <KV label={t("kvProtocol")}>{health ? String(health.rpc_protocol) : unknown}</KV>
@@ -72,24 +70,26 @@ function CoreFacts() {
 
 function ModelFacts() {
   const s = useStore();
-  const inference = s.inference;
+  const inference = s.core === "ok" ? s.inference : null;
   const meta = inferenceMeta(inference);
   const unknown = t("unknownValue");
   const stats = inference?.last_stats ?? null;
   return (
-    <Section id="sys-model" class="first" title={t("modelSection")}>
+    <Section id="sys-model" class="deskpad" title={t("modelSection")}>
       {!inference ? (
         <p class="empty-line">{s.inferenceError ?? t("stateUnknown")}</p>
       ) : (
         <>
           <dl class="kvs">
-            <KV label={t("kvState")} tone={meta.tone} mono={false}>
+            <KV label={t("kvState")} tone={meta.tone}>
               {t(meta.key)}
             </KV>
-            <KV label={t("modelProfile")} mono={false}>
+            <KV label={t("modelProfile")}>
               {inference.profile === "primary" ? t("profilePrimary") : t("profileFallback")}
             </KV>
-            <KV label={t("modelName")}>{inference.model}</KV>
+            <KV label={t("modelName")} wide>
+              {inference.model}
+            </KV>
             <KV label={t("contextHeading")}>
               {t("contextTokens", { n: formatNumber(inference.context_size, s.lang) })}
             </KV>
@@ -116,7 +116,7 @@ function ModelFacts() {
                 ? t("tokensPerSecond", { n: formatTps(inference.warmup_tokens_per_second_x10, s.lang) })
                 : unknown}
             </KV>
-            <KV label={t("kvSlow")} tone={inference.slow ? "warn" : undefined} mono={false}>
+            <KV label={t("kvSlow")} tone={inference.slow ? "warn" : undefined}>
               {inference.slow ? t("slowYes") : t("no")}
             </KV>
             <div class="kv kv-wide">
@@ -134,18 +134,18 @@ function ModelFacts() {
 function GovernorFacts() {
   const s = useStore();
   const now = useNow();
-  const governor = s.health?.governor ?? null;
+  const governor = s.core === "ok" ? (s.health?.governor ?? null) : null;
   const meta = governorMeta(governor);
   const unknown = t("unknownValue");
   const reasons = { game: "reasonGame", starting: "reasonStarting", detection_failed: "reasonDetection" } as const;
   const held = governor?.held_ms !== null && governor?.held_ms !== undefined;
   return (
-    <Section id="sys-governor" title={t("governorSection")}>
+    <Section id="sys-governor" class="deskpad" title={t("governorSection")}>
       <dl class="kvs">
-        <KV label={t("kvState")} tone={meta.tone} mono={false}>
+        <KV label={t("kvState")} tone={meta.tone}>
           {t(meta.key)}
         </KV>
-        <KV label={t("kvReason")} mono={false}>
+        <KV label={t("kvReason")}>
           {governor?.reason ? t(reasons[governor.reason]) : unknown}
         </KV>
         {governor?.process && <KV label={t("kvProcess")}>{governor.process}</KV>}
@@ -154,7 +154,7 @@ function GovernorFacts() {
             ? formatDuration(governor.held_ms + Math.max(0, now - s.healthAt))
             : unknown}
         </KV>
-        <KV label={t("kvOverdue")} tone={governor?.overdue ? "warn" : undefined} mono={false}>
+        <KV label={t("kvOverdue")} tone={governor?.overdue ? "warn" : undefined}>
           {governor ? (governor.overdue ? t("yes") : t("no")) : unknown}
         </KV>
       </dl>
@@ -166,13 +166,13 @@ function Privacy() {
   const s = useStore();
   const days = s.inference?.retention_days;
   return (
-    <Section id="sys-privacy" title={t("privacySection")}>
+    <Section id="sys-privacy" class="deskpad" title={t("privacySection")}>
       <p class="privacy-line">
         <LockIcon />
         <span>{t("privacyLocal")}</span>
       </p>
       <dl class="kvs">
-        <KV label={t("retentionHeading")} mono={false}>
+        <KV label={t("retentionHeading")}>
           {days === undefined
             ? t("unknownValue")
             : days === 0

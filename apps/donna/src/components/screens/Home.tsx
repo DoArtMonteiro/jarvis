@@ -28,21 +28,28 @@ import { JobList } from "./Work";
 import { KV, ScreenHead, Section, StatusTag, useNow } from "../ui";
 
 const EXCERPT_CHARS = 90;
+/** Home shows at most this many requests; the rest wait on Approvals. */
+const SLIPS = 2;
 
 export function Home() {
   const s = useStore();
   useJobsPolling();
   const now = useNow();
   const date = new Date(now);
-  const pending = s.approvals.length;
+  // Requests are only shown while the Core can confirm they are still pending.
+  const approvals = s.core === "ok" ? s.approvals : [];
+  const pending = approvals.length;
   const paused = s.inference?.state === "paused_for_game";
-  const lede = paused
-    ? t("homeLedeGame")
-    : pending === 0
-      ? t("homeLedeNone")
-      : pending === 1
-        ? t("homeLedeOne")
-        : t("homeLedeMany", { n: pending });
+  const lede =
+    s.core !== "ok"
+      ? t("homeLedeOffline")
+      : paused
+        ? t("homeLedeGame")
+        : pending === 0
+          ? t("homeLedeNone")
+          : pending === 1
+            ? t("homeLedeOne")
+            : t("homeLedeMany", { n: pending });
   const eyebrow = new Intl.DateTimeFormat(s.lang === "pt" ? "pt-PT" : "en-GB", {
     weekday: "long",
     day: "numeric",
@@ -57,46 +64,29 @@ export function Home() {
       <ScreenHead eyebrow={eyebrow} title={t(greetingKey(date.getHours()))} lede={lede} />
       <div class="two">
         <div class="col">
-          <div class="sec first">
-            <Composer
-              id="home-composer"
-              variant="home"
-              title={t("homeComposerTitle")}
-              value={s.homeDraft}
-              onChange={(homeDraft) => setState({ homeDraft })}
-              onSend={startConversation}
-              label={t("composerLabel")}
-              placeholder={t("homeComposerPlaceholder")}
-              hint={t("homeComposerHint")}
-            />
-          </div>
-          <Section id="home-decisions" title={t("decisionTitle")} count={pending} aside={pending > 0 ? t("decisionHint") : undefined}>
-            {pending === 0 ? (
-              <p class="empty-line">{t("decisionEmpty")}</p>
-            ) : (
-              <ul class="list">
-                {s.approvals.map((item) => (
-                  <li key={item.view.approval_id}>
-                    <DecisionRow item={item} now={now} />
-                  </li>
-                ))}
-              </ul>
-            )}
-          </Section>
-          <Section
-            id="home-jobs"
-            title={t("recentJobsTitle")}
-            aside={
-              <button type="button" class="link" onClick={() => goTo("work")}>
-                {t("seeWork")}
-              </button>
-            }
-          >
-            <JobList limit={5} />
-          </Section>
-        </div>
-        <div class="col">
-          <Machine />
+          {pending > 0 && (
+            <div class="slips">
+              {approvals.slice(0, SLIPS).map((item) => (
+                <DecisionSlip key={item.view.approval_id} item={item} now={now} />
+              ))}
+              {pending > SLIPS && (
+                <button type="button" class="link" onClick={() => goTo("approvals")}>
+                  {t("moreDecisions", { n: pending - SLIPS })}
+                </button>
+              )}
+            </div>
+          )}
+          <Composer
+            id="home-composer"
+            variant="home"
+            title={t("homeComposerTitle")}
+            value={s.homeDraft}
+            onChange={(homeDraft) => setState({ homeDraft })}
+            onSend={startConversation}
+            label={t("composerLabel")}
+            placeholder={t("homeComposerPlaceholder")}
+            hint={t("homeComposerHint")}
+          />
           <Section
             id="home-convs"
             title={t("recentConvsTitle")}
@@ -125,94 +115,134 @@ export function Home() {
             )}
           </Section>
         </div>
+        <div class="col">
+          <Machine />
+          <Section
+            id="home-jobs"
+            title={t("recentJobsTitle")}
+            aside={
+              <button type="button" class="link" onClick={() => goTo("work")}>
+                {t("seeWork")}
+              </button>
+            }
+          >
+            <JobList limit={4} />
+          </Section>
+        </div>
       </div>
     </div>
   );
 }
 
-/** A compact, visibly truncated preview. Deciding happens only on the full view. */
-function DecisionRow({ item, now }: { item: PendingApproval; now: number }) {
+/** A compact, visibly truncated preview on a paper slip. Deciding happens only on the full view. */
+function DecisionSlip({ item, now }: { item: PendingApproval; now: number }) {
   const s = useStore();
   const { view, deadline } = item;
   const consequence = consequenceKey(view.tool, s.lang);
   const preview = excerpt(approvalExcerptSource(view.arguments), EXCERPT_CHARS);
   const left = deadline - now;
+  const titleId = `slip-${view.approval_id}`;
   return (
-    <div class="row">
-      <div class="row-main">
-        <p class="rowt serif">{toolLabel(s.lang, view.tool)}</p>
-        {consequence && <p class="rowm">{t(consequence)}</p>}
-        {preview.text && (
-          <p class="rowm excerpt">
-            <span class="lbl">{t("excerptLabel")}</span> <span class="mono">{preview.text}</span>
-          </p>
-        )}
-        <p class="rowm t3">{t("requestedAt", { time: formatClock(view.requested_at, s.lang, true) })}</p>
+    <article class="slip" aria-labelledby={titleId}>
+      <div class="slip-head">
+        <span class="cap">{t("decisionTitle")}</span>
+        <span class="hint">{t("decisionHint")}</span>
       </div>
-      <div class="right">
-        <StatusTag tone={left <= 0 ? "mute" : left < 30_000 ? "warn" : "pending"}>
-          {left <= 0 ? t("expired") : t("expiresIn", { time: formatDuration(left) })}
-        </StatusTag>
+      <h2 class="slip-t" id={titleId}>
+        {toolLabel(s.lang, view.tool)}
+      </h2>
+      {consequence && <p class="slip-cons">{t(consequence)}</p>}
+      {preview.text && (
+        <p class="excerpt">
+          <span class="sr-only">{t("excerptLabel")}: </span>
+          <span class="mono">{preview.text}</span>
+        </p>
+      )}
+      <div class="slip-foot">
+        <div class="slip-meta">
+          <StatusTag tone={left <= 0 ? "mute" : left < 30_000 ? "warn" : "pending"}>
+            {left <= 0 ? t("expired") : t("expiresIn", { time: formatDuration(left) })}
+          </StatusTag>
+          <span class="tn">{t("requestedAt", { time: formatClock(view.requested_at, s.lang, true) })}</span>
+        </div>
         <button type="button" class="btn" onClick={() => openApproval(view.approval_id)}>
           {t("viewAndDecide")}
         </button>
       </div>
-    </div>
+    </article>
   );
 }
 
+/** Machine facts on the dark desk pad, apart from the reading surface. */
 function Machine() {
   const s = useStore();
+  const offline = s.core !== "ok";
   const inference = s.inference;
   const health = s.health;
   const model = inferenceMeta(inference);
   const governor = governorMeta(health?.governor);
   const stats = inference?.last_stats ?? null;
+  const warmup = inference?.warmup_tokens_per_second_x10 ?? null;
   const unknown = t("unknownValue");
+  // The figure says which measurement it is: the last reply, or the warm-up on load.
+  const speed = stats ? stats.tokens_per_second_x10 : warmup;
+  const speedLabel = stats ? t("speedLastReply") : warmup !== null ? t("speedOnLoad") : t("speedNone");
   return (
-    <Section
-      id="home-machine"
-      class="first"
-      title={t("machineTitle")}
-      aside={
+    <section class="deskpad" aria-labelledby="home-machine">
+      <div class="pad-head">
+        <h2 class="pad-t" id="home-machine">
+          {t("machineTitle")}
+        </h2>
         <button type="button" class="link" onClick={() => goTo("system")}>
           {t("seeSystem")}
         </button>
-      }
-    >
-      <dl class="kvs">
-        <KV label={t("modelName")}>{inference?.model ?? unknown}</KV>
-        <KV label={t("kvState")} tone={model.tone} mono={false}>
-          {t(model.key)}
-        </KV>
-        <KV label={t("modelProfile")} mono={false}>
-          {inference
-            ? `${inference.gpu_layers > 0 ? "GPU" : "CPU"} · ${
-                inference.profile === "primary" ? t("profilePrimary") : t("profileFallback")
-              }`
-            : unknown}
-        </KV>
-        <KV label={t("kvLastReply")}>
-          {stats
-            ? t("statsLine", { tps: formatTps(stats.tokens_per_second_x10, s.lang), ms: stats.first_token_ms })
-            : unknown}
-        </KV>
-        <KV label={t("contextHeading")}>
-          {inference ? t("contextTokens", { n: formatNumber(inference.context_size, s.lang) }) : unknown}
-        </KV>
-        <KV label={t("kvGovernor")} tone={governor.tone} mono={false}>
-          {t(governor.key)}
-          {health?.governor.process ? ` · ${health.governor.process}` : ""}
-        </KV>
-        <KV label={t("kvQueued")}>{health ? formatNumber(health.queued_jobs, s.lang) : unknown}</KV>
-        <KV label="Core" tone={s.core === "ok" ? "ok" : "danger"}>
-          {s.core !== "ok"
-            ? t("coreLost")
-            : health
-              ? `${t("coreOk")} · ${health.core_version} · ${formatDuration(health.uptime_ms)}`
-              : t("coreOk")}
-        </KV>
-      </dl>
-    </Section>
+      </div>
+      {offline ? (
+        <p class="pad-note">{t("machineOffline")}</p>
+      ) : (
+        <>
+          <div class="figures">
+            <p class="figure">
+              <span class="fl">{speedLabel}</span>
+              <span class="fv">
+                {speed !== null ? formatTps(speed, s.lang) : unknown}
+                {speed !== null && <span class="fu"> tok/s</span>}
+              </span>
+            </p>
+            <p class="figure">
+              <span class="fl">{t("contextShort")}</span>
+              <span class="fv">
+                {inference ? formatNumber(inference.context_size, s.lang) : unknown}
+                {inference && <span class="fu"> tokens</span>}
+              </span>
+            </p>
+          </div>
+          <dl class="kvs">
+            <KV label={t("modelName")} wide>
+              {inference?.model ?? unknown}
+            </KV>
+            <KV label={t("kvState")} tone={model.tone}>
+              {t(model.key)}
+            </KV>
+            <KV label={t("modelProfile")}>
+              {inference
+                ? `${inference.gpu_layers > 0 ? "GPU" : "CPU"} · ${
+                    inference.profile === "primary" ? t("profilePrimary") : t("profileFallback")
+                  }`
+                : unknown}
+            </KV>
+            <KV label={t("kvGovernor")} tone={governor.tone}>
+              {t(governor.key)}
+              {health?.governor.process ? ` · ${health.governor.process}` : ""}
+            </KV>
+            <KV label={t("kvQueued")}>{health ? formatNumber(health.queued_jobs, s.lang) : unknown}</KV>
+            <KV label="Core" tone="ok" wide>
+              {health ? `${health.core_version} · ${t("coreActive")} · ${formatDuration(health.uptime_ms)}` : t("coreActive")}
+            </KV>
+          </dl>
+        </>
+      )}
+      <p class="pad-foot">{t("padFoot")}</p>
+    </section>
   );
 }

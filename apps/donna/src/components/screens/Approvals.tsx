@@ -15,56 +15,55 @@ export function Approvals() {
     (s.decision ? undefined : s.approvals[0]);
 
   return (
-    <div class="screen-wrap">
-      <ScreenHead eyebrow={t("navApprovals")} title={t("approvalsHeading")} lede={t("approvalsLede")} />
-      {pending === 0 ? (
-        // Nothing pending: one message, and the last decision if one was just made.
-        <div class="appr-empty">
-          {s.decision && <Result decision={s.decision} />}
-          <p class="dt">{t("approvalsEmptyTitle")}</p>
-          <p class="t2">{t("approvalsEmptyHint")}</p>
-        </div>
-      ) : (
-        <div class="appr">
-          <div class="alist">
-            <p class="intro" role="status">
-              {pending === 1 ? t("approvalsCountOne") : t("approvalsCountMany", { n: pending })}
-            </p>
-            <ul aria-label={t("approvalsListLabel")}>
-              {s.approvals.map((item) => {
-                const left = item.deadline - now;
-                return (
-                  <li key={item.view.approval_id}>
-                    <button
-                      type="button"
-                      class="aitem"
-                      aria-current={item === selected ? "true" : undefined}
-                      onClick={() => selectApproval(item.view.approval_id)}
-                    >
-                      <span class="ait">{toolLabel(s.lang, item.view.tool)}</span>
-                      <span class="aim">
-                        <StatusTag tone={left <= 0 ? "mute" : "pending"}>
-                          {left <= 0 ? t("expired") : t("pendingTag")}
-                        </StatusTag>
-                        {left > 0 && <span class="tn">{formatDuration(left)}</span>}
-                      </span>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
-          <div class="adetail">
-            {s.decision && !s.approvals.some((item) => item.view.approval_id === s.decision?.approvalId) ? (
-              <Result decision={s.decision} />
-            ) : selected ? (
-              <Detail key={selected.view.approval_id} item={selected} now={now} />
-            ) : (
-              <p class="t2">{t("approvalsSelect")}</p>
-            )}
-          </div>
-        </div>
+    <div class="appr-screen" data-empty={pending === 0}>
+      {pending > 0 && (
+        // The index of pending requests; the open one is the paper tab that joins the page.
+        <aside class="alist" aria-label={t("approvalsListLabel")}>
+          <p class="intro" role="status">
+            {pending === 1 ? t("approvalsCountOne") : t("approvalsCountMany", { n: pending })}
+          </p>
+          <ul>
+            {s.approvals.map((item) => {
+              const left = item.deadline - now;
+              return (
+                <li key={item.view.approval_id}>
+                  <button
+                    type="button"
+                    class="aitem"
+                    aria-current={item === selected ? "true" : undefined}
+                    onClick={() => selectApproval(item.view.approval_id)}
+                  >
+                    <span class="ait">{toolLabel(s.lang, item.view.tool)}</span>
+                    <span class="aim">
+                      <StatusTag tone={left <= 0 ? "mute" : "pending"}>
+                        {left <= 0 ? t("expired") : t("pendingTag")}
+                      </StatusTag>
+                      {left > 0 && <span class="tn">{formatDuration(left)}</span>}
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </aside>
       )}
+      <div class="appr-page">
+        <ScreenHead eyebrow={t("navApprovals")} title={t("approvalsHeading")} lede={t("approvalsLede")} />
+        {pending === 0 ? (
+          // Nothing pending: one message, and the last decision if one was just made.
+          <div class="appr-empty">
+            {s.decision && <Result decision={s.decision} />}
+            <p class="dt">{t("approvalsEmptyTitle")}</p>
+            <p class="t2">{t("approvalsEmptyHint")}</p>
+          </div>
+        ) : s.decision && !s.approvals.some((item) => item.view.approval_id === s.decision?.approvalId) ? (
+          <Result decision={s.decision} />
+        ) : selected ? (
+          <Detail key={selected.view.approval_id} item={selected} now={now} />
+        ) : (
+          <p class="t2">{t("approvalsSelect")}</p>
+        )}
+      </div>
     </div>
   );
 }
@@ -133,7 +132,7 @@ function Detail({ item, now }: { item: PendingApproval; now: number }) {
   };
 
   return (
-    <article class="detail paper" aria-labelledby="approval-title">
+    <article class="detail" aria-labelledby="approval-title">
       <header>
         <h2 class="dt" id="approval-title">
           {toolLabel(s.lang, view.tool)}

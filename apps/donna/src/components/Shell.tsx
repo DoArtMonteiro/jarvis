@@ -5,6 +5,7 @@ import type { ComponentChildren, JSX } from "preact";
 import type { StringKey } from "../lib/i18n";
 import {
   formatDuration,
+  formatNumber,
   formatTps,
   governorMeta,
   holdState,
@@ -84,48 +85,47 @@ function Cell({ label, children }: { label: string; children: ComponentChildren 
   );
 }
 
+/** The ledger line under the sheet: quiet, lowercase, labelled by position. */
 export function StatusStrip() {
   const s = useStore();
   const model = inferenceMeta(s.inference);
   const governor = governorMeta(s.health?.governor);
-  const stats = s.inference?.last_stats;
+  const ok = s.core === "ok";
+  // Nothing the Core cannot confirm right now is shown as a live value.
+  const inference = ok ? s.inference : null;
+  const stats = inference?.last_stats;
   // The last reply's speed when there is one; otherwise the load-time warm-up, labelled as such.
-  const warmup = s.inference?.warmup_tokens_per_second_x10 ?? null;
+  const warmup = inference?.warmup_tokens_per_second_x10 ?? null;
   const speed = stats
     ? t("tokensPerSecond", { n: formatTps(stats.tokens_per_second_x10, s.lang) })
     : warmup !== null
       ? t("speedWarmup", { n: formatTps(warmup, s.lang) })
-      : "—";
-  const ok = s.core === "ok";
+      : t("unknownValue");
   return (
-    <div class="strip" role="group" aria-label={t("stripLabel")}>
+    <div class="ledger" role="group" aria-label={t("stripLabel")}>
       <Cell label={t("stripModel")}>
-        <span class="v" data-tone={model.tone}>
-          <ToneIcon tone={model.tone} />
-          {t(model.key)}
+        <span class="v" data-tone={ok ? model.tone : "mute"}>
+          <ToneIcon tone={ok ? model.tone : "mute"} />
+          {ok ? t(model.key) : t("unknownValue")}
+          {inference && (
+            <span class="t3"> · {t("contextTokens", { n: formatNumber(inference.context_size, s.lang) })}</span>
+          )}
         </span>
       </Cell>
       <Cell label={t("stripSpeed")}>
-        <span class="v mono">{speed}</span>
+        <span class="v tn">{speed}</span>
       </Cell>
       <Cell label={t("stripGovernor")}>
-        <span class="v" data-tone={governor.tone}>
-          <ToneIcon tone={governor.tone} />
-          {t(governor.key)}
-          {s.health?.governor.process && <span class="mono"> · {s.health.governor.process}</span>}
+        <span class="v" data-tone={ok ? governor.tone : "mute"}>
+          <ToneIcon tone={ok ? governor.tone : "mute"} />
+          {ok ? t(governor.key) : t("unknownValue")}
+          {ok && s.health?.governor.process && <span> · {s.health.governor.process}</span>}
         </span>
       </Cell>
       <Cell label={t("stripCore")}>
         <span class="v" data-tone={ok ? "ok" : "danger"}>
           <ToneIcon tone={ok ? "ok" : "danger"} />
-          {ok ? (
-            <span class="mono">
-              {t("coreOk")}
-              {s.health && ` · ${s.health.core_version}`}
-            </span>
-          ) : (
-            t("coreLost")
-          )}
+          {ok ? (s.health ? `${s.health.core_version} · ${t("coreActive")}` : t("coreActive")) : t("coreLost")}
         </span>
       </Cell>
       <span class="local">

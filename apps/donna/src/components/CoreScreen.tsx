@@ -52,22 +52,30 @@ export function CoreScreen() {
           {title}
         </h1>
         <p>{body}</p>
-        {!busy && (
-          <button type="button" class="btn primary" onClick={() => void retryCore()}>
-            {t("retry")}
-          </button>
-        )}
+        {busy && <span class="loading-line" aria-hidden="true" />}
+        {/* The cause is shown in full, not folded away: it is what the person needs to act. */}
         {(detail || configPath) && (
-          <details class="details">
-            <summary>{t("technicalDetails")}</summary>
+          <div class="core-reason">
+            {detail && (
+              <>
+                <p class="field-label">{t("technicalDetails")}</p>
+                <p class="mono small">{detail}</p>
+              </>
+            )}
             {configPath && (
               <p class="small">
                 <span class="muted">{t("configPath")}: </span>
                 <span class="mono">{configPath}</span>
               </p>
             )}
-            {detail && <p class="mono small">{detail}</p>}
-          </details>
+          </div>
+        )}
+        {!busy && (
+          <div class="actions">
+            <button type="button" class="btn fill" onClick={() => void retryCore()}>
+              {t("retry")}
+            </button>
+          </div>
         )}
       </div>
     </section>

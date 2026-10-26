@@ -86,9 +86,9 @@ export function App() {
         {t("skipToContent")}
       </a>
       <Rail />
-      <div class="frame">
-        <StatusStrip />
-        <main id="main" tabIndex={-1}>
+      {/* The room: one sheet of paper on the desk, the ledger line under it. */}
+      <div class="room">
+        <main id="main" class="sheet" tabIndex={-1}>
           {showCoreScreen ? (
             <CoreScreen />
           ) : (
@@ -110,6 +110,7 @@ export function App() {
             </>
           )}
         </main>
+        <StatusStrip />
       </div>
       <div class="toasts" role="region" aria-label={t("notifications")}>
         {s.toasts.map((toast) => (

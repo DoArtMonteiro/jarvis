@@ -95,20 +95,23 @@ export function ScreenHead({
   );
 }
 
-/** Label and value in a hairline list. */
+/** A label over its value. Mono only where the exact characters matter. */
 export function KV({
   label,
   children,
   tone,
-  mono = true,
+  mono = false,
+  wide = false,
 }: {
   label: string;
   children: ComponentChildren;
   tone?: Tone;
   mono?: boolean;
+  /** Spans the whole row of a fact grid. */
+  wide?: boolean;
 }) {
   return (
-    <div class="kv">
+    <div class={wide ? "kv kv-wide" : "kv"}>
       <dt>{label}</dt>
       <dd class={mono ? "mono" : undefined} data-tone={tone}>
         {tone && <ToneIcon tone={tone} />}

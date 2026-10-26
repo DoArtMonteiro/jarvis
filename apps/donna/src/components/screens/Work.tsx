@@ -19,42 +19,53 @@ export function Work() {
   return (
     <div class="screen-wrap">
       <ScreenHead eyebrow={t("navWork")} title={t("workTitle")} lede={t("workLede")} />
-      <Section id="work-jobs" class="first" title={t("jobsTitle")} count={s.jobs?.length}>
-        <JobList limit={20} header />
-      </Section>
-      <Section id="work-caps" title={t("capsTitle")}>
-        <p class="sec-intro">{t("capsIntro")}</p>
-        <ul class="tbl caps">
-          {CAPABILITIES.map((cap) => {
-            const key = capabilityKey(cap.id, s.lang);
-            return (
-              <li key={cap.id} class="tr">
-                <span class="job-goal">
-                  <span class="ttl">{key ? t(key) : cap.id}</span>
-                  <span class="mono t3 small">{cap.id}</span>
-                </span>
-                <span class="cap-tags">
-                  <span class="tag" data-kind={cap.needsApproval ? "approval" : "none"}>
-                    {cap.needsApproval ? t("capNeedsApproval") : t("capNoEffects")}
-                  </span>
-                  {cap.notYet && <span class="tag" data-kind="soon">{t("capNotYet")}</span>}
-                </span>
-              </li>
-            );
-          })}
-        </ul>
-      </Section>
-      <Section id="work-soon" title={t("soonTitle")} class="soon-sec">
-        <p class="sec-intro">{t("soonIntro")}</p>
-        <ul class="soonlist">
-          {SOON.map((key) => (
-            <li key={key} class="soonit">
-              <span class="soont">{t(key)}</span>
-              <span class="soonl">{t("soonTag")}</span>
-            </li>
-          ))}
-        </ul>
-      </Section>
+      <div class="two">
+        <div class="col">
+          <Section id="work-jobs" title={t("jobsTitle")} count={s.jobs?.length}>
+            <JobList limit={20} header />
+          </Section>
+          <Section id="work-soon" title={t("soonTitle")} class="soon-sec">
+            <p class="sec-intro">{t("soonIntro")}</p>
+            <ul class="soonlist">
+              {SOON.map((key) => (
+                <li key={key} class="soonit">
+                  <span class="soont">{t(key)}</span>
+                  <span class="soonl">{t("soonTag")}</span>
+                </li>
+              ))}
+            </ul>
+          </Section>
+        </div>
+        <div class="col">
+          {/* What Donna may ask for sits on the desk pad, beside what she did. */}
+          <Section id="work-caps" class="deskpad" title={t("capsTitle")}>
+            <p class="sec-intro">{t("capsIntro")}</p>
+            <ul class="tbl caps">
+              {CAPABILITIES.map((cap) => {
+                const key = capabilityKey(cap.id, s.lang);
+                return (
+                  <li key={cap.id} class="tr">
+                    <span class="job-goal">
+                      <span class="ttl">{key ? t(key) : cap.id}</span>
+                      <span class="mono t3 small">{cap.id}</span>
+                    </span>
+                    <span class="cap-tags">
+                      <span class="tag" data-kind={cap.needsApproval ? "approval" : "none"}>
+                        {cap.needsApproval ? t("capNeedsApproval") : t("capNoEffects")}
+                      </span>
+                      {cap.notYet && (
+                        <span class="tag" data-kind="soon">
+                          {t("capNotYet")}
+                        </span>
+                      )}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          </Section>
+        </div>
+      </div>
     </div>
   );
 }
