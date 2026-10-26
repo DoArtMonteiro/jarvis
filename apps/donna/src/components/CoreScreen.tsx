@@ -2,6 +2,7 @@ import { useEffect, useState } from "preact/hooks";
 import { api } from "../lib/api";
 import { retryCore, t, useStore } from "../lib/store";
 import type { AppInfo } from "../lib/types";
+import { Monogram } from "./ui";
 
 /** Shown in place of the chat while the Core is not usable. */
 export function CoreScreen() {
@@ -46,13 +47,13 @@ export function CoreScreen() {
   return (
     <section class="core-screen" aria-live="polite">
       <div class="core-card">
-        <div class="core-mark" data-busy={busy} aria-hidden="true">
-          D
-        </div>
-        <h1 class="display">{title}</h1>
+        <Monogram busy={busy} />
+        <h1 class="h1" id="screen-title" tabIndex={-1}>
+          {title}
+        </h1>
         <p>{body}</p>
         {!busy && (
-          <button type="button" class="btn btn-primary" onClick={() => void retryCore()}>
+          <button type="button" class="btn primary" onClick={() => void retryCore()}>
             {t("retry")}
           </button>
         )}

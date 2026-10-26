@@ -77,3 +77,81 @@ export const ArrowLeftIcon = () => (
     <path d="M19 12H5M11 6l-6 6 6 6" />
   </Icon>
 );
+export const HomeIcon = () => (
+  <Icon>
+    <path d="M4 11l8-7 8 7v9a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1z" />
+  </Icon>
+);
+export const ChatIcon = () => (
+  <Icon>
+    <path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z" />
+  </Icon>
+);
+export const WorkIcon = () => (
+  <Icon>
+    <rect x="3" y="7" width="18" height="13" rx="1.5" />
+    <path d="M8 7V4.5h8V7M3 12h18" />
+  </Icon>
+);
+export const SystemIcon = () => (
+  <Icon>
+    <rect x="7" y="7" width="10" height="10" rx="1.5" />
+    <path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4" />
+  </Icon>
+);
+export const ShieldIcon = () => (
+  <Icon>
+    <path d="M12 3l8 3v6c0 4.5-3.2 8-8 9-4.8-1-8-4.5-8-9V6z" />
+    <path d="m8.5 12 2.3 2.3L15.5 9.5" />
+  </Icon>
+);
+export const LockIcon = () => (
+  <Icon size={14}>
+    <rect x="5" y="11" width="14" height="9" rx="1.5" />
+    <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+  </Icon>
+);
+export const CheckIcon = () => (
+  <Icon size={14}>
+    <path d="m5 12.5 4.5 4.5L19 7.5" />
+  </Icon>
+);
+export const ClockIcon = () => (
+  <Icon size={14}>
+    <circle cx="12" cy="12" r="8.5" />
+    <path d="M12 7.5V12l3 2" />
+  </Icon>
+);
+export const AlertIcon = () => (
+  <Icon size={14}>
+    <path d="M12 4 2.8 19.5h18.4z" />
+    <path d="M12 10v4.5M12 17.2v.3" />
+  </Icon>
+);
+export const ErrorIcon = () => (
+  <Icon size={14}>
+    <circle cx="12" cy="12" r="8.5" />
+    <path d="m9 9 6 6M15 9l-6 6" />
+  </Icon>
+);
+export const MinusIcon = () => (
+  <Icon size={14}>
+    <circle cx="12" cy="12" r="8.5" />
+    <path d="M8.5 12h7" />
+  </Icon>
+);
+export const DownloadIcon = () => (
+  <Icon size={16}>
+    <path d="M12 4v11M7 10.5l5 5 5-5M5 20h14" />
+  </Icon>
+);
+export const HistoryIcon = () => (
+  <Icon>
+    <path d="M4 6h16M4 12h16M4 18h10" />
+  </Icon>
+);
+export const ArrowRightIcon = () => (
+  <Icon size={16}>
+    <path d="M5 12h14M13 6l6 6-6 6" />
+  </Icon>
+);

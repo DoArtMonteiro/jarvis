@@ -76,6 +76,8 @@ export const api = {
   deny: (approvalId: string, reason: string) => call<void>("deny", { approvalId, reason }),
   submitCopyProposal: (text: string) => call<JobView>("submit_copy_proposal", { text }),
   getJob: (jobId: string, waitMs = 0) => call<JobView>("get_job", { jobId, waitMs }),
+  /** Most recent jobs first; the app clamps `limit` to 1..50. */
+  listJobs: (limit = 20) => call<JobView[]>("list_jobs", { limit }),
 };
 
 export interface Listeners {

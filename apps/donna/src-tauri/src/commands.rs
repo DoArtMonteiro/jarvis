@@ -291,6 +291,18 @@ pub async fn get_job(state: Shared<'_>, job_id: String, wait_ms: u32) -> Reply<J
     }
 }
 
+/// The most recent jobs, newest first.
+#[tauri::command]
+pub async fn list_jobs(state: Shared<'_>, limit: u32) -> Reply<Vec<JobView>> {
+    let request = RpcRequest::ListJobs {
+        limit: limit.clamp(1, 50),
+    };
+    match state.call(&request).await? {
+        RpcResponse::Jobs { jobs } => Ok(jobs),
+        other => Err(DonnaError::unexpected(&other)),
+    }
+}
+
 /// Delete conversations not updated for `days` (0 keeps them).
 #[tauri::command]
 pub async fn set_retention(state: Shared<'_>, days: u32) -> Reply<InferenceView> {
