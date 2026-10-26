@@ -221,6 +221,9 @@ Use a model whose SHA-256 you have put in the configuration, and a build of `lla
 
 **Desktop app**
 
+A profile is a folder holding the configuration and, in its `app` subfolder, the app and the Core: `<profile>\donna.toml`, `<profile>\app\donna.exe`, `<profile>\app\jarvis-core.exe`. Started from there, the app reads `<profile>\donna.toml` and starts the `jarvis-core.exe` beside it, with no environment variables. Without a `donna.toml` one level above the app, it reads `%LOCALAPPDATA%\Donna\donna.toml`. `DONNA_CONFIG` and `DONNA_CORE_EXE` override both and are meant for development. A build output such as `src-tauri\target\release\donna.exe` has no Core beside it and is not an installed app.
+
+- Start the installed app from Explorer with no `DONNA_*` variable set: it reads its own profile's configuration and starts exactly one Core. Starting it again while it runs brings the open window forward and starts no second Core.
 - The app starts, connects to a running Core (or, when none answers, starts one and stops it again when its window closes), and shows the model status the Core reports. It holds no state beyond what the Core returns.
 - A reply streams into the window, can be cancelled, and renders as text: a message containing `<b>x</b>` and a Markdown image link shows the characters, not bold text and not a request to another host.
 - A clipboard proposal appears as text with a button. With `desktop.clipboard.write` set to `require_confirmation`, pressing it creates a job whose approval shows the whole text; nothing is copied before approving it in the inbox. Paste into a disposable editor and compare. With the capability on `deny`, the job is refused.
