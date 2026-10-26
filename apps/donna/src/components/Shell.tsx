@@ -93,9 +93,11 @@ export function StatusStrip() {
   const ok = s.core === "ok";
   // Nothing the Core cannot confirm right now is shown as a live value.
   const inference = ok ? s.inference : null;
-  const stats = inference?.last_stats;
+  // A speed is only current while a model is loaded.
+  const loaded = inference?.state === "ready" || inference?.state === "generating";
+  const stats = loaded ? inference?.last_stats : null;
   // The last reply's speed when there is one; otherwise the load-time warm-up, labelled as such.
-  const warmup = inference?.warmup_tokens_per_second_x10 ?? null;
+  const warmup = loaded ? (inference?.warmup_tokens_per_second_x10 ?? null) : null;
   const speed = stats
     ? t("tokensPerSecond", { n: formatTps(stats.tokens_per_second_x10, s.lang) })
     : warmup !== null
