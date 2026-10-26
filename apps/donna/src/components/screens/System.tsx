@@ -94,9 +94,12 @@ function ModelFacts() {
               {t("contextTokens", { n: formatNumber(inference.context_size, s.lang) })}
             </KV>
             <KV label={t("kvGpuLayers")}>
-              {inference.gpu_layers > 0
-                ? t("gpuLayersValue", { n: inference.gpu_layers })
-                : t("cpuOnlyValue")}
+              {/* llama.cpp treats any count above the model's layers as "all of them". */}
+              {inference.gpu_layers >= 999
+                ? t("gpuLayersAll")
+                : inference.gpu_layers > 0
+                  ? t("gpuLayersValue", { n: inference.gpu_layers })
+                  : t("cpuOnlyValue")}
             </KV>
             <KV label={t("modelLoadTime")}>
               {inference.load_ms !== null

@@ -130,9 +130,9 @@ export function StatusStrip() {
           {ok ? (s.health ? `${s.health.core_version} · ${t("coreActive")}` : t("coreActive")) : t("coreLost")}
         </span>
       </Cell>
-      <span class="local">
+      <span class="local" title={t("localOnly")}>
         <LockIcon />
-        {t("localOnly")}
+        <span class="local-text">{t("localOnly")}</span>
       </span>
     </div>
   );
