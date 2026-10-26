@@ -118,8 +118,11 @@ impl AppState {
         *locked(&self.boot) = Boot::Starting;
         self.status_wake.notify_one();
         let exe = paths::core_exe().ok_or_else(|| DonnaError::Launch {
-            message: "jarvis-core.exe not found: put it next to Donna or set DONNA_CORE_EXE"
-                .to_owned(),
+            message: format!(
+                "jarvis-core.exe not found in {}: start Donna from its installed folder \
+                 (<profile>\\app\\donna.exe) or set DONNA_CORE_EXE",
+                paths::exe_dir_display()
+            ),
         })?;
         // Keep the child before waiting, so closing during start-up stops it.
         let (child, stdout) = core_proc::spawn(&exe, &self.config_path)?;
