@@ -13,12 +13,25 @@ import type {
   DonnaError,
   HealthReport,
   InferenceView,
+  JobView,
   MessageView,
   StatusEvent,
   StreamErrorEvent,
 } from "./types";
 
 export type CoreView = "connecting" | StatusEvent["core"];
+
+/** The five screens of the rail, in rail order (Ctrl+1..5). */
+export const SCREENS = ["home", "chat", "work", "system", "approvals"] as const;
+export type Screen = (typeof SCREENS)[number];
+
+/** The outcome of the last approval decision, shown in place of the request. */
+export interface Decision {
+  approvalId: string;
+  tool: string;
+  outcome: "approved" | "denied" | "failed";
+  error?: string;
+}
 
 export interface PendingApproval {
   view: ApprovalView;
@@ -54,16 +67,27 @@ export interface State {
   loadingConversation: boolean;
   streaming: { turnId: string; text: string } | null;
   sending: boolean;
-  view: "chat" | "settings";
-  drawer: boolean;
-  modelPanel: boolean;
-  sidebar: boolean;
+  view: Screen;
+  /** The conversation history drawer (narrow windows only). */
+  historyOpen: boolean;
+  /** Recent jobs from the Core, newest first; null until first read. */
+  jobs: JobView[] | null;
+  jobsError: boolean;
+  selectedApproval: string | null;
+  decision: Decision | null;
+  /** True once the Core has answered in this session. */
+  everConnected: boolean;
+  /** Local time (ms) the last health report arrived; live counters start from it. */
+  healthAt: number;
+  /** The Core's reason for a reply that did not finish, by message id. */
+  turnErrors: Record<string, string>;
   proposals: Record<string, ProposalState>;
   toasts: Toast[];
   announcement: string;
   contextError: string | null;
-  /** The composer text; kept here so it survives screen changes. */
+  /** The composer texts; kept here so they survive screen changes. */
   draft: string;
+  homeDraft: string;
 }
 
 const SETTINGS_KEY = "donna.settings";
@@ -112,15 +136,21 @@ function initialState(): State {
     loadingConversation: false,
     streaming: null,
     sending: false,
-    view: "chat",
-    drawer: false,
-    modelPanel: false,
-    sidebar: true,
+    view: "home",
+    historyOpen: false,
+    jobs: null,
+    jobsError: false,
+    selectedApproval: null,
+    decision: null,
+    everConnected: false,
+    healthAt: Date.now(),
+    turnErrors: {},
     proposals: {},
     toasts: [],
     announcement: "",
     contextError: null,
     draft: "",
+    homeDraft: "",
   };
 }
 
@@ -193,6 +223,16 @@ export function errorText(error: unknown): string {
     case "version_mismatch":
       return t("coreVersionBody", { found: e.found, expected: e.expected });
   }
+}
+
+// ---- navigation -------------------------------------------------------------
+
+export function goTo(view: Screen): void {
+  if (view === state.view) return;
+  // Home lists recent conversations: leave no search filter behind.
+  if (view !== "chat" && state.search.trim() !== "") setSearch("");
+  // A decision result belongs to the visit that made it.
+  setState({ view, historyOpen: false, ...(state.view === "approvals" ? { decision: null } : {}) });
 }
 
 // ---- settings -------------------------------------------------------------
@@ -290,8 +330,18 @@ export function setSearch(search: string): void {
 
 export function newConversation(): void {
   if (state.streaming || state.sending) return;
-  setState({ activeId: null, messages: [], view: "chat" });
-  document.getElementById("composer")?.focus();
+  setState({ activeId: null, messages: [], view: "chat", historyOpen: false });
+  requestAnimationFrame(() => document.getElementById("composer")?.focus());
+}
+
+/** Send the first message of a new conversation (the Home composer). */
+export async function startConversation(text: string): Promise<boolean> {
+  if (state.streaming || state.sending) {
+    toast(t("chatBusy"), "error");
+    return false;
+  }
+  setState({ activeId: null, messages: [], view: "chat", historyOpen: false });
+  return sendMessage(text);
 }
 
 export async function openConversation(id: string): Promise<void> {
@@ -299,6 +349,7 @@ export async function openConversation(id: string): Promise<void> {
   const previous = { activeId: state.activeId, messages: state.messages };
   setState({
     view: "chat",
+    historyOpen: false,
     activeId: id,
     messages: id === previous.activeId ? state.messages : [],
     loadingConversation: true,
@@ -394,6 +445,7 @@ export async function sendMessage(text: string): Promise<boolean> {
 function follow(turnId: string, conversationId: string): void {
   api.chatFollow(turnId, conversationId).catch((error: unknown) => {
     if (state.streaming?.turnId !== turnId) return;
+    toast(errorText(error), "error");
     void finishTurn(conversationId, {
       text: state.streaming.text,
       delta: null,
@@ -446,7 +498,11 @@ async function finishTurn(
 ): Promise<void> {
   const id = conversationId ?? state.activeId;
   const streaming = state.streaming;
-  if (final.error) toast(final.error, "error");
+  if (streaming && final.error) {
+    // Shown with the reply itself, never as if the reply were complete.
+    const error = final.error;
+    setState((s) => ({ turnErrors: { ...s.turnErrors, [streaming.turnId]: error } }));
+  }
   if (streaming) {
     const reply: MessageView = {
       message_id: streaming.turnId,
@@ -496,6 +552,7 @@ function onDelta(event: DeltaEvent): void {
 
 function onStreamError(event: StreamErrorEvent): void {
   if (state.streaming?.turnId !== event.turn_id) return;
+  toast(errorText(event.error), "error");
   void finishTurn(event.conversation_id, {
     text: state.streaming.text,
     delta: null,
@@ -505,30 +562,109 @@ function onStreamError(event: StreamErrorEvent): void {
 
 // ---- approvals & proposals --------------------------------------------------
 
+/** A proposal submitted from the chat whose approval should open when it lands. */
+let awaitedJob: string | null = null;
+
 function onApprovals(views: ApprovalView[]): void {
   const now = Date.now();
+  const approvals = views.map((view) => ({ view, deadline: now + view.expires_in_ms }));
+  const awaited = awaitedJob ? views.find((view) => view.job_id === awaitedJob) : undefined;
+  if (awaited) awaitedJob = null;
+  const changed = approvals.length !== state.approvals.length;
   setState({
-    approvals: views.map((view) => ({ view, deadline: now + view.expires_in_ms })),
+    approvals,
+    ...(awaited ? { selectedApproval: awaited.approval_id, decision: null } : {}),
   });
+  if (changed) void refreshJobs();
+}
+
+/** Open the full request on the Approvals screen. */
+export function openApproval(approvalId: string | null): void {
+  selectApproval(approvalId);
+  goTo("approvals");
+}
+
+/** Show one request in full; a choice by the person overrides a pending auto-open. */
+export function selectApproval(approvalId: string | null): void {
+  awaitedJob = null;
+  setState({ selectedApproval: approvalId, decision: null });
+}
+
+/** Open the approval that belongs to a job (a clipboard proposal), once it is pending. */
+export function openApprovalForJob(jobId: string | undefined): void {
+  const match = state.approvals.find((item) => item.view.job_id === jobId);
+  if (match) return openApproval(match.view.approval_id);
+  awaitedJob = jobId ?? null;
+  goTo("approvals");
+}
+
+async function decide(
+  view: ApprovalView,
+  outcome: "approved" | "denied",
+  action: () => Promise<void>,
+): Promise<void> {
+  try {
+    await action();
+    setState({ decision: { approvalId: view.approval_id, tool: view.tool, outcome } });
+  } catch (error) {
+    setState({
+      decision: {
+        approvalId: view.approval_id,
+        tool: view.tool,
+        outcome: "failed",
+        error: errorText(error),
+      },
+    });
+  }
+  await refreshApprovals();
+  void refreshJobs();
 }
 
 export async function approve(view: ApprovalView): Promise<void> {
-  try {
-    // The fingerprint is the one in the view the person reviewed.
-    await api.approve(view.approval_id, view.fingerprint);
-  } catch (error) {
-    toast(`${t("approvalFailed")} ${errorText(error)}`, "error");
-  }
-  await refreshApprovals();
+  // The fingerprint is the one in the view the person reviewed.
+  await decide(view, "approved", () => api.approve(view.approval_id, view.fingerprint));
 }
 
 export async function deny(view: ApprovalView, reason: string): Promise<void> {
-  try {
-    await api.deny(view.approval_id, reason);
-  } catch (error) {
-    toast(`${t("approvalFailed")} ${errorText(error)}`, "error");
+  await decide(view, "denied", () => api.deny(view.approval_id, reason));
+}
+
+// ---- jobs ---------------------------------------------------------------------
+
+let jobsInFlight = false;
+/** A refresh was asked for while one was running: run once more after it. */
+let jobsDirty = false;
+
+export async function refreshJobs(): Promise<void> {
+  if (state.core !== "ok") return;
+  if (jobsInFlight) {
+    jobsDirty = true;
+    return;
   }
-  await refreshApprovals();
+  jobsInFlight = true;
+  try {
+    do {
+      jobsDirty = false;
+      try {
+        setState({ jobs: await api.listJobs(20), jobsError: false });
+      } catch {
+        setState({ jobsError: true });
+      }
+    } while (jobsDirty && state.core === "ok");
+  } finally {
+    jobsInFlight = false;
+  }
+}
+
+const JOBS_POLL_MS = 5000;
+
+/** Keep the jobs list fresh while a screen that shows it is mounted. */
+export function useJobsPolling(): void {
+  useEffect(() => {
+    void refreshJobs();
+    const id = setInterval(() => void refreshJobs(), JOBS_POLL_MS);
+    return () => clearInterval(id);
+  }, []);
 }
 
 async function refreshApprovals(): Promise<void> {
@@ -551,8 +687,14 @@ function saveProposals(): void {
 }
 
 function setProposal(messageId: string, proposal: ProposalState): void {
+  const before = state.proposals[messageId]?.phase;
   setState((s) => ({ proposals: { ...s.proposals, [messageId]: proposal } }));
   saveProposals();
+  if (before !== proposal.phase) void refreshJobs();
+  // A proposal that has finished no longer waits for its approval to open.
+  if (proposal.jobId === awaitedJob && ["done", "failed", "cancelled"].includes(proposal.phase)) {
+    awaitedJob = null;
+  }
 }
 
 async function trackJob(messageId: string, jobId: string): Promise<void> {
@@ -601,7 +743,8 @@ export async function submitProposal(messageId: string, text: string): Promise<v
   try {
     const job = await api.submitCopyProposal(text);
     setProposal(messageId, { phase: "waiting", jobId: job.job_id });
-    setState({ drawer: true });
+    // The request is decided on the Approvals screen, in full.
+    openApprovalForJob(job.job_id);
     void trackJob(messageId, job.job_id);
   } catch (error) {
     setState((s) => {
@@ -622,16 +765,27 @@ function onStatus(event: StatusEvent): void {
   // One failed poll is not an outage: wait for a second before leaving "ok".
   failStreak = event.core === "ok" ? 0 : failStreak + 1;
   if (wasOk && event.core !== "ok" && failStreak < 2) return;
+  const previous = state.health;
   setState({
     core: event.core,
     coreError: event.error,
     health: event.health ?? (event.core === "ok" ? state.health : null),
+    healthAt: event.health ? Date.now() : state.healthAt,
     inference: event.inference ?? (event.core === "ok" ? state.inference : null),
     inferenceError: event.inference_error,
+    everConnected: state.everConnected || event.core === "ok",
   });
   if (event.core === "ok" && !wasOk) {
     void refreshConversations();
     void refreshApprovals();
+    void refreshJobs();
+  } else if (
+    event.health &&
+    previous &&
+    (event.health.queued_jobs !== previous.queued_jobs ||
+      event.health.pending_approvals !== previous.pending_approvals)
+  ) {
+    void refreshJobs();
   }
 }
 

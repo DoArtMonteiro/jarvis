@@ -27,6 +27,7 @@
     "allow-approve",
     "allow-deny",
     "allow-submit-copy-proposal",
-    "allow-get-job"
+    "allow-get-job",
+    "allow-list-jobs"
   ]
 }

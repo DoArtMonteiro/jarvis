@@ -60,6 +60,7 @@ pub fn run() {
             commands::deny,
             commands::submit_copy_proposal,
             commands::get_job,
+            commands::list_jobs,
         ])
         .build(tauri::generate_context!());
     let app = match app {

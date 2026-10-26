@@ -21,6 +21,7 @@ const COMMANDS: &[&str] = &[
     "deny",
     "submit_copy_proposal",
     "get_job",
+    "list_jobs",
 ];
 
 fn main() {
