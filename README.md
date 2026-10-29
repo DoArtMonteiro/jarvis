@@ -1,172 +1,104 @@
-# JARVIS
+# JARVIS / Donna
 
-A local-first agent runtime with a Rust execution core, typed capabilities and Python intelligence workers.
+A local assistant runtime with a Rust policy core, typed tools, human approval for scoped writes and an OS-isolated worker. A separate Windows Session Agent handles approved clipboard writes. Donna is its desktop client.
 
-**Status:** M6 desktop and local-inference milestone merged; M7 daily-driver reliability and privacy remains a draft PR awaiting supervised owner acceptance. A long-lived Rust Core supervises an OS-isolated Python worker (Windows AppContainer; Linux Landlock/seccomp), enforces typed capabilities and human approvals, and records decisions in SQLite. The Tauri desktop client communicates through typed RPC. Local language-model conversation runs through the Core without direct tool authority (ADR 0021). Model-backed planning, voice and personal integrations are not yet delivered.
+**Status:** M7 reliability and privacy work and Donna Experience V1 are merged into `main` ([PR #10](https://github.com/WhiteBlindness/jarvis/pull/10), [PR #11](https://github.com/WhiteBlindness/jarvis/pull/11)). This is a local prototype with a small tool set, not a general autonomous assistant.
 
-## Why it exists
+[Architecture](docs/architecture.md) · [Threat model](docs/threat-model.md) · [Windows validation](docs/windows-validation.md) · [Decisions](docs/decisions/README.md)
 
-The usual way to let an assistant act on a computer is to hand it a shell. Once a model can choose a command line, every permission check written around commands can be bypassed by quoting, chaining or picking another binary, and nothing records why an action happened.
+## The problem
 
-JARVIS starts from the opposite end: the model never gets operating system access. It can only propose typed requests such as `system.info {}` or `workspace.write_file { "path": "notes.txt", "content": "…" }`. A Rust Core decides whether each request may run, asks a person when policy says so, runs it under limits, and records the decision before acting on it. The goal is autonomy that is safe, observable and recoverable.
-
-## What is technically interesting
-
-- **Capabilities, not commands.** The worker names a tool and its arguments, never a permission. The Core derives the required capabilities through an exhaustive `match`; unlisted capabilities are denied, and the config cannot raise a class B capability to `allow`.
-- **Approvals bound to one exact request.** A request that needs a person is suspended in the Core. The worker never sees an approval and has no field to claim one. A person approves through a separate client, which must present the SHA-256 fingerprint of the exact task, request, tool, arguments and capabilities it displayed. The approval is consumed in the same transaction that starts execution, and can never be used twice, outlive its session or survive a restart.
-- **Decide, record, then act.** The policy decision, the consumed approval and `execution_started` are committed before a tool runs. Tests inject database failures before and after execution to show what happens in each case.
-- **Integrity in the schema, not only in code.** Triggers keep the audit log append-only and make terminal tasks, decided approvals and finished jobs immutable, including against `INSERT OR REPLACE`.
-- **An OS boundary around the worker, checked at every Core start.** The worker can read its interpreter and its own source and, on Windows, what Windows opens to every AppContainer (system directories, some registry keys including parts of the user's `HKEY_CURRENT_USER`, and a screen device context; screen capture and keyboard state are not proven blocked). It has no access to user files, Core data or other processes, cannot write (on Windows, except in its own AppContainer folder, which the Core empties before every start), cannot start child processes, and by design has no network of any kind (loopback included). On Windows that is an AppContainer with no capabilities, a job object, a child-process policy, an explicit handle list and process mitigations, set in one `CreateProcessW` call, with no administrator rights and no second account. On Linux it is Landlock plus a seccomp filter, with no root. Before the first worker runs, the Core starts a probe under the same isolation and checks from its own side that it could not reach a loopback listener (TCP and UDP), read a file next to the database or the user's home, or start a process; if any check fails, the Core refuses to start. The probe covers loopback only; the rest of the no-network claim rests on the zero-capability AppContainer (Windows), seccomp (Linux) and the CI tests.
-- **A supervised worker.** No shell, a cleared environment, a handshake and a job timeout, restarts with exponential backoff inside a budget, and death with the Core.
-- **A local RPC interface the worker cannot reach.** Unix socket in an owner-only directory, or a named pipe that only the current user can open. The isolated worker cannot create a socket (Linux) or open the pipe (Windows); behind that, every peer is identified by the OS and the worker, anything in its job or process group, and restricted Windows tokens are refused and audited.
-- **Adversarial tests.** A hostile worker process tries smuggled approvals, path traversal, invented tools, replays, requests outside its job and approving its own write over the RPC endpoint, against the real binary.
+Giving an assistant a shell makes permissions hard to explain and audit. JARVIS instead accepts requests for named, typed tools. A Rust Core derives each request's capabilities, applies policy, asks for confirmation when required, records the decision, and then runs the tool.
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    P[Person] --> C[CLI or Donna desktop client]
+    C --> R[Local RPC]
+    R --> CORE[Rust Core]
+    CORE --> POL[Typed request and capability policy]
+    POL -->|Needs confirmation| AP[Separate approval client]
+    AP --> POL
+    POL -->|Allowed request| GW[Tool Gateway]
+    GW --> TOOLS[Bounded first-party tools]
+    CORE --> DB[(SQLite jobs, approvals and audit log)]
+    CORE <-->|stdio protocol| W[Python worker]
+    W -. runs inside .-> ISO[AppContainer on Windows; Landlock and seccomp on Linux]
+    CORE -->|Single-use grant after approval| SA[Windows Session Agent]
+    SA --> CLIP[User clipboard]
+    SA -. User-level process outside worker sandbox .-> USER[Windows user session]
+    CORE --> MODEL[Optional local model broker]
+    MODEL --> LLM[llama.cpp server, no tool interface]
 ```
- person ── CLI ── local RPC ──►  Rust Core (jarvis-core serve)              SQLite
-                                  rpc → jobs, approvals               ──►  jobs, tasks,
-                                  decode → capabilities → policy            approvals,
-                                  → [approval] → record → Tool Gateway ──►  audit_events
-                                       ▲ stdio only        │
- ┌─ OS isolation boundary ──────────┐  │              typed tools
- │ AppContainer (Windows)           │  │  system.info · filesystem.read_fixture ·
- │ Landlock + seccomp (Linux)       │  │  workspace.write_file
- │   Python worker ── tool_request ─┼──┘
- │   reads its runtime and source;  │
- │   no user files, no processes,   │
- │   no network (by design)         │
- └──────────────────────────────────┘
-```
 
-| Component | Language | Role |
-| --- | --- | --- |
-| `crates/jarvis-protocol` | Rust | Worker protocol v2 and local RPC v3: closed tool and capability sets, conversation types, strict decoding |
-| `crates/jarvis-core` | Rust | Daemon, RPC server, policy, approvals, Tool Gateway, session, SQLite store, supervision, local model broker and conversation store, CLI |
-| `crates/jarvis-tools` | Rust | First-party tools behind a `ToolExecutor` trait |
-| `crates/jarvis-sandbox` | Rust | Starts the worker inside its OS isolation; the only crate with `unsafe` code |
-| `services/intelligence-python` | Python | Worker: protocol client, job loop and a deterministic planner (standard library only) |
-| `apps/donna` | Tauri 2 | Desktop client for conversations: an RPC client with no policy or state of its own |
+The worker proposes tool requests but does not grant itself permissions or approvals. The Core owns the policy, durable state and tool execution. The Session Agent is a separate clipboard path that accepts a single-use grant after approval. It and the optional llama.cpp server run as user-level processes outside the worker sandbox. Donna is an RPC client; it does not keep a separate policy or job store.
 
-Details: [architecture](docs/architecture.md), [protocols](docs/protocol.md), [threat model](docs/threat-model.md), [decisions](docs/decisions/README.md), [Windows validation](docs/windows-validation.md).
+## What is implemented
 
-## Security model
+- Long-running Core with a typed local RPC interface and command-line client.
+- Three bounded Core tools: system information, reading configured fixtures and writing one text file inside a configured workspace.
+- A separate Windows Session Agent writes approved text to the clipboard under a single-use grant issued by the Core.
+- Desktop capture, clipboard-read and text-entry operations are declared in the protocol but are not implemented as available actions.
+- Human approval for workspace writes. Approval binds to the exact task, request, tool, arguments and capabilities, expires and can be consumed once.
+- SQLite persistence for jobs, tasks, approvals and an append-only audit log, with crash recovery and quarantine for steps whose outcome is unknown.
+- Python worker supervision and OS isolation on Windows and Linux, including a start-up probe that fails closed when required checks fail.
+- Donna's Windows desktop screens for Home, Chat, Work, System and Approvals.
+- Optional local language-model conversations through a Core-managed `llama.cpp` helper. The model has no tools; its text is not interpreted as an action.
 
-Every capability belongs to one class:
+## Security boundaries and known gaps
 
-| Class | Meaning | Today |
-| --- | --- | --- |
-| A. Allow automatically | Read-only, bounded, no personal data | `system.info`, `filesystem.read.fixture` |
-| B. Require confirmation | Side effects inside an approved area | `workspace.write` (write one text file inside the configured workspace) |
-| C. Prohibited | Shell, process launch, unrestricted filesystem or network, credentials, the Core's own state | No tool exists, and neither protocol can express them |
+JARVIS limits what a worker can do, but the operating system remains part of the trust boundary. The Windows worker can read system directories and some registry keys available to AppContainer processes, including parts of `HKEY_CURRENT_USER`. It can obtain a screen device context. Whether screen capture or keyboard-state access is blocked has not been proved. The worker also knows its profile path and can fill its own AppContainer directory until the Core clears it before the next start.
 
-The limits are stated plainly in the [threat model](docs/threat-model.md). The worker's isolation relies on the operating system: a kernel or AppContainer escape is out of scope, the Linux syscall filter is a denylist of dangerous groups rather than an allowlist, and on Windows the worker can read system directories, registry keys open to all AppContainers (including parts of the user's `HKEY_CURRENT_USER`, such as Explorer's list of recent documents, opened for read on a desktop run), learns the profile path and can fill its own AppContainer folder until the next start. It can also obtain a screen device context; it runs with win32k system calls disabled, but whether it can capture the screen or read keyboard state is not proven either way. Until the registry, screen and keyboard gaps are resolved, no model, voice or personal-data integration may run in the worker. Any process running as the same user, other than the worker, can use the RPC interface, which is the trust boundary. Some Windows behaviour can only be checked on a real desktop; [docs/windows-validation.md](docs/windows-validation.md) lists it.
+The Python worker is the component confined by AppContainer on Windows or Landlock and seccomp on Linux. The Session Agent and optional llama.cpp server are separate user-level processes outside that worker sandbox. The Session Agent accepts approved clipboard-write grants, but it does not receive the worker's OS isolation guarantees.
 
-## Implemented
+Until the registry, screen and keyboard questions are resolved, the worker must not receive model, voice or personal-data integrations. A process running as the same user can use the local RPC interface. Kernel or AppContainer escapes are outside the threat model. See the [threat model](docs/threat-model.md) and [Windows validation notes](docs/windows-validation.md) for scope and evidence.
 
-- Long-lived Core with start-up recovery, worker supervision with a restart budget, graceful shutdown on signals or an authorised RPC request, structured logs and a range-checked TOML config.
-- Local RPC: health, submit and wait for jobs, list and wait for approvals, approve, deny, shutdown. CLI commands for each, plus read-only `tasks` and `audit`.
-- Human approval for class B requests, bound by fingerprint, single use, with expiry, audited from request to consumption.
-- Three tools: `system.info` (no hostname, username, environment or paths), `filesystem.read_fixture` (one configured directory) and `workspace.write_file` (one configured directory, handle-based resolution, atomic replace, no links followed out).
-- Worker isolation on Windows (AppContainer) and Linux (Landlock and seccomp), checked at every start by a probe (loopback TCP and UDP, a file next to the database, the user's home, starting a process) and by hostile probes from a real child process on CI; `isolation check` and `isolation remove` commands, and an optional Windows script that adds firewall rules for the worker as defence in depth.
-- SQLite store with migrations, jobs, tasks, approvals, an append-only audit log, replay protection and crash recovery. A job whose worker or Core stopped is resumed without repeating a recorded step, or quarantined when a step's outcome is unknown (ADR 0015).
-- Optional gaming governor (off by default): while a configured process runs, the Core does not start queued jobs; running jobs are not touched. It reads only the process list, holds when it cannot tell, never releases because of time, and shows its state in `health` and the audit log (ADR 0016).
-- Python worker with a job loop and a deterministic planner.
-- Optional local model (ADR 0021): the Core starts a llama.cpp server as a trusted helper (loopback only, per-start key, cleared environment, job-bounded, model pinned by SHA-256) and streams replies to RPC clients (`jarvis-core chat`, or the desktop app). The model has no tools and its output is never parsed for actions; the one exception is a clipboard suggestion that appears only when the person asked for a copy, and that still needs the person to submit it and approve the exact text. Conversations are stored in their own database, deletable, never in the audit log. With the governor on, the model is unloaded while a game runs. CI cannot run a model or a GPU; that part is validated on Windows hardware, and reply quality is the model's, not the Core's.
+The optional local model is not evaluated by CI for response quality or GPU behaviour. Its output remains text, not a tool request. A clipboard suggestion appears only after a person asks to copy, and the person must submit and approve the exact text.
 
-## Planned
+## Verification and reproduction
 
-- Model-backed planning, then speech and retrieval. The worker keeps no network and no model.
-- A dashboard for jobs and approvals on the RPC interface.
-- More tools, each added through the threat model first.
+Requirements: Rust 1.89 or newer and Python 3.11 or newer. Linux requires Landlock support (kernel 5.13 or newer); the Core refuses to start the worker if the check fails. On Windows, set `[worker].program = "python"` in `config/jarvis.example.toml` and use a real `python.exe`, not the `py` launcher or a virtual environment. Those launch a second process, which the worker policy refuses. See [Windows validation](docs/windows-validation.md) for interpreter checks. Neither platform requires administrator rights.
 
-## Stack
-
-Rust 2024 (Tokio, rusqlite with bundled SQLite, serde, clap, tracing, cap-std, sha2, windows-sys) · Python 3.11+ standard library · pytest, mypy, ruff, uv · proptest · GitHub Actions on Linux and Windows
-
-## Run it
-
-Requirements: Rust 1.89 or newer and Python 3.11 or newer. SQLite is compiled in and the worker has no dependencies. On Linux the kernel must have Landlock enabled (5.13 or newer, which current distributions ship); otherwise the Core refuses to start the worker. On Windows, set `program = "python"` (a real `python.exe`, not the `py` launcher or a virtual environment) in `config/jarvis.example.toml` and see [docs/windows-validation.md](docs/windows-validation.md). No administrator rights are needed on either system.
-
-Check the worker's isolation on this machine first (no running Core needed):
+Check whether this machine supports the configured worker isolation, then start the Core:
 
 ```bash
 cargo run -p jarvis-core -- isolation check --config config/jarvis.example.toml
-```
-
-Start the Core in one terminal:
-
-```bash
 cargo run -p jarvis-core -- serve --config config/jarvis.example.toml
 ```
 
-Use it from another:
+In a second terminal, submit a bounded read request and inspect the job and audit records:
 
 ```bash
-jarvis() { cargo run -q -p jarvis-core -- "$@" --config config/jarvis.example.toml; }
-jarvis health
-jarvis submit "describe the runtime, then read welcome.txt" --wait
-jarvis submit "write notes.txt: remember the milk"
-jarvis approvals list
-jarvis approvals approve <approval-id>      # shows the request, then asks for `yes`
-jarvis jobs
-jarvis audit
-jarvis shutdown
+cargo run -p jarvis-core -- submit "describe the runtime, then read welcome.txt" --wait --config config/jarvis.example.toml
+cargo run -p jarvis-core -- jobs --config config/jarvis.example.toml
+cargo run -p jarvis-core -- audit --config config/jarvis.example.toml
 ```
 
-To talk to a local model, copy the `[inference]` sections of `config/donna.example.toml`, set the server, model, persona and SHA-256 for your files, and run `jarvis chat "hello"` against a running Core.
-
-The write waits for a person. `approvals list` shows exactly what would run:
-
-```
-approval      01a10319-5022-74aa-80f9-6c29e8f4f896
-status        pending
-tool          workspace.write_file
-capabilities  workspace.write
-arguments     bytes = 17
-              path = notes.txt
-              preview = remember the milk
-              sha256 = 0057061a4f16934b96f73f579167f795c4d4c20d8c501fc495197c550af51110
-task          01a10319-5021-73d0-ba45-e0c93916f943
-request       req-c62b9fe6b5394ff4a60dbfb8da446921
-job           01a10319-501e-762a-b088-9295fb881977
-requested     2026-10-03T18:49:12.994Z (1s ago)
-expires       2026-10-03T18:54:12.994Z (in 4m 59s)
-fingerprint   5e849f28156a39774031cb46c7c01891b945407b13b367f4596b2b5f5103fd10
-```
-
-After approval the audit log shows the decision, the approval and its consumption recorded before the tool ran:
-
-```
-18  policy_evaluated    {"capabilities":["workspace.write"],"decision":"require_confirmation"}
-19  approval_requested  {"approval_id":"01a10319-5022-…","fingerprint":"5e849f28…","tool":"workspace.write_file",…}
-20  approval_granted    {"approval_id":"01a10319-5022-…","client":"local client pid 6391"}
-21  approval_consumed   {"approval_id":"01a10319-5022-…"}
-22  execution_started   {"tool":"workspace.write_file"}
-23  execution_finished  {"duration_ms":1,"error":null,"status":"completed"}
-```
-
-The file appears in `var/workspace/notes.txt`. Try `jarvis approvals deny <id>`, or a goal such as `read ../Cargo.toml` or `write ../escape.txt: x`, to see refusals.
-
-## Test it
+A write request waits for a person to inspect and approve its exact arguments. Example configuration files are provided; they contain no credentials.
 
 ```bash
-cargo test --workspace          # needs python3 on PATH, or set JARVIS_TEST_PYTHON
-
+cargo test --workspace
 cd services/intelligence-python
-uv sync && uv run pytest && uv run mypy && uv run ruff check .
+uv sync
+uv run pytest
+uv run mypy
+uv run ruff check .
 ```
 
-The Rust suite covers the request pipeline and every refusal path, approvals (grant, deny, expiry, wrong fingerprint, single use, restart, the worker leaving while a request waits, database failures before and after execution), the workspace writer against traversal, links and races, isolation probes (a real Python child trying to read the profile, write files, reach the network, start processes, signal or read the Core, use a leaked handle and open the RPC endpoint), the start-up check failing closed, worker crashes and restart budgets, signals, recovery, resuming a job across a killed Core and a dying worker without repeating a completed step, quarantine of steps with an unknown outcome, the upgrade of a database from before the step ledger, and the RPC interface. CI runs it on Linux and Windows, along with `isolation check`, the Windows provisioning script, the isolation overhead measurement, the Python checks, the minimum supported Rust version, the documented quick start and a secret scan.
+The Rust tests start Python workers. Keep the test interpreter on `PATH` or set `JARVIS_TEST_PYTHON` to its executable. The CI checks run Rust and Python paths on Linux and Windows, the Donna desktop build on Windows, the documented quick start, minimum Rust version, isolation checks and a secret scan. [PR #11](https://github.com/WhiteBlindness/jarvis/pull/11) records the merged Donna V1 checks. CI does not run a local language model or assess its response quality.
 
-## Repository layout
+## Development timeline
 
-```
-crates/            jarvis-protocol, jarvis-core, jarvis-tools, jarvis-sandbox
-apps/              donna (desktop client)
-services/          intelligence-python (the worker)
-config/            example configuration
-docs/              architecture, protocols, threat model, decisions, Windows validation
-tests/protocol/    contract fixtures shared by Rust and Python
-tests/fixtures/    the fixture directory used by the demo
-```
+- **03/10/2026:** Rust Core, typed capability policy, durable state and Python worker introduced in [PR #1](https://github.com/WhiteBlindness/jarvis/pull/1).
+- **04/10/2026:** human approval and Windows containment integrated in [PR #2](https://github.com/WhiteBlindness/jarvis/pull/2).
+- **13/10/2026:** worker isolation and start-up probes integrated in [PR #3](https://github.com/WhiteBlindness/jarvis/pull/3); durable job recovery followed in [PR #5](https://github.com/WhiteBlindness/jarvis/pull/5).
+- **20/10/2026:** same-user Windows RPC authorisation fixed in [commit `0b4e78b`](https://github.com/WhiteBlindness/jarvis/commit/0b4e78b).
+- **24/10/2026:** M6 added the desktop client and optional local inference in [PR #9](https://github.com/WhiteBlindness/jarvis/pull/9).
+- **26/10/2026:** M7 reliability and privacy work merged in [PR #10](https://github.com/WhiteBlindness/jarvis/pull/10); Donna Experience V1 merged in [PR #11](https://github.com/WhiteBlindness/jarvis/pull/11).
+
+These are integration milestones. They do not imply general autonomy or acceptance for uses outside the documented prototype.
+
+## Planned
+
+Model-backed planning, speech, retrieval and additional tools remain future work. Each new tool needs a threat-model entry and an explicit capability policy before implementation.
