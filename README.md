@@ -2,7 +2,7 @@
 
 A local assistant runtime with a Rust policy core, typed tools, human approval for scoped writes and an OS-isolated worker. A separate Windows Session Agent handles approved clipboard writes. Donna is its desktop client.
 
-**Status:** M7 reliability and privacy work and Donna Experience V1 are merged into `main` ([PR #10](https://github.com/WhiteBlindness/jarvis/pull/10), [PR #11](https://github.com/WhiteBlindness/jarvis/pull/11)). This is a local prototype with a small tool set, not a general autonomous assistant.
+**Status:** M7 reliability and privacy work and Donna Experience V1 are merged into `main` ([PR #10](https://github.com/DoArtMonteiro/jarvis/pull/10), [PR #11](https://github.com/DoArtMonteiro/jarvis/pull/11)). This is a local prototype with a small tool set, not a general autonomous assistant.
 
 [Architecture](docs/architecture.md) · [Threat model](docs/threat-model.md) · [Windows validation](docs/windows-validation.md) · [Decisions](docs/decisions/README.md)
 
@@ -86,16 +86,16 @@ uv run mypy
 uv run ruff check .
 ```
 
-The Rust tests start Python workers. Keep the test interpreter on `PATH` or set `JARVIS_TEST_PYTHON` to its executable. The CI checks run Rust and Python paths on Linux and Windows, the Donna desktop build on Windows, the documented quick start, minimum Rust version, isolation checks and a secret scan. [PR #11](https://github.com/WhiteBlindness/jarvis/pull/11) records the merged Donna V1 checks. CI does not run a local language model or assess its response quality.
+The Rust tests start Python workers. Keep the test interpreter on `PATH` or set `JARVIS_TEST_PYTHON` to its executable. The CI checks run Rust and Python paths on Linux and Windows, the Donna desktop build on Windows, the documented quick start, minimum Rust version, isolation checks and a secret scan. [PR #11](https://github.com/DoArtMonteiro/jarvis/pull/11) records the merged Donna V1 checks. CI does not run a local language model or assess its response quality.
 
 ## Development timeline
 
-- **03/10/2026:** Rust Core, typed capability policy, durable state and Python worker introduced in [PR #1](https://github.com/WhiteBlindness/jarvis/pull/1).
-- **04/10/2026:** human approval and Windows containment integrated in [PR #2](https://github.com/WhiteBlindness/jarvis/pull/2).
-- **13/10/2026:** worker isolation and start-up probes integrated in [PR #3](https://github.com/WhiteBlindness/jarvis/pull/3); durable job recovery followed in [PR #5](https://github.com/WhiteBlindness/jarvis/pull/5).
-- **20/10/2026:** same-user Windows RPC authorisation fixed in [commit `0b4e78b`](https://github.com/WhiteBlindness/jarvis/commit/0b4e78b).
-- **24/10/2026:** M6 added the desktop client and optional local inference in [PR #9](https://github.com/WhiteBlindness/jarvis/pull/9).
-- **26/10/2026:** M7 reliability and privacy work merged in [PR #10](https://github.com/WhiteBlindness/jarvis/pull/10); Donna Experience V1 merged in [PR #11](https://github.com/WhiteBlindness/jarvis/pull/11).
+- **03/10/2026:** Rust Core, typed capability policy, durable state and Python worker introduced in [PR #1](https://github.com/DoArtMonteiro/jarvis/pull/1).
+- **04/10/2026:** human approval and Windows containment integrated in [PR #2](https://github.com/DoArtMonteiro/jarvis/pull/2).
+- **13/10/2026:** worker isolation and start-up probes integrated in [PR #3](https://github.com/DoArtMonteiro/jarvis/pull/3); durable job recovery followed in [PR #5](https://github.com/DoArtMonteiro/jarvis/pull/5).
+- **20/10/2026:** same-user Windows RPC authorisation fixed in [commit `0b4e78b`](https://github.com/DoArtMonteiro/jarvis/commit/0b4e78b).
+- **24/10/2026:** M6 added the desktop client and optional local inference in [PR #9](https://github.com/DoArtMonteiro/jarvis/pull/9).
+- **26/10/2026:** M7 reliability and privacy work merged in [PR #10](https://github.com/DoArtMonteiro/jarvis/pull/10); Donna Experience V1 merged in [PR #11](https://github.com/DoArtMonteiro/jarvis/pull/11).
 
 These are integration milestones. They do not imply general autonomy or acceptance for uses outside the documented prototype.
 
